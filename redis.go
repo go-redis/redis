@@ -969,8 +969,15 @@ func (c *baseClient) initStreamingCredentials() {
 
 func (c *baseClient) reAuthConnection() func(poolCn *pool.Conn, credentials auth.Credentials) error {
 	return func(poolCn *pool.Conn, credentials auth.Credentials) error {
-		var err error
 		username, password := credentials.BasicAuth()
+		if poolCn.IsPubSub() {
+			if fn := poolCn.GetPubSubReAuth(); fn != nil {
+				return fn(username, password)
+			}
+			return nil
+		}
+
+		var err error
 
 		// Use background context - timeout is handled by ReadTimeout in WithReader/WithWriter
 		ctx := context.Background()
@@ -994,6 +1001,12 @@ func (c *baseClient) reAuthConnection() func(poolCn *pool.Conn, credentials auth
 func (c *baseClient) onAuthenticationErr() func(poolCn *pool.Conn, err error) {
 	return func(poolCn *pool.Conn, err error) {
 		if err != nil {
+			if poolCn.IsPubSub() {
+				poolCn.GetStateMachine().Transition(pool.StateClosed)
+				_ = poolCn.Close()
+				internal.Logger.Printf(context.Background(), "redis: pubsub re-authentication failed: %v", err)
+				return
+			}
 			// A server-side rejection of the re-auth AUTH (WRONGPASS, NOPERM) is
 			// not a bad-conn error, so isBadConn alone would leave the connection
 			// pooled while it is still authenticated with the credentials the
