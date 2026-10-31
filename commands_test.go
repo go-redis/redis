@@ -5248,7 +5248,7 @@ var _ = Describe("Commands", func() {
 				Expect(res[0]).To(BeNumerically("~", 100, 2))
 				Expect(res[1:]).To(Equal([]int64{redis.SMemberNoExpiration, redis.SMemberNotFound}))
 
-				res, err = client.SExpireWithArgs(ctx, "sexp", 50*time.Second, redis.SExpireArgs{GT: true}, "a").Result()
+				res, err = client.SExpireWithArgs(ctx, "sexp", 50*time.Second, redis.SExpireGT, "a").Result()
 				Expect(err).NotTo(HaveOccurred())
 				Expect(res).To(Equal([]int64{redis.SExpireConditionFail}))
 
@@ -5383,16 +5383,16 @@ var _ = Describe("Commands", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(ttl[0]).To(BeNumerically("~", 20000, 2000))
 
-				res, err = client.SPExpireWithArgs(ctx, "sexp", 30*time.Second, redis.SExpireArgs{LT: true}, "a").Result()
+				res, err = client.SPExpireWithArgs(ctx, "sexp", 30*time.Second, redis.SExpireLT, "a").Result()
 				Expect(err).NotTo(HaveOccurred())
 				Expect(res).To(Equal([]int64{redis.SExpireConditionFail}))
 
 				at := time.Unix(4102444800, 0)
-				res, err = client.SExpireAtWithArgs(ctx, "sexp", at, redis.SExpireArgs{NX: true}, "a", "b").Result()
+				res, err = client.SExpireAtWithArgs(ctx, "sexp", at, redis.SExpireNX, "a", "b").Result()
 				Expect(err).NotTo(HaveOccurred())
 				Expect(res).To(Equal([]int64{redis.SExpireConditionFail, redis.SExpireUpdated}))
 
-				res, err = client.SPExpireAtWithArgs(ctx, "sexp", at.Add(time.Second), redis.SExpireArgs{XX: true}, "b").Result()
+				res, err = client.SPExpireAtWithArgs(ctx, "sexp", at.Add(time.Second), redis.SExpireXX, "b").Result()
 				Expect(err).NotTo(HaveOccurred())
 				Expect(res).To(Equal([]int64{redis.SExpireUpdated}))
 
