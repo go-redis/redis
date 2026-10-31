@@ -681,9 +681,9 @@ func (c *multidbCore) processTxPipeline(ctx context.Context, cmds []Cmder) error
 		// evidence of that. Return the cancellation as the aggregate error (like
 		// processPipeline) rather than the stale transport error, so a caller
 		// does not mistake a deliberate cancel for a retryable disconnect.
-		if !callerEnded(ctx, err, db.ctxTimeouts()) {
-			c.recordBatchOutcomes(ctx, db, user, err, executed, res, dg)
-		}
+		// Record per command even when the aggregate error is caller-ended:
+		// EXEC may have committed, and those results are health evidence.
+		c.recordBatchOutcomes(ctx, db, user, err, executed, res, dg)
 		db.cb.ReleaseFor(res)
 		return ctx.Err()
 	}
