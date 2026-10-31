@@ -1456,6 +1456,49 @@ func TestCSCPolicyInvalidModeDisablesAtConstruction(t *testing.T) {
 	}
 }
 
+
+func TestCSCPolicyOptOutKeepsNOAfterDisable(t *testing.T) {
+	// #4236 item 1: after disableCSCServing, OPTOUT sockets that were
+	// initialized with TRACKING ON must still emit CLIENT CACHING NO for
+	// ordinary uncached reads. Client-level cscActive=false must not drop
+	// the per-connection prefix.
+	ctx := context.Background()
+	s := newCSCPolicyServer(t, nil)
+	opt := cscPolicyOptions(s.addr, TrackingModeOptOut)
+	opt.PoolSize = 1
+	// Force pipelines onto the tracked main pool (dedicated pipeline sockets
+	// stay untracked and correctly omit CLIENT CACHING).
+	opt.PipelinePoolSize = -1
+	c := policyClient(t, opt)
+	if err := c.Ping(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	before := s.prefixes()
+	if got, err := c.Get(WithoutCache(ctx), "k").Result(); err != nil || got != "v" {
+		t.Fatal(got, err)
+	}
+	if s.prefixes() != before+1 {
+		t.Fatal("baseline OPTOUT NO missing", s.snapshot())
+	}
+	c.disableCSCServing(ctx, "test: mid-life disable must keep per-conn NO")
+	if got, err := c.Get(WithoutCache(ctx), "k2").Result(); err != nil || got != "v" {
+		t.Fatal(got, err)
+	}
+	if s.prefixes() != before+2 {
+		t.Fatal("disabled CSC dropped OPTOUT NO on tracked socket", s.snapshot())
+	}
+	pipe := c.Pipeline()
+	pipe.Get(WithoutCache(ctx), "k3")
+	if _, err := pipe.Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if s.prefixes() != before+3 {
+		t.Fatal("disabled CSC dropped OPTOUT NO on tracked pipeline", s.snapshot())
+	}
+	s.assertPairs(t)
+}
+
+
 func TestCSCPolicyFullDuplexUntracked(t *testing.T) {
 	for _, mode := range []TrackingMode{TrackingModePlain, TrackingModeOptIn, TrackingModeOptOut} {
 		for _, cluster := range []bool{false, true} {

@@ -1976,9 +1976,11 @@ func (c *baseClient) _process(ctx context.Context, cmd Cmder, attempt int, captu
 		}
 		// Borrowed Conn/Tx wrappers do not serve cache hits, but can still hold
 		// a tracked connection and need NO for an ordinary uncached OPTOUT read.
+		// Per-socket init generation (not live client-level CSC) decides whether
+		// the socket still carries TRACKING after disableCSCServing (#4236 item 1).
 		flag := byte(0)
 		if c.cscPolicy.mode != TrackingModePlain {
-			tracked := c.cscTrackingRequested() && c.cscConnInitGen(cn.GetID()) != 0
+			tracked := c.cscConnInitGen(cn.GetID()) != 0
 			if capture != nil && !tracked {
 				capture.noStore = true
 			}
