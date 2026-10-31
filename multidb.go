@@ -354,9 +354,10 @@ type MultiDBOptions struct {
 	// health checks).
 	ProbeTargetBeforeFailover bool
 
-	// The three callbacks below may call control operations. Changes made
-	// while NewMultiDBClient runs (startup breaker states, the initial
-	// selection) are delivered after it returns, and not at all if it fails.
+	// The three callbacks below may call control operations. Breaker changes
+	// made while NewMultiDBClient runs are delivered after it returns, and not
+	// at all if it fails. The initial selection is not a change and fires no
+	// callback: read ActiveDatabaseID after NewMultiDBClient returns.
 	// A callback can still run before the caller has stored the returned
 	// client: if a callback uses the client, publish it first (for example
 	// under a mutex, or through a channel the callback waits on).
