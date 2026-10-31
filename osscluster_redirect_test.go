@@ -210,6 +210,7 @@ func TestIsMovedSameConnAddr(t *testing.T) {
 		// check unbracketed IPv6 address.
 		{"MOVED 1 ::1:6379", "[::1]:6379", true},
 		{"MOVED 1 ::2:6379", "[::1]:6379", false},
+		{"MOVED 1 [::1]:6379", "::1:6379", true},
 		// Without a host the redirect is relative to the sending connection.
 		{"MOVED 1 :6380", "10.0.0.5:6380", true},
 		{"MOVED 1 :6381", "10.0.0.5:6380", false},

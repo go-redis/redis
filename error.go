@@ -288,7 +288,7 @@ func isMovedSameConnAddr(err error, addr string) bool {
 		return false
 	}
 
-	connHost, connPort, err := net.SplitHostPort(addr)
+	connHost, connPort, err := net.SplitHostPort(internal.GetAddr(addr))
 	if err != nil || movedPort != connPort {
 		return false
 	}
