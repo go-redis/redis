@@ -1709,3 +1709,46 @@ func TestCSCPolicyFullDuplexCloseWhileWaitingForPool(t *testing.T) {
 		t.Fatal("Close lost or duplicated accepted request", s.snapshot())
 	}
 }
+
+func TestCSCOptOutWrappersShareCommandMetadata(t *testing.T) {
+	// Custom readonly keyed command that only exists via Overrides. Without the
+	// parent store, Conn/Tx fall back to the static table, cscTrackable fails,
+	// and OPTOUT omits CLIENT CACHING NO (issue #4236 item 3).
+	info := cloneCommandInfo(defaultCommandMetadataView().records["get"])
+	c := NewClient(&Options{
+		Addr:                        "127.0.0.1:1",
+		Protocol:                    3,
+		ClientSideCacheConfig:       &ClientSideCacheConfig{MaxEntries: 8},
+		ClientSideCacheTrackingMode: TrackingModeOptOut,
+		CommandMetadata: &CommandMetadataConfig{
+			Overrides: map[string]*CommandInfo{"xcustomget": info},
+		},
+		MaintNotificationsConfig: &maintnotifications.Config{Mode: maintnotifications.ModeDisabled},
+	})
+	defer c.Close()
+	if c.cmdMeta == nil {
+		t.Fatal("expected a parent command-metadata store for overrides")
+	}
+	cmd := NewCmd(context.Background(), "xcustomget", "k")
+	if !c.cscTrackable(cmd) {
+		t.Fatal("parent should treat the override as trackable")
+	}
+
+	cn := c.Conn()
+	defer cn.Close()
+	if cn.cmdMeta != nil || cn.metadataSource != c.cmdMeta || cn.metadataView() != c.metadataView() {
+		t.Fatal("Conn did not borrow the parent metadata view")
+	}
+	if !cn.cscTrackable(cmd) {
+		t.Fatal("Conn ignored the parent CommandMetadata override")
+	}
+
+	tx := c.newTx()
+	defer tx.Close(context.Background())
+	if tx.cmdMeta != nil || tx.metadataSource != c.cmdMeta || tx.metadataView() != c.metadataView() {
+		t.Fatal("Tx did not borrow the parent metadata view")
+	}
+	if !tx.cscTrackable(cmd) {
+		t.Fatal("Tx ignored the parent CommandMetadata override")
+	}
+}

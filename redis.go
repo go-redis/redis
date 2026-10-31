@@ -1113,6 +1113,9 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 	// can suppress tracking on an OPTOUT connection.
 	conn.baseClient.cscPolicy = c.cscPolicy
 	conn.baseClient.cscPoolHook = c.cscPoolHook
+	// Custom CommandMetadata lives on the parent store; without it, OnConnect
+	// reads of overridden commands fall back to the static table and skip NO.
+	c.shareCommandMetadata(&conn.baseClient)
 	// This internal conn's init pipeline issues CLIENT TRACKING ON itself;
 	// exempt it from the guard that blocks user-issued CLIENT TRACKING. Setting
 	// the field after newConn is safe: initHooks bound the pipeline hook as a
@@ -3034,6 +3037,9 @@ func (c *Client) conn(discardOnClose bool) *Conn {
 	// credentials listener when a cold Conn/EphemeralConn initializes a fresh
 	// pool connection (issue #4154).
 	conn.baseClient.streamingCredentialsManager = c.streamingCredentialsManager
+	// Conn() never serves cache hits, but OPTOUT still prefixes uncached reads
+	// when cscTrackable is true — that lookup needs the parent's overrides.
+	c.baseClient.shareCommandMetadata(&conn.baseClient)
 	return conn
 }
 
