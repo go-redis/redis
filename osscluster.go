@@ -3251,6 +3251,14 @@ func (c *ClusterClient) processPipelineNodeConn(
 				c.himportRequeueFailedSets(ctx, cmds, failedCmds)
 			}
 		}
+		if err == nil || isRedisError(err) {
+			// ref to #1914: if a node was replaced within a same hostname, the
+			// connection still points to the old node, which answers MOVED with
+			// that same hostname. When returning MOVED, a connection will be dropped
+			if moved := movedToSameConnAddr(cmds, node.Client.getAddr()); moved != nil {
+				err = moved
+			}
+		}
 		return err
 	})
 }
@@ -3315,12 +3323,22 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 	return nil
 }
 
+// movedToSameConnAddr returns the first MOVED in cmds that points back to addr.
+func movedToSameConnAddr(cmds []Cmder, addr string) error {
+	for _, cmd := range cmds {
+		if err := cmd.rawErr(); isMovedSameConnAddr(err, addr) {
+			return err
+		}
+	}
+	return nil
+}
+
 // checkMovedErr queues cmd for the node a MOVED or ASK redirect points to.
 //
-// Unlike the single-command path (shouldRetry with isMovedSameConnAddr), it does
-// not drop the connection that sent a MOVED pointing back to the same address,
-// with or without a host, so Pipeline and TxPipeline may reuse that connection on
-// the retry. This is not handled yet.
+// It does not drop the connection itself. When a MOVED points back to the
+// address of the sending connection, processPipelineNodeConn returns that
+// MOVED (movedToSameConnAddr) so releaseConnToPool removes the connection, as
+// on the single-command path.
 func (c *ClusterClient) checkMovedErr(
 	ctx context.Context, from *clusterNode, cmd Cmder, err error, failedCmds *cmdsMap,
 ) bool {
@@ -3699,6 +3717,10 @@ func (c *ClusterClient) processTxPipelineNode(
 			connErr := outcome.err
 			if isRedisError(outcome.err) {
 				connErr = nil
+			}
+			if outcome.kind == txRetryMoved && isMovedSameConnAddr(outcome.err, node.Client.getAddr()) {
+				// in case we got stuck moving to the same node, release the connection
+				connErr = outcome.err
 			}
 			if outcome.unreadReplies {
 				connErr = errTxDirtyConn
