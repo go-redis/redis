@@ -29,11 +29,12 @@ func main() {
 	flag.Parse()
 
 	// A deadline makes NewMultiDBClient retry the initial health checks until
-	// InitialDBState is met or the deadline expires.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// InitialDBState is met or the deadline expires. It bounds construction
+	// only: startup can use most of it.
+	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	client, err := redis.NewMultiDBClient(ctx, &redis.MultiDBOptions{
+	client, err := redis.NewMultiDBClient(startCtx, &redis.MultiDBOptions{
 		// Members get ids 0 and 1, in slice order. The higher weight is
 		// preferred; weights are in (0, 1], and -1 disables a member.
 		Clients: []redis.MultiDBClientConfig{
@@ -51,6 +52,7 @@ func main() {
 	}
 	defer client.Close()
 
+	ctx := context.Background()
 	fmt.Println("active database:", client.ActiveDatabaseID())
 
 	// Commands go to the active member.

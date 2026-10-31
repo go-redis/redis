@@ -1458,6 +1458,59 @@ func TestMultiDBPipelineCallerCancelDoesNotPoisonBreaker(t *testing.T) {
 	}
 }
 
+// mixedCancelHook cancels the caller's ctx and fails the batch like a cluster
+// fan-out where one node's dial was cut by that cancel (the batch error) while
+// another node failed on its own.
+type mixedCancelHook struct{ cancel context.CancelFunc }
+
+func (h *mixedCancelHook) DialHook(next redis.DialHook) redis.DialHook          { return next }
+func (h *mixedCancelHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+
+func (h *mixedCancelHook) ProcessPipelineHook(redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		h.cancel()
+		cut := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("operation was canceled")}
+		cmds[0].SetErr(cut)
+		cmds[1].SetErr(io.EOF)
+		return cut
+	}
+}
+
+// A caller cancel that ends one node's dial must not hide another node's own
+// transport failure in the same batch: it is still recorded.
+func TestMultiDBPipelineCallerCancelRecordsIndependentFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	det := &fakeDetector{}
+	opts := baseOptions()
+	opts.FailureDetector = det
+	opts.Clients = []redis.MultiDBClientConfig{{
+		Options:      &redis.Options{Addr: "127.0.0.1:1"},
+		Weight:       0.5,
+		HealthChecks: []redis.MultiDBHealthCheck{newFakeHealthCheck(true)},
+	}}
+	initCtx, initCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer initCancel()
+	mdb, err := redis.NewMultiDBClient(initCtx, opts)
+	if err != nil {
+		t.Fatalf("NewMultiDBClient: %v", err)
+	}
+	defer mdb.Close()
+	if err := mdb.AddDatabaseHook(0, &mixedCancelHook{cancel: cancel}); err != nil {
+		t.Fatalf("AddDatabaseHook: %v", err)
+	}
+
+	_, _ = mdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+		p.Set(ctx, "a", "v", 0)
+		p.Set(ctx, "b", "v", 0)
+		return nil
+	})
+	if got := det.failures.Load(); got != 1 {
+		t.Errorf("detector failures = %d, want 1 (the independent io.EOF; the cut dial is neutral)", got)
+	}
+}
+
 func TestMultiDBTxAndWatchReturnContextErrorBeforeFailover(t *testing.T) {
 	dbA := newTestDB("a", "127.0.0.1:1", 0.75, true)
 	dbB := newTestDB("b", "127.0.0.1:2", 0.5, true)

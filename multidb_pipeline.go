@@ -481,19 +481,15 @@ func (c *multidbCore) processPipelineRetries(ctx context.Context, cmds []Cmder, 
 		err := db.processPipelineHook(context.WithValue(ctx, pipelineExecutedKey{}, executed), cmds)
 		if err != nil && ctx.Err() != nil {
 			// The caller's own context ended (deadline/cancel) while the batch
-			// ran. A context error or a dial cut short (callerEnded) is a
-			// client-side signal, not a health verdict: release any half-open
-			// reservation and return WITHOUT recording. Any other error (a
-			// member read timeout, a reset) is recorded: member socket I/O
-			// does not watch ctx unless ContextTimeoutEnabled is set.
-			// recordBatchOutcomes re-checks each command the same way: on a
-			// cluster fan-out another node's dial may have been cut too.
-			if callerEnded(ctx, err, db.ctxTimeouts()) {
-				db.cb.ReleaseFor(res)
-			} else {
-				c.recordBatchOutcomes(ctx, db, cmds, err, executed, res, dg)
-				db.cb.ReleaseFor(res)
-			}
+			// ran. Record per command, not by the batch error: a context error
+			// or a dial cut short (callerEnded) is a client-side signal and
+			// records nothing, while any other error (a member read timeout, a
+			// reset) is recorded, since member socket I/O does not watch ctx
+			// unless ContextTimeoutEnabled is set. On a cluster fan-out the
+			// batch error can be one node's cut dial while another node failed
+			// on its own. Then release any half-open reservation.
+			c.recordBatchOutcomes(ctx, db, cmds, err, executed, res, dg)
+			db.cb.ReleaseFor(res)
 			pendingDB = nil
 			// No retry either way: the caller's ctx is done.
 			//
