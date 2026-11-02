@@ -3251,6 +3251,14 @@ func (c *ClusterClient) processPipelineNodeConn(
 				c.himportRequeueFailedSets(ctx, cmds, failedCmds)
 			}
 		}
+		if err == nil || isRedisError(err) {
+			// ref to #1914: if a node was replaced within a same hostname, the
+			// connection still points to the old node, which answers MOVED with
+			// that same hostname. When returning MOVED, a connection will be dropped
+			if moved := movedToSameConnAddr(cmds, node.Client.getAddr()); moved != nil {
+				err = moved
+			}
+		}
 		return err
 	})
 }
@@ -3315,12 +3323,22 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 	return nil
 }
 
+// movedToSameConnAddr returns the first MOVED in cmds that points back to addr.
+func movedToSameConnAddr(cmds []Cmder, addr string) error {
+	for _, cmd := range cmds {
+		if err := cmd.rawErr(); isMovedSameConnAddr(err, addr) {
+			return err
+		}
+	}
+	return nil
+}
+
 // checkMovedErr queues cmd for the node a MOVED or ASK redirect points to.
 //
-// Unlike the single-command path (shouldRetry with isMovedSameConnAddr), it does
-// not drop the connection that sent a MOVED pointing back to the same address,
-// with or without a host, so Pipeline and TxPipeline may reuse that connection on
-// the retry. This is not handled yet.
+// It does not drop the connection itself. When a MOVED points back to the
+// address of the sending connection, processPipelineNodeConn returns that
+// MOVED (movedToSameConnAddr) so releaseConnToPool removes the connection, as
+// on the single-command path.
 func (c *ClusterClient) checkMovedErr(
 	ctx context.Context, from *clusterNode, cmd Cmder, err error, failedCmds *cmdsMap,
 ) bool {
@@ -3429,6 +3447,8 @@ type txOutcome struct {
 	addr          string
 	execErr       error
 	unreadReplies bool
+	// if one of the command reported MOVED error, we will store it here for the priority resolution
+	movedToSelf error
 }
 
 // txRedirect records the first queue-stage redirect (MOVED/ASK/TRYAGAIN) seen
@@ -3700,6 +3720,10 @@ func (c *ClusterClient) processTxPipelineNode(
 			if isRedisError(outcome.err) {
 				connErr = nil
 			}
+			if outcome.movedToSelf != nil {
+				// in case we got stuck moving to the same node, release the connection
+				connErr = outcome.movedToSelf
+			}
 			if outcome.unreadReplies {
 				connErr = errTxDirtyConn
 			}
@@ -3816,6 +3840,7 @@ func (c *ClusterClient) readTxPipelineReplies(
 	// Queue replies: +QUEUED, or a redirect / command error that dirties the tx.
 	var firstRedirect *txRedirect
 	var firstFatal error
+	var movedToSelf error
 	for _, cmd := range cmds {
 		err := readStatus()
 		if err == nil {
@@ -3823,6 +3848,9 @@ func (c *ClusterClient) readTxPipelineReplies(
 		}
 		if !isRedisError(err) {
 			return c.txReadFatal(err) // IO error
+		}
+		if movedToSelf == nil && isMovedSameConnAddr(err, node.Client.getAddr()) {
+			movedToSelf = err
 		}
 		if moved, ask, addr := isMovedError(err); moved || ask {
 			if firstRedirect == nil {
@@ -3851,7 +3879,12 @@ func (c *ClusterClient) readTxPipelineReplies(
 		if !isRedisError(err) {
 			return c.txReadFatal(err) // IO error
 		}
-		return c.classifyExecError(err, firstRedirect, firstFatal)
+		if movedToSelf == nil && isMovedSameConnAddr(err, node.Client.getAddr()) {
+			movedToSelf = err // MOVED came from EXEC
+		}
+		outcome := c.classifyExecError(err, firstRedirect, firstFatal)
+		outcome.movedToSelf = movedToSelf
+		return outcome
 	}
 
 	if line[0] != proto.RespArray {
