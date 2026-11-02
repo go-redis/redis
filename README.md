@@ -770,10 +770,11 @@ health checks and policies (lag-aware, probe counts) live in the
 `github.com/redis/go-redis/v9/multidb` package.
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// The deadline bounds startup only: NewMultiDBClient can use most of it.
+startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 defer cancel()
 
-client, err := redis.NewMultiDBClient(ctx, &redis.MultiDBOptions{
+client, err := redis.NewMultiDBClient(startCtx, &redis.MultiDBOptions{
 	Clients: []redis.MultiDBClientConfig{
 		{Options: &redis.Options{Addr: "east.example.com:6379"}, Weight: 1.0},
 		{Options: &redis.Options{Addr: "west.example.com:6379"}, Weight: 0.5},
@@ -784,6 +785,7 @@ if err != nil {
 }
 defer client.Close()
 
+ctx := context.Background()
 if err := client.Set(ctx, "key", "value", 0).Err(); err != nil {
 	panic(err)
 }

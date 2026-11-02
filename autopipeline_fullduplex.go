@@ -2060,20 +2060,22 @@ func (fd *fdEngine) session(bg context.Context, cn *pool.Conn, carry []fdReq) (u
 							// owns the whole cluster retry budget; startAttempt is unused by the
 							// cluster reprocess. shouldRetry(e) here matches only reply-level Redis
 							// errors (see the fdReplyIsFatal note above).
-							if fd.redirectAware && shouldRetry(e, false) {
-								fd.retryOnNormalConn(req, retryStartAttempt(false, false))
-								done++
-								continue
-							}
-							// An owner with its own retry policy (MultiDB) reruns a retryable
-							// reply through its path, like a dropped session's tail: the member
-							// client's MaxRetries is commonly off there. req.attempts counts the
-							// executions done, so the guard keeps the total within
-							// ownerRetryBudget+1; once spent, the reply settles inline below.
+							//
+							// An owner with its own retry policy (MultiDB) goes first, also for a
+							// cluster member: it reruns a retryable reply through its path, like a
+							// dropped session's tail, so the retry can fail over to another member
+							// and keeps submit order. req.attempts counts the executions done, so
+							// the guard keeps the total within ownerRetryBudget+1; once spent, the
+							// reply settles inline below.
 							ownerRetries := fd.ownerRetries && fd.reroute != nil
 							if ownerRetries && !moved && !ask && shouldRetry(e, false) &&
 								req.attempts <= fd.ownerRetryBudget {
 								fd.rerouteReplyToOwner(req, e)
+								done++
+								continue
+							}
+							if !ownerRetries && fd.redirectAware && shouldRetry(e, false) {
+								fd.retryOnNormalConn(req, retryStartAttempt(false, false))
 								done++
 								continue
 							}

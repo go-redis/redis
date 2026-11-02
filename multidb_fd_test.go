@@ -1413,6 +1413,60 @@ func TestMultiDBFullDuplexRetryableReplyFailsOver(t *testing.T) {
 	}
 }
 
+// A retryable reply on a cluster member's FD child follows MultiDB's retry
+// policy too: the retry fails over to the other member instead of being
+// retried on the same cluster.
+func TestMultiDBFullDuplexClusterRetryableReplyFailsOver(t *testing.T) {
+	a, b := newFDStateServer(t), newFDStateServer(t)
+	a.readOnly.Store(true)
+	clusterMember := MultiDBClientConfig{
+		ClusterOptions: &ClusterOptions{
+			Addrs:      []string{a.addr()},
+			Protocol:   2,
+			MaxRetries: -1,
+			ClusterSlots: func(context.Context) ([]ClusterSlot, error) {
+				return []ClusterSlot{{Start: 0, End: 16383, Nodes: []ClusterNode{{Addr: a.addr()}}}}, nil
+			},
+		},
+		Weight: 0.75,
+	}
+	standalone := MultiDBClientConfig{
+		Options: &Options{Addr: b.addr(), Protocol: 2, DisableIdentity: true, MaxRetries: -1},
+		Weight:  0.5,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	mdb, err := NewMultiDBClient(ctx, &MultiDBOptions{
+		Clients:              []MultiDBClientConfig{clusterMember, standalone},
+		HealthCheckInterval:  time.Hour,
+		HealthChecks:         []MultiDBHealthCheck{onePingCheck{}},
+		CircuitBreakerConfig: &MultiDBCircuitBreakerConfig{FailureThreshold: 1, SuccessThreshold: 1, GracePeriod: time.Hour},
+		CommandRetries:       2,
+		AutoFallbackInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("NewMultiDBClient: %v", err)
+	}
+	t.Cleanup(func() { _ = mdb.Close() })
+	ap, err := mdb.AutoPipelineWithOptions(&AutoPipelineOptions{FullDuplex: true})
+	if err != nil {
+		t.Fatalf("AutoPipeline: %v", err)
+	}
+	if ap.mdbFD == nil {
+		t.Fatal("full duplex not engaged")
+	}
+	if child, _ := ap.mdbFD.childFor(mdb.core.dbByID(0)); child == nil || child.clusterFD == nil {
+		t.Skip("cluster member has no cluster FD child here")
+	}
+	if err := ap.Set(context.Background(), "k", "v", 0).Err(); err != nil {
+		t.Fatalf("Set: %v, want served by the standalone member", err)
+	}
+	if a.setCalls.Load() != 1 || b.setCalls.Load() != 1 {
+		t.Fatalf("SETs: cluster=%d standalone=%d, want 1 each (one READONLY on the cluster, then failover)",
+			a.setCalls.Load(), b.setCalls.Load())
+	}
+}
+
 // A command that keeps getting a retryable reply runs at most
 // CommandRetries+1 times in total, FD attempt included.
 func TestMultiDBFullDuplexRetryableReplyBudget(t *testing.T) {
