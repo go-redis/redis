@@ -3275,14 +3275,15 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 ) error {
 	// Commands redirected by MOVED/ASK are already queued for their new
 	// node, so a whole-batch retry must not queue them again.
-	var redirected map[Cmder]struct{}
+	// Track them by index: a Cmder value is not always comparable.
+	var redirected []bool
 	retryCmds := func() []Cmder {
-		if len(redirected) == 0 {
+		if redirected == nil {
 			return cmds
 		}
-		retry := make([]Cmder, 0, len(cmds)-len(redirected))
-		for _, cmd := range cmds {
-			if _, ok := redirected[cmd]; !ok {
+		retry := make([]Cmder, 0, len(cmds))
+		for i, cmd := range cmds {
+			if !redirected[i] {
 				retry = append(retry, cmd)
 			}
 		}
@@ -3315,9 +3316,9 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 
 		if c.checkMovedErr(ctx, node, cmd, err, failedCmds) {
 			if redirected == nil {
-				redirected = make(map[Cmder]struct{})
+				redirected = make([]bool, len(cmds))
 			}
-			redirected[cmd] = struct{}{}
+			redirected[i] = true
 			continue
 		}
 

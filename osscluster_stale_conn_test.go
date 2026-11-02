@@ -258,12 +258,16 @@ func TestClusterPipelineRetryDoesNotDuplicateRedirect(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 	ctx := context.Background()
 
+	// A Cmder value with a slice is not comparable and must not be hashed.
+	type taggedCmd struct {
+		*IntCmd
+		tags []string
+	}
 	var set *StatusCmd
-	var incr *IntCmd
+	incr := taggedCmd{IntCmd: NewIntCmd(ctx, "incr", "counter"), tags: []string{"t"}}
 	_, _ = client.Pipelined(ctx, func(pipe Pipeliner) error {
 		set = pipe.Set(ctx, "key", "v", 0)
-		incr = pipe.Incr(ctx, "counter")
-		return nil
+		return pipe.Process(ctx, incr)
 	})
 
 	if err := set.Err(); err != nil {
