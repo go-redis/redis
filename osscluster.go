@@ -3447,6 +3447,8 @@ type txOutcome struct {
 	addr          string
 	execErr       error
 	unreadReplies bool
+	// if one of the command reported MOVED error, we will store it here for the priority resolution
+	movedToSelf error
 }
 
 // txRedirect records the first queue-stage redirect (MOVED/ASK/TRYAGAIN) seen
@@ -3718,9 +3720,9 @@ func (c *ClusterClient) processTxPipelineNode(
 			if isRedisError(outcome.err) {
 				connErr = nil
 			}
-			if outcome.kind == txRetryMoved && isMovedSameConnAddr(outcome.err, node.Client.getAddr()) {
+			if outcome.movedToSelf != nil {
 				// in case we got stuck moving to the same node, release the connection
-				connErr = outcome.err
+				connErr = outcome.movedToSelf
 			}
 			if outcome.unreadReplies {
 				connErr = errTxDirtyConn
@@ -3838,6 +3840,7 @@ func (c *ClusterClient) readTxPipelineReplies(
 	// Queue replies: +QUEUED, or a redirect / command error that dirties the tx.
 	var firstRedirect *txRedirect
 	var firstFatal error
+	var movedToSelf error
 	for _, cmd := range cmds {
 		err := readStatus()
 		if err == nil {
@@ -3845,6 +3848,9 @@ func (c *ClusterClient) readTxPipelineReplies(
 		}
 		if !isRedisError(err) {
 			return c.txReadFatal(err) // IO error
+		}
+		if movedToSelf == nil && isMovedSameConnAddr(err, node.Client.getAddr()) {
+			movedToSelf = err
 		}
 		if moved, ask, addr := isMovedError(err); moved || ask {
 			if firstRedirect == nil {
@@ -3873,7 +3879,12 @@ func (c *ClusterClient) readTxPipelineReplies(
 		if !isRedisError(err) {
 			return c.txReadFatal(err) // IO error
 		}
-		return c.classifyExecError(err, firstRedirect, firstFatal)
+		if movedToSelf == nil && isMovedSameConnAddr(err, node.Client.getAddr()) {
+			movedToSelf = err // MOVED came from EXEC
+		}
+		outcome := c.classifyExecError(err, firstRedirect, firstFatal)
+		outcome.movedToSelf = movedToSelf
+		return outcome
 	}
 
 	if line[0] != proto.RespArray {

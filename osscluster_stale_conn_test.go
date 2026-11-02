@@ -2,7 +2,10 @@ package redis
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -122,6 +125,7 @@ func TestClusterMovedToSameAddrMixedBatch(t *testing.T) {
 		replies      map[string]string // stale server replies besides the MOVED to GET
 		himport      bool
 		otherFirst   bool
+		tx           bool
 		maxRedirects int
 		cmd          func(ctx context.Context, pipe Pipeliner) Cmder
 	}{
@@ -130,6 +134,15 @@ func TestClusterMovedToSameAddrMixedBatch(t *testing.T) {
 			name:         "retryable first reply",
 			replies:      map[string]string{"set": "-TRYAGAIN Multiple keys request during rehashing of slot\r\n"},
 			otherFirst:   true,
+			maxRedirects: 1,
+			cmd:          func(ctx context.Context, pipe Pipeliner) Cmder { return pipe.Set(ctx, "key", "v", 0) },
+		},
+		{
+			// TRYAGAIN goes first
+			name:         "tx retryable first reply",
+			replies:      map[string]string{"set": "-TRYAGAIN Multiple keys request during rehashing of slot\r\n"},
+			otherFirst:   true,
+			tx:           true,
 			maxRedirects: 1,
 			cmd:          func(ctx context.Context, pipe Pipeliner) Cmder { return pipe.Set(ctx, "key", "v", 0) },
 		},
@@ -164,9 +177,13 @@ func TestClusterMovedToSameAddrMixedBatch(t *testing.T) {
 			replaced.Store(true)
 			switchTo(freshSrv)
 
+			run := client.Pipelined
+			if tc.tx {
+				run = client.TxPipelined
+			}
 			var other Cmder
 			var get *StringCmd
-			_, _ = client.Pipelined(ctx, func(pipe Pipeliner) error {
+			_, _ = run(ctx, func(pipe Pipeliner) error {
 				if tc.otherFirst {
 					other = tc.cmd(ctx, pipe)
 				}
@@ -242,24 +259,34 @@ func newMovedTestServer(t *testing.T, target string, gets *atomic.Int32, overrid
 }
 
 func newOKTestServer(t *testing.T, gets *atomic.Int32) string {
-	var queued atomic.Bool
+	var queued []string // replies of the commands queued since MULTI; nil outside a transaction
+	var mu sync.Mutex
 	return newClusterCSCTestServer(t, func(cmd string) string {
+		reply := "+OK\r\n"
 		switch cmd {
 		case "hello":
 			return "%0\r\n"
 		case "multi":
-			queued.Store(true)
+			mu.Lock()
+			queued = []string{}
+			mu.Unlock()
 			return "+OK\r\n"
+		case "exec":
+			mu.Lock()
+			defer mu.Unlock()
+			replies := fmt.Sprintf("*%d\r\n%s", len(queued), strings.Join(queued, ""))
+			queued = nil
+			return replies
 		case "get":
 			gets.Add(1)
-			if queued.Load() {
-				return "+QUEUED\r\n"
-			}
-			return "$2\r\nok\r\n"
-		case "exec":
-			queued.Store(false)
-			return "*1\r\n$2\r\nok\r\n"
+			reply = "$2\r\nok\r\n"
 		}
-		return "+OK\r\n"
+		mu.Lock()
+		defer mu.Unlock()
+		if queued != nil {
+			queued = append(queued, reply)
+			return "+QUEUED\r\n"
+		}
+		return reply
 	})
 }
