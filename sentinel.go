@@ -1097,7 +1097,8 @@ func (c *sentinelFailover) sharedLookupTimeout() time.Duration {
 	case read == 0:
 		read = 5 * time.Second
 	}
-	return dial + read
+	// replicaAddrsOnce tries the sentinels one after another.
+	return (dial + read) * time.Duration(len(c.opt.SentinelAddrs)+1)
 }
 
 func (c *sentinelFailover) MasterAddr(ctx context.Context) (string, error) {
