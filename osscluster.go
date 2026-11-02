@@ -3273,6 +3273,17 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 	route *clusterPipelineRouting,
 	flags []byte,
 ) error {
+	redirects := newCmdsMap()
+	remapped := false
+	defer func() {
+		if remapped {
+			return
+		}
+		for node, cmds := range redirects.m {
+			failedCmds.Add(node, cmds...)
+		}
+	}()
+
 	for i, cmd := range cmds {
 		if flags != nil && flags[i] != 0 {
 			if err := node.Client.readCSCPipelinePrefix(ctx, cn, rd); err != nil {
@@ -3297,7 +3308,7 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 			continue
 		}
 
-		if c.checkMovedErr(ctx, node, cmd, err, failedCmds) {
+		if c.checkMovedErr(ctx, node, cmd, err, redirects) {
 			continue
 		}
 
@@ -3307,7 +3318,7 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 
 		if !isRedisError(err) {
 			if shouldRetry(err, true) && !cmdsContainNoRetry(cmds) {
-				_ = c.mapCmdsByNodeInView(ctx, failedCmds, cmds, route)
+				remapped = c.mapCmdsByNodeInView(ctx, failedCmds, cmds, route) == nil
 			}
 			setCmdsErr(cmds[i+1:], err)
 			return err
@@ -3316,7 +3327,7 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 
 	// rawErr: execution path; never await an async command's batch here.
 	if err := cmds[0].rawErr(); err != nil && shouldRetry(err, true) && !cmdsContainNoRetry(cmds) {
-		_ = c.mapCmdsByNodeInView(ctx, failedCmds, cmds, route)
+		remapped = c.mapCmdsByNodeInView(ctx, failedCmds, cmds, route) == nil
 		return err
 	}
 

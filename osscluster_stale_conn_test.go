@@ -207,6 +207,76 @@ func TestClusterMovedToSameAddrMixedBatch(t *testing.T) {
 	}
 }
 
+// TestClusterPipelineRetryDoesNotDuplicateRedirect tests a batch whose first
+// reply is retryable while a later command gets MOVED. The redirected command
+// must be sent to its new node only once.
+func TestClusterPipelineRetryDoesNotDuplicateRedirect(t *testing.T) {
+	const srcAddr, dstAddr = "node-a:6379", "node-b:6379"
+	var tryAgain atomic.Bool
+	tryAgain.Store(true)
+	srcSrv := newClusterCSCTestServer(t, func(cmd string) string {
+		switch cmd {
+		case "hello":
+			return "%0\r\n"
+		case "set":
+			if tryAgain.Swap(false) {
+				return "-TRYAGAIN Multiple keys request during rehashing of slot\r\n"
+			}
+		case "incr":
+			return "-MOVED 0 " + dstAddr + "\r\n"
+		}
+		return "+OK\r\n"
+	})
+	var incrs atomic.Int32
+	dstSrv := newClusterCSCTestServer(t, func(cmd string) string {
+		switch cmd {
+		case "hello":
+			return "%0\r\n"
+		case "incr":
+			return fmt.Sprintf(":%d\r\n", incrs.Add(1))
+		}
+		return "+OK\r\n"
+	})
+
+	client := NewClusterClient(&ClusterOptions{
+		Protocol:                 3,
+		DisableIdentity:          true,
+		MaxRedirects:             3,
+		MaintNotificationsConfig: &maintnotifications.Config{Mode: maintnotifications.ModeDisabled},
+		ClusterSlots: func(context.Context) ([]ClusterSlot, error) {
+			return []ClusterSlot{{Start: 0, End: 16383, Nodes: []ClusterNode{{Addr: srcAddr}}}}, nil
+		},
+		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			target := srcSrv
+			if addr == dstAddr {
+				target = dstSrv
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, "127.0.0.1"+target)
+		},
+	})
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+
+	var set *StatusCmd
+	var incr *IntCmd
+	_, _ = client.Pipelined(ctx, func(pipe Pipeliner) error {
+		set = pipe.Set(ctx, "key", "v", 0)
+		incr = pipe.Incr(ctx, "counter")
+		return nil
+	})
+
+	if err := set.Err(); err != nil {
+		t.Fatalf("set error: %q; want nil", err)
+	}
+	if val, err := incr.Result(); err != nil || val != 1 {
+		t.Fatalf("incr %d, error: %q; want 1, nil", val, err)
+	}
+	if n := incrs.Load(); n != 1 {
+		t.Fatalf("destination served %d INCRs, want 1", n)
+	}
+}
+
 // newSwitchedClusterClient returns a client and func for host reslver.
 func newSwitchedClusterClient(t *testing.T, addr, srv string, maxRedirects int) (*ClusterClient, func(string)) {
 	var target atomic.Value
