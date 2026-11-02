@@ -859,7 +859,12 @@ func (cmd *Cmd) Int() (int, error) {
 	}
 	switch val := cmd.val.(type) {
 	case int64:
-		return int(val), nil
+		if n := int(val); int64(n) == val {
+			return n, nil
+		}
+		// int is 32 bits on 386 and arm: give the range error Atoi gives
+		// for the same number in a bulk string, not a truncated value.
+		return strconv.Atoi(strconv.FormatInt(val, 10))
 	case string:
 		return strconv.Atoi(val)
 	case float64:
