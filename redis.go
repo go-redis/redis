@@ -1178,6 +1178,7 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 		// atomically claims callbacks, so unsubscribe still runs only once.
 		if cn.IsClosed() {
 			_ = cn.Close()
+			return fmt.Errorf("connection closed during streaming credentials setup: %w", pool.ErrClosed)
 		}
 
 		username, password = credentials.BasicAuth()
