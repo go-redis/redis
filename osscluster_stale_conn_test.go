@@ -209,7 +209,7 @@ func TestClusterMovedToSameAddrMixedBatch(t *testing.T) {
 
 // TestClusterPipelineRetryDoesNotDuplicateRedirect tests a batch whose first
 // reply is retryable while a later command gets MOVED. The redirected command
-// must be sent to its new node only once.
+// must be sent to its new node only once, in the same retry round.
 func TestClusterPipelineRetryDoesNotDuplicateRedirect(t *testing.T) {
 	const srcAddr, dstAddr = "node-a:6379", "node-b:6379"
 	var tryAgain atomic.Bool
@@ -241,7 +241,7 @@ func TestClusterPipelineRetryDoesNotDuplicateRedirect(t *testing.T) {
 	client := NewClusterClient(&ClusterOptions{
 		Protocol:                 3,
 		DisableIdentity:          true,
-		MaxRedirects:             3,
+		MaxRedirects:             1,
 		MaintNotificationsConfig: &maintnotifications.Config{Mode: maintnotifications.ModeDisabled},
 		ClusterSlots: func(context.Context) ([]ClusterSlot, error) {
 			return []ClusterSlot{{Start: 0, End: 16383, Nodes: []ClusterNode{{Addr: srcAddr}}}}, nil

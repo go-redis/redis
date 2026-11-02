@@ -3273,16 +3273,21 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 	route *clusterPipelineRouting,
 	flags []byte,
 ) error {
-	redirects := newCmdsMap()
-	remapped := false
-	defer func() {
-		if remapped {
-			return
+	// Commands redirected by MOVED/ASK are already queued for their new
+	// node, so a whole-batch retry must not queue them again.
+	var redirected map[Cmder]struct{}
+	retryCmds := func() []Cmder {
+		if len(redirected) == 0 {
+			return cmds
 		}
-		for node, cmds := range redirects.m {
-			failedCmds.Add(node, cmds...)
+		retry := make([]Cmder, 0, len(cmds)-len(redirected))
+		for _, cmd := range cmds {
+			if _, ok := redirected[cmd]; !ok {
+				retry = append(retry, cmd)
+			}
 		}
-	}()
+		return retry
+	}
 
 	for i, cmd := range cmds {
 		if flags != nil && flags[i] != 0 {
@@ -3308,7 +3313,11 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 			continue
 		}
 
-		if c.checkMovedErr(ctx, node, cmd, err, redirects) {
+		if c.checkMovedErr(ctx, node, cmd, err, failedCmds) {
+			if redirected == nil {
+				redirected = make(map[Cmder]struct{})
+			}
+			redirected[cmd] = struct{}{}
 			continue
 		}
 
@@ -3318,7 +3327,7 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 
 		if !isRedisError(err) {
 			if shouldRetry(err, true) && !cmdsContainNoRetry(cmds) {
-				remapped = c.mapCmdsByNodeInView(ctx, failedCmds, cmds, route) == nil
+				_ = c.mapCmdsByNodeInView(ctx, failedCmds, retryCmds(), route)
 			}
 			setCmdsErr(cmds[i+1:], err)
 			return err
@@ -3327,7 +3336,7 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 
 	// rawErr: execution path; never await an async command's batch here.
 	if err := cmds[0].rawErr(); err != nil && shouldRetry(err, true) && !cmdsContainNoRetry(cmds) {
-		remapped = c.mapCmdsByNodeInView(ctx, failedCmds, cmds, route) == nil
+		_ = c.mapCmdsByNodeInView(ctx, failedCmds, retryCmds(), route)
 		return err
 	}
 
