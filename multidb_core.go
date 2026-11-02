@@ -2458,6 +2458,11 @@ func (c *multidbCore) newPubSub() *PubSub {
 	// on the right member's pool.
 	var ownersMu sync.Mutex
 	owners := make(map[*pool.Conn]*Client)
+	// handoffAddrs holds the endpoint a member's connection was moved to by a
+	// maintenance handoff (MOVING). Keyed by member so a failover never dials
+	// another member's endpoint. The addr argument of newConn is not used: it
+	// is the PubSub's single opt.Addr, which does not follow the member.
+	handoffAddrs := make(map[*Client]string)
 
 	// Terminality of "a cluster member is active and no standalone can serve the
 	// subscription" is decided by the config at creation, not by live
@@ -2496,7 +2501,13 @@ func (c *multidbCore) newPubSub() *PubSub {
 			// Limiter admission, and closes the conn on failure. A member
 			// removed meanwhile answers with the pool's ErrClosed, which
 			// pubSubDialErr keeps terminal for the channel loops.
-			cn, err := db.c.newPubSubConn(ctx, db.c.opt.Addr, channels)
+			addr := db.c.opt.Addr
+			ownersMu.Lock()
+			if a := handoffAddrs[db.c]; a != "" {
+				addr = a
+			}
+			ownersMu.Unlock()
+			cn, err := db.c.newPubSubConn(ctx, addr, channels)
 			if err != nil {
 				return nil, pubSubDialErr(db, err, c.closed.Load())
 			}
@@ -2517,6 +2528,11 @@ func (c *multidbCore) newPubSub() *PubSub {
 		closeConn: func(cn *pool.Conn) error {
 			ownersMu.Lock()
 			owner := owners[cn]
+			// PubSub.reconnect closes a connection marked for handoff before
+			// re-dialing: remember the new endpoint for its member.
+			if ep := cn.GetHandoffEndpoint(); owner != nil && cn.ShouldHandoff() && ep != "" && ep != internal.RedisNull {
+				handoffAddrs[owner] = ep
+			}
 			ownersMu.Unlock()
 			if owner != nil {
 				owner.pubSubPool.UntrackConn(cn)

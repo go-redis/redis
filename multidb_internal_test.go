@@ -2785,6 +2785,135 @@ func TestMultiDBPubSubDropsPushesOnClosedConnection(t *testing.T) {
 	}
 }
 
+// pubSubDialRecorder is a MultiDB with two fake standalone members whose
+// dialer records every address it is asked to dial.
+func pubSubDialRecorder(t *testing.T) (*MultiDBClient, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var dials []string
+	dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		mu.Lock()
+		dials = append(dials, addr)
+		mu.Unlock()
+		return helloRespondingDialer(ctx, network, addr)
+	}
+	member := func(addr string) *Options {
+		return &Options{Addr: addr, Dialer: dialer, Protocol: 2, DisableIdentity: true}
+	}
+	opts := &MultiDBOptions{
+		HealthCheckInterval:  time.Hour,
+		AutoFallbackInterval: -1,
+		HealthCheckTimeout:   time.Second,
+		Clients: []MultiDBClientConfig{
+			{Options: member("127.0.0.1:1"), Weight: 0.75, HealthChecks: []MultiDBHealthCheck{okLivenessCheck{}}},
+			{Options: member("127.0.0.1:2"), Weight: 0.5, HealthChecks: []MultiDBHealthCheck{okLivenessCheck{}}},
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	mdb, err := NewMultiDBClient(ctx, opts)
+	if err != nil {
+		t.Fatalf("NewMultiDBClient: %v", err)
+	}
+	t.Cleanup(func() { _ = mdb.Close() })
+	mu.Lock()
+	dials = nil
+	mu.Unlock()
+	return mdb, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), dials...)
+	}
+}
+
+// A handoff (MOVING) on a PubSub connection re-dials the new endpoint of the
+// member that owns the connection, and only that member.
+func TestMultiDBPubSubHandoffDialsNewEndpoint(t *testing.T) {
+	mdb, dials := pubSubDialRecorder(t)
+	ctx := context.Background()
+	ps := mdb.core.newPubSub()
+	t.Cleanup(func() { _ = ps.Close() })
+	if err := ps.Subscribe(ctx, "ch"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if err := ps.cn.MarkForHandoff("127.0.0.1:9", 1); err != nil {
+		t.Fatalf("MarkForHandoff: %v", err)
+	}
+	ps.mu.Lock()
+	ps.releaseConn(ctx, ps.cn, nil, false)
+	ps.mu.Unlock()
+	if got := dials(); len(got) != 2 || got[1] != "127.0.0.1:9" {
+		t.Fatalf("dials = %v, want the handoff endpoint 127.0.0.1:9 last", got)
+	}
+
+	// After a failover the handoff endpoint of member 0 must not be used.
+	mdb.core.active.Store(1)
+	ps.forceReconnect(ctx, errors.New("switch"))
+	if got := dials(); len(got) != 3 || got[2] != "127.0.0.1:2" {
+		t.Fatalf("dials = %v, want member 1's address 127.0.0.1:2 last", got)
+	}
+
+	// Failing back to member 0 dials its handoff endpoint again.
+	mdb.core.active.Store(0)
+	ps.forceReconnect(ctx, errors.New("switch"))
+	if got := dials(); len(got) != 4 || got[3] != "127.0.0.1:9" {
+		t.Fatalf("dials = %v, want member 0's handoff endpoint 127.0.0.1:9 last", got)
+	}
+}
+
+// An empty, never-connected PubSub does not dial on an active-database change.
+func TestMultiDBPubSubForceReconnectSkipsEmptyHandle(t *testing.T) {
+	mdb, dials := pubSubDialRecorder(t)
+	ps := mdb.core.newPubSub()
+	t.Cleanup(func() { _ = ps.Close() })
+	ps.forceReconnect(context.Background(), errors.New("switch"))
+	if got := dials(); len(got) != 0 {
+		t.Fatalf("dials = %v, want none for an empty PubSub", got)
+	}
+}
+
+// A reconnect whose switch was superseded (ctx canceled) while it waited for
+// the PubSub mutex must not close the connection the newer switch made.
+func TestMultiDBPubSubSupersededReconnectKeepsConn(t *testing.T) {
+	mdb, dials := pubSubDialRecorder(t)
+	ps := mdb.core.newPubSub()
+	t.Cleanup(func() { _ = ps.Close() })
+	if err := ps.Subscribe(context.Background(), "ch"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	cn := ps.cn
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ps.forceReconnect(ctx, errors.New("switch"))
+	if ps.cn != cn || cn.IsClosed() || len(dials()) != 1 {
+		t.Fatalf("superseded reconnect replaced the live connection (dials %v)", dials())
+	}
+}
+
+// unsettledCmds must not resend the followers of a blocking command's
+// neutral deadline: they carry the same propagated error, and
+// recordBatchOutcomes counts them as neutral.
+func TestUnsettledCmdsSkipsPropagatedBlockingTimeout(t *testing.T) {
+	blpop := NewStatusCmd(context.Background(), "blpop", "k", "5")
+	blpop.setReadTimeout(5 * time.Second)
+	get := NewStatusCmd(context.Background(), "get", "k")
+	other := NewStatusCmd(context.Background(), "set", "k2", "v")
+	e := &batchTimeoutErr{}
+	blpop.SetErr(e)
+	get.SetErr(e)                     // propagated from the blocker
+	other.SetErr(io.ErrUnexpectedEOF) // another node's transport failure
+	cmds := []Cmder{blpop, get, other}
+
+	next := unsettledCmds(cmds, execAll(cmds))
+	if len(next) != 1 || next[0] != other {
+		names := make([]string, 0, len(next))
+		for _, c := range next {
+			names = append(names, c.Name())
+		}
+		t.Fatalf("unsettled = %v, want only [set]", names)
+	}
+}
+
 // resetInsideRecordSuccessFD is resetInsideRecordFD's success twin: its
 // RecordSuccess first resets the core's detector window, then counts the
 // success, as a pre-reset success arriving into the fresh window would.

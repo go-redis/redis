@@ -205,6 +205,15 @@ func (c *PubSub) forceReconnect(ctx context.Context, reason error) {
 	if c.closed {
 		return
 	}
+	// A canceled ctx means a newer switch superseded this one; its own
+	// reconnect may already hold the new connection.
+	if ctx.Err() != nil {
+		return
+	}
+	// Nothing to move: an empty handle dials lazily on first use.
+	if c.cn == nil && len(c.channels) == 0 && len(c.patterns) == 0 && len(c.schannels) == 0 {
+		return
+	}
 	c.reconnect(ctx, reason)
 }
 

@@ -103,43 +103,16 @@ func (c *multidbCore) recordBatchOutcomes(ctx context.Context, db *multidbDataba
 	// Errors are matched by identity, not errors.Is: the readers stamp the
 	// same value, and an independent failure on another node can wrap the
 	// same sentinel (e.g. os.ErrDeadlineExceeded) as the blocker's timeout.
-	var neutralPropagated []error
-	var seen []error
-	for _, cmd := range cmds {
-		err := cmd.rawErr()
-		if err == nil || isRedisError(err) {
-			continue
-		}
-		known := false
-		for _, s := range seen {
-			if sameErr(err, s) {
-				known = true
-				break
-			}
-		}
-		if known {
-			continue
-		}
-		seen = append(seen, err)
-		if cmd.readTimeout() != nil && classifyOutcome(err, false) == outcomeNeutral {
-			neutralPropagated = append(neutralPropagated, err)
-		}
-	}
+	batchOutcome := batchOutcomeFunc(cmds)
 	// After the caller's ctx ended, each command is checked on its own: on a
 	// cluster fan-out one node's dial can be cut by ctx while another node's
 	// read times out, and the batch error carries only one of them.
 	ctxTimeouts := db.ctxTimeouts()
 	classify := func(cmd Cmder) outcomeKind {
-		err := cmd.rawErr()
-		if callerEnded(ctx, err, ctxTimeouts) {
+		if callerEnded(ctx, cmd.rawErr(), ctxTimeouts) {
 			return outcomeNeutral
 		}
-		for _, origin := range neutralPropagated {
-			if sameErr(err, origin) {
-				return outcomeNeutral
-			}
-		}
-		return classifyOutcome(err, cmd.readTimeout() == nil)
+		return batchOutcome(cmd)
 	}
 	// The GLOBAL detector (and successSinceFailover) is fed only while this
 	// member is STILL the active — re-checked per recorded outcome, not once up
@@ -1126,12 +1099,54 @@ func (c *MultiDBClient) AsyncAutoPipelineWithOptions(config *AutoPipelineOptions
 // a cluster member's healthy-node writes do not run twice. A standalone member
 // stamps a mid-pipeline drop on every command of the batch, replied or not, so
 // there the whole batch is resent, as before.
+//
+// Followers carrying a blocking command's neutral deadline are not resent,
+// matching recordBatchOutcomes (see batchOutcomeFunc).
 func unsettledCmds(cmds []Cmder, executed *executedCmds) []Cmder {
+	outcome := batchOutcomeFunc(cmds)
 	out := make([]Cmder, 0, len(cmds))
 	for _, cmd := range cmds {
-		if !executed.has(cmd) || classifyOutcome(cmd.rawErr(), cmd.readTimeout() == nil) == outcomeFailure {
+		if !executed.has(cmd) || outcome(cmd) == outcomeFailure {
 			out = append(out, cmd)
 		}
 	}
 	return out
+}
+
+// batchOutcomeFunc returns the per-command outcome classifier of a batch: a
+// command carrying the same error as a blocking command's neutral deadline
+// that first carried it (the reader's propagation) is neutral too; anything
+// else is classified on its own read timeout.
+func batchOutcomeFunc(cmds []Cmder) func(Cmder) outcomeKind {
+	var neutralPropagated []error
+	var seen []error
+	for _, cmd := range cmds {
+		err := cmd.rawErr()
+		if err == nil || isRedisError(err) {
+			continue
+		}
+		known := false
+		for _, s := range seen {
+			if sameErr(err, s) {
+				known = true
+				break
+			}
+		}
+		if known {
+			continue
+		}
+		seen = append(seen, err)
+		if cmd.readTimeout() != nil && classifyOutcome(err, false) == outcomeNeutral {
+			neutralPropagated = append(neutralPropagated, err)
+		}
+	}
+	return func(cmd Cmder) outcomeKind {
+		err := cmd.rawErr()
+		for _, origin := range neutralPropagated {
+			if sameErr(err, origin) {
+				return outcomeNeutral
+			}
+		}
+		return classifyOutcome(err, cmd.readTimeout() == nil)
+	}
 }
