@@ -1484,6 +1484,18 @@ func (e *errWithServingEndpoint) Error() string { return e.err.Error() }
 
 func (e *errWithServingEndpoint) Unwrap() error { return e.err }
 
+// RedisError keeps typed redis.Error checks working if a caller still sees the
+// wrapper (hooks / Process return value). Prefer storing the unwrapped error on
+// cmd.Err(); see Client.Process and pipelineReadCmdsWithFlags.
+func (e *errWithServingEndpoint) RedisError() {}
+
+func unwrapServingEndpoint(err error) error {
+	if e, ok := err.(*errWithServingEndpoint); ok {
+		return e.err
+	}
+	return err
+}
+
 func wrapServingEndpoint(cn *pool.Conn, err error) error {
 	if err == nil || cn == nil {
 		return err
@@ -1511,7 +1523,11 @@ func (c *baseClient) releaseConnToPool(ctx context.Context, p pool.Pooler, cn *p
 	// a push-notification drain that consumed part of a RESP3 frame, or a panic
 	// while serializing a command's args mid-write. Such a conn MUST be removed —
 	// reusing it would decode leftover bytes as the next caller's replies.
-	if isBadConn(err, false, c.opt.Addr) || errors.Is(err, errConnUnusable) {
+	connAddr := c.opt.Addr
+	if ep := cn.ServingEndpoint(); ep != "" {
+		connAddr = ep
+	}
+	if isBadConn(err, false, connAddr) || errors.Is(err, errConnUnusable) {
 		p.Remove(ctx, cn, err)
 		return
 	}
@@ -2576,20 +2592,18 @@ func (c *baseClient) pipelineReadCmdsWithFlags(ctx context.Context, cn *pool.Con
 			internal.Logger.Printf(ctx, "push: error processing pending notifications before reading reply: %v", err)
 		}
 		err := cmd.readReply(rd)
-		// Carry the held connection's logical endpoint with hostless MOVED/ASK
-		// the same way process() does, so ClusterClient ASK retries and
-		// Pipelined redirects survive maintenance handoffs (#4233 Bugbot).
-		err = wrapServingEndpoint(cn, err)
 		cmd.SetErr(err)
 		if err != nil && !isRedisError(err) {
 			setCmdsErr(cmds[i+1:], err)
-			return err
+			return wrapServingEndpoint(cn, err)
 		}
 	}
 	// Retry errors like "LOADING redis is loading the dataset in memory".
 	// rawErr: this runs on the execution path; never await here (an async
 	// autopipeline command's ready channel is closed by this very batch).
-	return cmds[0].rawErr()
+	// Wrap the batch error so hostless MOVED/ASK from a handed-off connection
+	// still carry the serving endpoint for ClusterClient (#4233 review).
+	return wrapServingEndpoint(cn, cmds[0].rawErr())
 }
 
 func (c *baseClient) txPipelineProcessCmds(
@@ -3073,7 +3087,9 @@ func (c *Client) conn(discardOnClose bool) *Conn {
 
 func (c *Client) Process(ctx context.Context, cmd Cmder) error {
 	err := c.processHook(ctx, cmd)
-	cmd.SetErr(err)
+	// Keep serving-endpoint metadata on the returned error for ClusterClient,
+	// but never expose the wrapper via cmd.Err() (#4233 review).
+	cmd.SetErr(unwrapServingEndpoint(err))
 	return err
 }
 
