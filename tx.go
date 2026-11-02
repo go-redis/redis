@@ -64,6 +64,9 @@ func (c *Client) newTx() *Tx {
 			streamingCredentialsManager: c.streamingCredentialsManager,
 		},
 	}
+	// Tx reads are uncached but still OPTOUT-prefix when trackable; share the
+	// parent's CommandMetadata overrides for custom read-only keyed commands.
+	c.baseClient.shareCommandMetadata(&tx.baseClient)
 	tx.init()
 	return &tx
 }
