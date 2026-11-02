@@ -2991,6 +2991,18 @@ func (c *ClusterClient) mapCmdsByNodeInView(
 	cmds []Cmder,
 	route *clusterPipelineRouting,
 ) error {
+	return c.mapCmdsByNodeInViewWith(ctx, cmdsMap, cmds, route, nil)
+}
+
+// mapCmdsByNodeInViewWith is mapCmdsByNodeInView, but place, if not nil,
+// can queue cmds[i] itself instead of on node and then returns true.
+func (c *ClusterClient) mapCmdsByNodeInViewWith(
+	ctx context.Context,
+	cmdsMap *cmdsMap,
+	cmds []Cmder,
+	route *clusterPipelineRouting,
+	place func(i int, node *clusterNode) bool,
+) error {
 	state, err := c.state.Get(ctx)
 	if err != nil {
 		return err
@@ -3049,6 +3061,9 @@ func (c *ClusterClient) mapCmdsByNodeInView(
 		}
 		if err != nil {
 			return c.noteTopologySelectionError(err)
+		}
+		if place != nil && place(i, node) {
+			continue
 		}
 		cmdsMap.Add(node, cmd)
 	}
@@ -3273,21 +3288,27 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 	route *clusterPipelineRouting,
 	flags []byte,
 ) error {
-	// Commands redirected by MOVED/ASK are already queued for their new
-	// node, so a whole-batch retry must not queue them again.
+	// Commands redirected by MOVED/ASK are queued for their new node at the
+	// end, in command order. A whole-batch retry queues them in their place
+	// instead, so it neither sends them twice nor reorders the batch.
 	// Track them by index: a Cmder value is not always comparable.
-	var redirected []bool
-	retryCmds := func() []Cmder {
-		if redirected == nil {
-			return cmds
-		}
-		retry := make([]Cmder, 0, len(cmds))
-		for i, cmd := range cmds {
-			if !redirected[i] {
-				retry = append(retry, cmd)
+	var redirects []pipelineRedirect
+	defer func() {
+		for _, r := range redirects {
+			if r.node != nil {
+				failedCmds.Add(r.node, r.cmds...)
 			}
 		}
-		return retry
+	}()
+	retryCmds := func() {
+		_ = c.mapCmdsByNodeInViewWith(ctx, failedCmds, cmds, route, func(i int, _ *clusterNode) bool {
+			if redirects == nil || redirects[i].node == nil {
+				return false
+			}
+			failedCmds.Add(redirects[i].node, redirects[i].cmds...)
+			redirects[i].node = nil
+			return true
+		})
 	}
 
 	for i, cmd := range cmds {
@@ -3314,11 +3335,11 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 			continue
 		}
 
-		if c.checkMovedErr(ctx, node, cmd, err, failedCmds) {
-			if redirected == nil {
-				redirected = make([]bool, len(cmds))
+		if r := c.checkMovedErr(ctx, node, cmd, err); r.node != nil {
+			if redirects == nil {
+				redirects = make([]pipelineRedirect, len(cmds))
 			}
-			redirected[i] = true
+			redirects[i] = r
 			continue
 		}
 
@@ -3328,7 +3349,7 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 
 		if !isRedisError(err) {
 			if shouldRetry(err, true) && !cmdsContainNoRetry(cmds) {
-				_ = c.mapCmdsByNodeInView(ctx, failedCmds, retryCmds(), route)
+				retryCmds()
 			}
 			setCmdsErr(cmds[i+1:], err)
 			return err
@@ -3337,7 +3358,7 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 
 	// rawErr: execution path; never await an async command's batch here.
 	if err := cmds[0].rawErr(); err != nil && shouldRetry(err, true) && !cmdsContainNoRetry(cmds) {
-		_ = c.mapCmdsByNodeInView(ctx, failedCmds, retryCmds(), route)
+		retryCmds()
 		return err
 	}
 
@@ -3354,37 +3375,38 @@ func movedToSameConnAddr(cmds []Cmder, addr string) error {
 	return nil
 }
 
-// checkMovedErr queues cmd for the node a MOVED or ASK redirect points to.
+// pipelineRedirect holds the commands a MOVED or ASK redirect sends to node.
+type pipelineRedirect struct {
+	node *clusterNode
+	cmds []Cmder
+}
+
+// checkMovedErr returns where a MOVED or ASK redirect sends cmd. The node is
+// nil when err is not a redirect.
 //
 // It does not drop the connection itself. When a MOVED points back to the
 // address of the sending connection, processPipelineNodeConn returns that
 // MOVED (movedToSameConnAddr) so releaseConnToPool removes the connection, as
 // on the single-command path.
 func (c *ClusterClient) checkMovedErr(
-	ctx context.Context, from *clusterNode, cmd Cmder, err error, failedCmds *cmdsMap,
-) bool {
+	ctx context.Context, from *clusterNode, cmd Cmder, err error,
+) pipelineRedirect {
 	moved, ask, addr := isMovedError(err)
 	if !moved && !ask {
-		return false
+		return pipelineRedirect{}
 	}
 
 	node, err := c.nodes.GetOrCreate(redirectAddr(addr, from))
 	if err != nil {
-		return false
+		return pipelineRedirect{}
 	}
 
 	if moved {
 		c.state.LazyReload()
-		failedCmds.Add(node, cmd)
-		return true
+		return pipelineRedirect{node: node, cmds: []Cmder{cmd}}
 	}
 
-	if ask {
-		failedCmds.Add(node, NewCmd(ctx, "asking"), cmd)
-		return true
-	}
-
-	panic("not reached")
+	return pipelineRedirect{node: node, cmds: []Cmder{NewCmd(ctx, "asking"), cmd}}
 }
 
 // TxPipeline acts like Pipeline, but wraps queued commands with MULTI/EXEC.

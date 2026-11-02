@@ -281,6 +281,50 @@ func TestClusterPipelineRetryDoesNotDuplicateRedirect(t *testing.T) {
 	}
 }
 
+// TestClusterPipelineRetryKeepsOrder tests a batch whose first reply is
+// retryable while a later command gets MOVED to the same node. The retry
+// must keep the original command order.
+func TestClusterPipelineRetryKeepsOrder(t *testing.T) {
+	const addr = "node-1.example:6379"
+	var staleGets atomic.Int32
+	var replaced atomic.Bool
+	staleSrv := newMovedTestServer(t, addr, &staleGets, func(cmd string) (string, bool) {
+		return "-TRYAGAIN Multiple keys request during rehashing of slot\r\n", cmd == "set" && replaced.Load()
+	})
+	var mu sync.Mutex
+	var sent []string
+	freshSrv := newClusterCSCTestServer(t, func(cmd string) string {
+		if cmd == "hello" {
+			return "%0\r\n"
+		}
+		mu.Lock()
+		sent = append(sent, cmd)
+		mu.Unlock()
+		if cmd == "get" {
+			return "$2\r\nok\r\n"
+		}
+		return "+OK\r\n"
+	})
+
+	client, switchTo := newSwitchedClusterClient(t, addr, staleSrv, 1)
+	ctx := context.Background()
+	_, _ = client.Pipelined(ctx, func(pipe Pipeliner) error { pipe.Ping(ctx); return nil })
+	replaced.Store(true)
+	switchTo(freshSrv)
+
+	_, _ = client.Pipelined(ctx, func(pipe Pipeliner) error {
+		pipe.Set(ctx, "key", "v", 0)
+		pipe.Get(ctx, "key")
+		return nil
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := strings.Join(sent, " "); got != "set get" {
+		t.Fatalf("fresh server got %q, want %q", got, "set get")
+	}
+}
+
 // newSwitchedClusterClient returns a client and func for host reslver.
 func newSwitchedClusterClient(t *testing.T, addr, srv string, maxRedirects int) (*ClusterClient, func(string)) {
 	var target atomic.Value
