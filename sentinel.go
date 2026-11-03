@@ -879,8 +879,8 @@ func (c *SentinelClient) Process(ctx context.Context, cmd Cmder) error {
 func (c *SentinelClient) pubSub() *PubSub {
 	pubsub := &PubSub{
 		opt: c.cloneOpt(),
-		newConn: func(ctx context.Context, addr string, channels []string) (*pool.Conn, error) {
-			return c.newPubSubConn(ctx, addr, channels)
+		newConn: func(ctx context.Context, addr string, channels []string, onInit ...func(*pool.Conn)) (*pool.Conn, error) {
+			return c.newPubSubConn(ctx, addr, channels, onInit...)
 		},
 		closeConn: func(cn *pool.Conn) error {
 			// Untrack connection from PubSubPool

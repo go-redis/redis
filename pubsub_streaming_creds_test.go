@@ -68,6 +68,7 @@ type mockRESP3Server struct {
 	conns      []net.Conn
 	commands   [][]string
 	authErr    error
+	helloErr   error
 	subscribed chan struct{}
 }
 
@@ -144,11 +145,16 @@ func (s *mockRESP3Server) handleConn(c net.Conn) {
 		s.mu.Lock()
 		s.commands = append(s.commands, args)
 		authErr := s.authErr
+		helloErr := s.helloErr
 		s.mu.Unlock()
 
 		switch cmdName {
 		case "HELLO":
-			_, _ = c.Write([]byte("%2\r\n+server\r\n+redis\r\n+proto\r\n:3\r\n"))
+			if helloErr != nil {
+				_, _ = c.Write([]byte(fmt.Sprintf("-ERR %s\r\n", helloErr.Error())))
+			} else {
+				_, _ = c.Write([]byte("%2\r\n+server\r\n+redis\r\n+proto\r\n:3\r\n"))
+			}
 		case "CLIENT":
 			_, _ = c.Write([]byte("+OK\r\n"))
 		case "SUBSCRIBE":
@@ -156,7 +162,11 @@ func (s *mockRESP3Server) handleConn(c net.Conn) {
 			if len(args) > 1 {
 				channel = args[1]
 			}
-			resp := fmt.Sprintf(">3\r\n$9\r\nsubscribe\r\n$%d\r\n%s\r\n:1\r\n", len(channel), channel)
+			prefix := ">3"
+			if helloErr != nil {
+				prefix = "*3"
+			}
+			resp := fmt.Sprintf("%s\r\n$9\r\nsubscribe\r\n$%d\r\n%s\r\n:1\r\n", prefix, len(channel), channel)
 			_, _ = c.Write([]byte(resp))
 			select {
 			case s.subscribed <- struct{}{}:
@@ -179,8 +189,12 @@ func (s *mockRESP3Server) handleConn(c net.Conn) {
 func (s *mockRESP3Server) Publish(channel, payload string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	resp := fmt.Sprintf(">3\r\n$7\r\nmessage\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-		len(channel), channel, len(payload), payload)
+	prefix := ">3"
+	if s.helloErr != nil {
+		prefix = "*3"
+	}
+	resp := fmt.Sprintf("%s\r\n$7\r\nmessage\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+		prefix, len(channel), channel, len(payload), payload)
 	for _, c := range s.conns {
 		_, _ = c.Write([]byte(resp))
 	}
@@ -386,6 +400,156 @@ func TestPubSubRESP3StreamingCredsAuthError(t *testing.T) {
 	if !srv.HasCommand("AUTH", "bad_user") {
 		t.Fatal("expected server to receive AUTH bad_user command")
 	}
+
+	// Reader should observe authentication error and trigger reconnect
+	_, err = ps.Receive(ctx)
+	if err == nil {
+		t.Fatal("expected receive to fail with authentication error")
+	}
+	if !strings.Contains(err.Error(), "invalid credentials provided") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestPubSubRESP3StreamingCredsBufferedMessages(t *testing.T) {
+	srv := newMockRESP3Server(t)
+	defer srv.Close()
+
+	provider := newTestStreamingProvider("init_user", "init_pass")
+	client := redis.NewClient(&redis.Options{
+		Addr:                         srv.ln.Addr().String(),
+		Protocol:                     3,
+		StreamingCredentialsProvider: provider,
+		PoolSize:                     1,
+		ReadTimeout:                  3 * time.Second,
+		WriteTimeout:                 3 * time.Second,
+		DisableIdentity:              true,
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: maintnotifications.ModeDisabled,
+		},
+	})
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	channel := "buffered_channel"
+	ps := client.Subscribe(ctx, channel)
+	defer ps.Close()
+
+	// Wait for subscription confirmation
+	msg, err := ps.Receive(ctx)
+	if err != nil {
+		t.Fatalf("ps.Receive failed: %v", err)
+	}
+	if sub, ok := msg.(*redis.Subscription); !ok || sub.Kind != "subscribe" {
+		t.Fatalf("expected subscribe confirmation, got %v", msg)
+	}
+
+	// Publish 5 messages to the subscribed channel while no reader is active.
+	// These messages buffer on the subscriber socket.
+	expectedMessages := []string{"msg-1", "msg-2", "msg-3", "msg-4", "msg-5"}
+	for _, payload := range expectedMessages {
+		srv.Publish(channel, payload)
+	}
+
+	// Rotate credentials while messages are buffered
+	provider.Update("rotated_user", "rotated_pass")
+
+	// Wait for the server to process the AUTH command
+	deadline := time.Now().Add(2 * time.Second)
+	for !srv.HasCommand("AUTH", "rotated_user") && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !srv.HasCommand("AUTH", "rotated_user") {
+		t.Fatal("expected server to receive AUTH rotated_user command")
+	}
+
+	// Verify all 5 buffered messages are delivered in order without data loss
+	for i, expected := range expectedMessages {
+		m, err := ps.ReceiveMessage(ctx)
+		if err != nil {
+			t.Fatalf("failed to receive message %d (%s): %v", i+1, expected, err)
+		}
+		if m.Channel != channel || m.Payload != expected {
+			t.Fatalf("message %d mismatch: got Channel=%q Payload=%q, want Channel=%q Payload=%q",
+				i+1, m.Channel, m.Payload, channel, expected)
+		}
+	}
+
+	// Verify that the connection was retained and never dropped or reconnected.
+	// Exactly one connection should have been established on the server.
+	srv.mu.Lock()
+	connsLen := len(srv.conns)
+	srv.mu.Unlock()
+	if connsLen != 1 {
+		t.Fatalf("expected connection to be preserved (conns=1), but saw %d connections", connsLen)
+	}
+
+	// Verify normal message flow continues on the existing connection
+	srv.Publish(channel, "msg-after-rotation")
+	postRotMsg, err := ps.ReceiveMessage(ctx)
+	if err != nil {
+		t.Fatalf("failed to receive message after credential rotation: %v", err)
+	}
+	if postRotMsg.Payload != "msg-after-rotation" {
+		t.Fatalf("unexpected post-rotation payload: got %q, want %q", postRotMsg.Payload, "msg-after-rotation")
+	}
+}
+
+type immediateRotatingProvider struct {
+	mu           sync.Mutex
+	initCreds    auth.Credentials
+	rotatedCreds auth.Credentials
+}
+
+func (p *immediateRotatingProvider) Subscribe(listener auth.CredentialsListener) (auth.Credentials, auth.UnsubscribeFunc, error) {
+	// Trigger rotation inside Subscribe before newPubSubConn finishes
+	go listener.OnNext(p.rotatedCreds)
+	return p.initCreds, func() error { return nil }, nil
+}
+
+func TestPubSubRESP3StreamingCredsEarlyRotation(t *testing.T) {
+	srv := newMockRESP3Server(t)
+	defer srv.Close()
+
+	provider := &immediateRotatingProvider{
+		initCreds:    auth.NewBasicCredentials("init_user", "init_pass"),
+		rotatedCreds: auth.NewBasicCredentials("early_rotated_user", "early_rotated_pass"),
+	}
+	client := redis.NewClient(&redis.Options{
+		Addr:                         srv.ln.Addr().String(),
+		Protocol:                     3,
+		StreamingCredentialsProvider: provider,
+		PoolSize:                     1,
+		ReadTimeout:                  3 * time.Second,
+		WriteTimeout:                 3 * time.Second,
+		DisableIdentity:              true,
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: maintnotifications.ModeDisabled,
+		},
+	})
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ps := client.Subscribe(ctx, "early_channel")
+	defer ps.Close()
+
+	_, err := ps.Receive(ctx)
+	if err != nil {
+		t.Fatalf("ps.Receive failed: %v", err)
+	}
+
+	// Verify AUTH was received for early_rotated_user despite rotation during initConn window
+	deadline := time.Now().Add(2 * time.Second)
+	for !srv.HasCommand("AUTH", "early_rotated_user") && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !srv.HasCommand("AUTH", "early_rotated_user") {
+		t.Fatal("expected server to receive AUTH early_rotated_user command")
+	}
 }
 
 func TestPubSubRESP2StreamingCredsNoOp(t *testing.T) {
@@ -425,5 +589,65 @@ func TestPubSubRESP2StreamingCredsNoOp(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if srv.HasCommand("AUTH", "resp2_new_user") {
 		t.Fatal("expected RESP2 Pub/Sub socket NOT to issue in-place AUTH")
+	}
+}
+
+func TestPubSubRESP2FallbackStreamingCredsReconnect(t *testing.T) {
+	srv := newMockRESP3Server(t)
+	defer srv.Close()
+
+	srv.mu.Lock()
+	srv.helloErr = errors.New("unknown command 'HELLO'")
+	srv.mu.Unlock()
+
+	provider := newTestStreamingProvider("init_user", "init_pass")
+	client := redis.NewClient(&redis.Options{
+		Addr:                         srv.ln.Addr().String(),
+		Protocol:                     3, // Protocol 3 configured, falls back to RESP2 when HELLO is rejected
+		StreamingCredentialsProvider: provider,
+		PoolSize:                     1,
+		ReadTimeout:                  3 * time.Second,
+		WriteTimeout:                 3 * time.Second,
+		DisableIdentity:              true,
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: maintnotifications.ModeDisabled,
+		},
+	})
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ps := client.Subscribe(ctx, "fallback_channel")
+	defer ps.Close()
+
+	msg, err := ps.Receive(ctx)
+	if err != nil {
+		t.Fatalf("initial subscribe failed: %v", err)
+	}
+	if sub, ok := msg.(*redis.Subscription); !ok || sub.Kind != "subscribe" {
+		t.Fatalf("expected subscribe confirmation, got %v", msg)
+	}
+
+	// Trigger credential rotation under RESP2 fallback
+	provider.Update("fallback_new_user", "fallback_new_pass")
+
+	// Wait for the reconnected connection to complete AUTH during handshake
+	deadline := time.Now().Add(2 * time.Second)
+	for !srv.HasCommand("AUTH", "fallback_new_user") && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !srv.HasCommand("AUTH", "fallback_new_user") {
+		t.Fatal("expected server to receive AUTH fallback_new_user command after reconnect")
+	}
+
+	// Verify subscriber can receive messages on the reconnected connection
+	srv.Publish("fallback_channel", "payload_after_fallback_reauth")
+	m, err := ps.ReceiveMessage(ctx)
+	if err != nil {
+		t.Fatalf("failed to receive message after fallback reauth: %v", err)
+	}
+	if m.Channel != "fallback_channel" || m.Payload != "payload_after_fallback_reauth" {
+		t.Fatalf("unexpected message: %v", m)
 	}
 }

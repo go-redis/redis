@@ -4046,7 +4046,7 @@ func (c *ClusterClient) pubSub() *PubSub {
 	var node *clusterNode
 	pubsub := &PubSub{
 		opt: c.opt.clientOptions(),
-		newConn: func(ctx context.Context, addr string, channels []string) (*pool.Conn, error) {
+		newConn: func(ctx context.Context, addr string, channels []string, onInit ...func(*pool.Conn)) (*pool.Conn, error) {
 			if node != nil {
 				panic("node != nil")
 			}
@@ -4080,7 +4080,7 @@ func (c *ClusterClient) pubSub() *PubSub {
 					return nil, err
 				}
 			}
-			cn, err := node.Client.newPubSubConn(ctx, node.Client.opt.Addr, channels)
+			cn, err := node.Client.newPubSubConn(ctx, node.Client.opt.Addr, channels, onInit...)
 			if err != nil {
 				node = nil
 				return nil, err
