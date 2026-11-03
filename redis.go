@@ -1030,6 +1030,9 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 	//    - We're already in INITIALIZING, so just proceed with initialization
 
 	currentState := cn.GetStateMachine().GetState()
+	if currentState == pool.StateClosed {
+		return pool.ErrClosed
+	}
 
 	// Fast path: Check if already initialized (IDLE or IN_USE)
 	if currentState == pool.StateIdle || currentState == pool.StateInUse {
@@ -1171,6 +1174,12 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 			}
 		}
 		cn.SetOnClose(onClose)
+		// Close may have consumed the callback before Subscribe returned.
+		// Re-run teardown after publishing it so a late subscription is not lost.
+		if cn.IsClosed() {
+			_ = cn.Close()
+			return fmt.Errorf("connection closed during streaming credentials setup: %w", pool.ErrClosed)
+		}
 
 		username, password = credentials.BasicAuth()
 	} else {
@@ -1425,7 +1434,16 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 	// This marks the connection as initialized and ready for use
 	// NOTE: The connection is still owned by the calling goroutine at this point
 	// and won't be available to other goroutines until it's Put() back into the pool
-	cn.GetStateMachine().Transition(pool.StateIdle)
+	// Do not overwrite a Close that raced the final handshake reply.
+	for {
+		state := cn.GetStateMachine().GetState()
+		if state == pool.StateClosed {
+			return pool.ErrClosed
+		}
+		if _, err := cn.GetStateMachine().TryTransition([]pool.ConnState{state}, pool.StateIdle); err == nil {
+			break
+		}
+	}
 
 	// Call OnConnect hook if configured
 	// The connection is in IDLE state but still owned by this goroutine
