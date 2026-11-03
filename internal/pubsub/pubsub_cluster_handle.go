@@ -762,8 +762,10 @@ func (h *clusterShardHandle) writePlacements(ctx context.Context, placements []*
 // write: a channel released while it was in flight is unsubscribed
 // here, by the writer (see shardPart.pending). A fresh part whose node
 // manager closed under it — pruned between the lookup and the write,
-// handing out a handle born closed — is replaced and the write retried.
-// A failed dial leaves the channels placed — the engine keeps their
+// handing out a handle born closed — is replaced and the write retried,
+// with the channels still desired: one released while the write was in
+// flight must not come back subscribed on the replacement. A failed
+// dial leaves the channels placed — the engine keeps their
 // registration for its reconnect replay, and a part they move off keeps
 // delivering meanwhile — and is reported. Callers must hold no lock.
 func (h *clusterShardHandle) writePlacement(ctx context.Context, pl *placement) error {
@@ -788,7 +790,17 @@ func (h *clusterShardHandle) writePlacement(ctx context.Context, pl *placement) 
 				}
 			}
 			h.m.forgetNodeManager(pl.addr, pl.nm)
-			err = h.placeLocked(pl)
+			for ch := range pl.moved {
+				if _, desired := h.schannels[ch]; !desired {
+					delete(pl.moved, ch)
+					delete(pl.old, ch)
+				}
+			}
+			if len(pl.moved) == 0 {
+				retry, err = false, nil // everything was released meanwhile
+			} else {
+				err = h.placeLocked(pl)
+			}
 		}
 		h.mu.Unlock()
 
