@@ -8224,7 +8224,7 @@ var _ = Describe("Commands", func() {
 			Expect(err).To(Equal(redis.Nil))
 		})
 
-		It("should XRead with per-stream IDs", func() {
+		It("should XRead with per-stream IDs", Label("NonRedisEnterprise"), func() {
 			_, err := client.XAdd(ctx, &redis.XAddArgs{Stream: "stream2", ID: "1-0", Values: map[string]interface{}{"alpha": "a"}}).Result()
 			Expect(err).NotTo(HaveOccurred())
 			_, err = client.XAdd(ctx, &redis.XAddArgs{Stream: "stream2", ID: "2-0", Values: map[string]interface{}{"beta": "b"}}).Result()
