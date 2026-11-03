@@ -27,6 +27,28 @@ type shardPart struct {
 	// would leave the part, its forwarder and its node manager alive
 	// for as long as the composite lives.
 	leaving map[string]struct{}
+	// pending counts, per shard channel, the subscribe writes of it in
+	// flight on this part. A channel is placed under the composite's
+	// locks but written with them released — the write dials the node
+	// when it has no connection, and a dial must not stall the
+	// composite's other operations — so a release can overtake the
+	// write. The releaser then leaves the unsubscribe to the writer (see
+	// releaseLocked, settleLocked): sent by the releaser, it could reach
+	// the node's manager before the subscribe and leave the channel
+	// subscribed there with nothing placed here.
+	pending map[string]int
+}
+
+// placeLocked places chs on the part, each with a subscribe write in
+// flight that settleLocked ends. Callers must hold the composite's mu.
+func (p *shardPart) placeLocked(chs map[string]struct{}) {
+	if p.pending == nil {
+		p.pending = make(map[string]int)
+	}
+	for ch := range chs {
+		p.schannels[ch] = struct{}{}
+		p.pending[ch]++
+	}
 }
 
 // leaveLocked moves ch from placed to leaving. Callers must hold the
@@ -37,6 +59,36 @@ func (p *shardPart) leaveLocked(ch string) {
 		p.leaving = make(map[string]struct{})
 	}
 	p.leaving[ch] = struct{}{}
+}
+
+// releaseLocked moves ch from placed to leaving and reports whether its
+// unsubscribe is the caller's to write: it is not while a subscribe
+// write of ch is in flight, whose writer then writes it (see pending).
+// Callers must hold the composite's mu.
+func (p *shardPart) releaseLocked(ch string) bool {
+	p.leaveLocked(ch)
+	return p.pending[ch] == 0
+}
+
+// settleLocked ends a subscribe write of chs and returns, sorted, the
+// channels released while it was in flight, whose unsubscribe the
+// writer now owes (see pending). Callers must hold the composite's mu.
+func (p *shardPart) settleLocked(chs map[string]struct{}) []string {
+	var release []string
+	for ch := range chs {
+		if p.pending[ch]--; p.pending[ch] > 0 {
+			continue
+		}
+		delete(p.pending, ch)
+		if _, placed := p.schannels[ch]; placed {
+			continue
+		}
+		if _, leaving := p.leaving[ch]; leaving {
+			release = append(release, ch)
+		}
+	}
+	slices.Sort(release)
+	return release
 }
 
 // drained reports whether a slot part carries nothing and owes nothing.
@@ -69,9 +121,19 @@ const (
 type clusterShardHandle struct {
 	m *ClusterManager
 
-	// mu guards the fields below it up to the consumer view. Lock
-	// order: rerouteMu → deliverMu → mu; the manager's mu is a leaf
-	// and never held while taking mu.
+	// ops is the handle's operation lock (a slot: full means held),
+	// serializing SSubscribe, SUnsubscribe and the re-route sweep's work
+	// on this handle with each other — see lockOps. It covers the
+	// bookkeeping of an operation (placement snapshot, owner resolve,
+	// placement), never a subscribe write: the write dials the node when
+	// it has no connection yet, and a dial to a node that stopped
+	// answering must stall neither this handle's other operations nor
+	// another handle's (see shardPart.pending for what guards the write
+	// instead). Lock order: the manager's sweepMu → ops → deliverMu → mu.
+	ops chan struct{}
+
+	// mu guards the fields below it up to the consumer view (lock order
+	// above); the manager's mu is a leaf and never held while taking mu.
 	mu    sync.Mutex
 	state shardHandleState
 	parts map[*shardPart]struct{}
@@ -134,6 +196,7 @@ func newClusterShardHandle(m *ClusterManager) *clusterShardHandle {
 	size, _ := m.consumerSettings()
 	return &clusterShardHandle{
 		m:         m,
+		ops:       make(chan struct{}, 1),
 		parts:     make(map[*shardPart]struct{}),
 		schannels: make(map[string]struct{}),
 		moving:    make(map[string]*shardPart),
@@ -144,12 +207,20 @@ func newClusterShardHandle(m *ClusterManager) *clusterShardHandle {
 	}
 }
 
-// open reports whether the handle still accepts work.
-func (h *clusterShardHandle) open() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.state == shardHandleOpen
+// lockOps takes the operation lock, or gives up with ctx's error once
+// ctx ends first: an operation waits for the lock no longer than its
+// caller allows. Callers release it with unlockOps.
+func (h *clusterShardHandle) lockOps(ctx context.Context) error {
+	select {
+	case h.ops <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
+
+// unlockOps releases the operation lock taken by lockOps.
+func (h *clusterShardHandle) unlockOps() { <-h.ops }
 
 // Events returns the raw composite delivery stream (see PubSuber).
 func (h *clusterShardHandle) Events() <-chan any {
@@ -325,15 +396,22 @@ func (h *clusterShardHandle) landedLocked(p *shardPart, ev any) (release map[*sh
 		if _, held := q.schannels[sub.Channel]; !held {
 			continue
 		}
-		if release == nil {
-			release = make(map[*shardPart][]string)
-		}
-		release[q] = append(release[q], sub.Channel)
-		if delete(q.schannels, sub.Channel); q.drained() {
+		// A part with a subscribe write of the channel in flight is
+		// neither closed nor sent the unsubscribe here: the writer does
+		// that once its write returned (see shardPart.pending).
+		var write bool
+		if delete(q.schannels, sub.Channel); q.drained() && q.pending[sub.Channel] == 0 {
 			delete(h.parts, q)
 			emptied = append(emptied, q)
+			write = true
 		} else {
-			q.leaveLocked(sub.Channel)
+			write = q.releaseLocked(sub.Channel)
+		}
+		if write {
+			if release == nil {
+				release = make(map[*shardPart][]string)
+			}
+			release[q] = append(release[q], sub.Channel)
 		}
 	}
 	return release, emptied
@@ -490,9 +568,16 @@ func (h *clusterShardHandle) placementLocked() (current map[string]*shardPart, c
 // the part it lives on to the current owner: subscribe on the new node,
 // and release the channel on the old part only once the new node
 // confirmed it — overlap beats a delivery gap. The events stream is
-// untouched. Serialized by the manager's re-route sweep (callers hold
-// rerouteMu).
+// untouched. Serialized with the handle's own operations by its
+// operation lock, held through the placement and released for the
+// writes (see ops); callers hold the manager's sweepMu.
 func (h *clusterShardHandle) reroute(ctx context.Context) error {
+	if err := h.lockOps(ctx); err != nil {
+		return err
+	}
+	unlock := sync.OnceFunc(h.unlockOps)
+	defer unlock()
+
 	h.mu.Lock()
 	if h.state != shardHandleOpen {
 		h.mu.Unlock()
@@ -523,21 +608,16 @@ func (h *clusterShardHandle) reroute(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	var firstErr error
-	for addr, chs := range groups {
-		if err := h.handleSSubscribe(ctx, addr, chs, current); err != nil {
-			if errors.Is(err, pool.ErrClosed) {
-				return nil // the handle started closing mid-sweep
-			}
-			// A dial that failed: the part is attached and recovers on
-			// its own; the sweep goes on with the other groups.
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
+	placements, err := h.placeGroups(groups, current)
+	unlock()
+	if err == nil {
+		err = h.writePlacements(ctx, placements)
 	}
-	return firstErr
+	if errors.Is(err, pool.ErrClosed) {
+		return nil // the handle started closing mid-sweep
+	}
+	// A dial that failed: the part is attached and recovers on its own.
+	return err
 }
 
 // withCancelOf returns a context with values' values that is cancelled
@@ -552,115 +632,173 @@ func withCancelOf(values, ctrl context.Context) (context.Context, context.Cancel
 	}
 }
 
-// handleSSubscribe places one resolved owner-group of shard channels on
-// addr, preferring to join an existing part there (a fresh part per
-// call would leak one emptied part per migration cycle). A relocated
-// channel is marked moving before its subscribe is written — the
-// confirmation may arrive before the write returns — and stays on the
-// part it leaves until the new part confirms it (see landedLocked). A
-// failed dial still places the channels — the engine keeps their
-// registration for its reconnect replay, and the old part keeps
-// delivering meanwhile — and is reported. Channels joining an existing
-// part are placed on it under the lock that picked it, before the
-// subscribe is written: a part is detached and closed once it is empty
-// and owes nothing (see drainedLocked, landedLocked), which a part
-// picked while its last channel's release was in flight would otherwise
-// become mid-join, taking the joining channels down with it. Callers
-// hold rerouteMu and must not hold h.mu.
-func (h *clusterShardHandle) handleSSubscribe(ctx context.Context, addr string, channels map[string]struct{}, current map[string]*shardPart) error {
-	// Skip channels already placed on the target node; a channel with no
-	// placement needs subscribing but has no old part to release.
-	moved := make(map[string]struct{}, len(channels))
-	relocated := make(map[string]struct{}, len(channels))
-	for ch := range channels {
-		p := current[ch]
-		if p != nil && p.addr == addr {
-			continue
-		}
-		moved[ch] = struct{}{}
-		if p != nil {
-			relocated[ch] = struct{}{}
-		}
-	}
-	if len(moved) == 0 {
-		return nil
-	}
+// placement is one resolved owner-group of shard channels placed on a
+// part of the owning node, awaiting its subscribe write.
+type placement struct {
+	addr   string
+	target *shardPart
+	// fresh marks a target created for this placement; nm is then its
+	// node manager, forgotten if the write finds it closed.
+	fresh bool
+	nm    *Manager
+	// moved are the channels to subscribe on target: those of the group
+	// not placed on the node already. old maps each of them that moves
+	// off another part to that part.
+	moved map[string]struct{}
+	old   map[string]*shardPart
+}
 
-	// markMoving points the relocated channels at target, if the part
-	// they leave still carries them (one that ended meanwhile left them
-	// unplaced: nothing to release). Callers must hold h.mu.
-	markMoving := func(target *shardPart) {
-		for ch := range relocated {
-			old := current[ch]
-			if _, live := h.parts[old]; !live {
+// placeGroups places every resolved owner-group's channels that are
+// not on the owning node yet, against the placement snapshot current
+// they were resolved with, and returns the placements for
+// writePlacements. Nothing is written here: placing under the locks and
+// writing with them released is what keeps a dial from stalling the
+// handle's other operations (see ops), and placing BEFORE the write —
+// the part registered, its forwarder running — is what makes a release
+// or a confirmation that lands mid-write see the channels (see
+// shardPart.pending, drainedLocked). Callers must hold ops and must not
+// hold h.mu.
+func (h *clusterShardHandle) placeGroups(groups map[string]map[string]struct{}, current map[string]*shardPart) ([]*placement, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.state != shardHandleOpen {
+		return nil, pool.ErrClosed
+	}
+	var placements []*placement
+	for _, addr := range slices.Sorted(maps.Keys(groups)) {
+		pl := &placement{
+			addr:  addr,
+			moved: make(map[string]struct{}),
+			old:   make(map[string]*shardPart),
+		}
+		// A channel with no placement needs subscribing but has no old
+		// part to release.
+		for ch := range groups[addr] {
+			p := current[ch]
+			if p != nil && p.addr == addr {
 				continue
 			}
-			if _, held := old.schannels[ch]; held {
-				h.moving[ch] = target
+			pl.moved[ch] = struct{}{}
+			if p != nil {
+				pl.old[ch] = p
 			}
 		}
-	}
-	// unmarkMoving reverts markMoving(target). Callers must hold h.mu.
-	unmarkMoving := func(target *shardPart) {
-		for ch := range relocated {
-			if h.moving[ch] == target {
-				delete(h.moving, ch)
-			}
+		if len(pl.moved) == 0 {
+			continue
 		}
+		if err := h.placeLocked(pl); err != nil {
+			return nil, err
+		}
+		placements = append(placements, pl)
 	}
+	return placements, nil
+}
 
-	h.mu.Lock()
-	var target *shardPart
+// placeLocked places pl's channels on the handle's part of pl.addr,
+// joining the existing one (a fresh part per call would leak one
+// emptied part per migration cycle) or creating it: registered and
+// forwarding before anything is written, so a confirmation — which may
+// arrive before the write returns — finds it. A relocated channel is
+// marked moving to the target if the part it leaves still carries it
+// (one that ended meanwhile left it unplaced: nothing to release), and
+// stays on that part until the target confirms it (see landedLocked).
+// Callers must hold h.mu with the handle open.
+func (h *clusterShardHandle) placeLocked(pl *placement) error {
+	pl.target, pl.fresh, pl.nm = nil, false, nil
 	for p := range h.parts {
-		if p.addr == addr && p.schannels != nil {
-			target = p
+		if p.addr == pl.addr && p.schannels != nil {
+			pl.target = p
 			break
 		}
 	}
-	if target != nil {
-		maps.Copy(target.schannels, moved)
-		markMoving(target)
-	}
-	h.mu.Unlock()
-
-	var err error
-	if target != nil {
-		_, err = target.handle.SSubscribe(ctx, slices.Sorted(maps.Keys(moved))...)
-		if errors.Is(err, pool.ErrClosed) {
-			// The part's node manager was pruned between the lookup and
-			// the subscribe; fall through to a fresh part.
-			h.mu.Lock()
-			for ch := range moved {
-				delete(target.schannels, ch)
-			}
-			unmarkMoving(target)
-			h.mu.Unlock()
-			target = nil
-		}
-	}
-	if target == nil {
-		part, perr := h.m.subscribeOnNode(ctx, addr, moved)
-		if part == nil {
-			return perr
-		}
-		// The part's forwarder — and so any confirmation — starts after
-		// the mark, under the same lock.
-		target = &shardPart{addr: addr, handle: part, schannels: make(map[string]struct{}, len(moved))}
-		h.mu.Lock()
-		if h.state != shardHandleOpen {
-			h.mu.Unlock()
-			_ = part.Close()
+	if pl.target == nil {
+		nm := h.m.nodeManager(pl.addr)
+		if nm == nil {
 			return pool.ErrClosed
 		}
-		maps.Copy(target.schannels, moved)
-		markMoving(target)
-		h.parts[target] = struct{}{}
+		pl.target = &shardPart{
+			addr:      pl.addr,
+			handle:    nm.NewHandle(),
+			schannels: make(map[string]struct{}, len(pl.moved)),
+		}
+		pl.fresh, pl.nm = true, nm
+		h.parts[pl.target] = struct{}{}
 		h.active++
-		go h.forward(target)
-		h.mu.Unlock()
-		return perr
+		go h.forward(pl.target)
 	}
-	return err
+	pl.target.placeLocked(pl.moved)
+	for ch, old := range pl.old {
+		if _, live := h.parts[old]; !live {
+			continue
+		}
+		if _, held := old.schannels[ch]; held {
+			h.moving[ch] = pl.target
+		}
+	}
+	return nil
+}
+
+// writePlacements writes the placements' subscribes, in order, and
+// returns the first error; ErrClosed (the handle closed) ends it at
+// once. Callers must hold no lock.
+func (h *clusterShardHandle) writePlacements(ctx context.Context, placements []*placement) error {
+	var firstErr error
+	for _, pl := range placements {
+		if err := h.writePlacement(ctx, pl); err != nil {
+			if errors.Is(err, pool.ErrClosed) {
+				return err
+			}
+			// A failed dial: the part is attached and recovers on its
+			// own; keep going with the remaining placements.
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// writePlacement subscribes pl's channels on its part and settles the
+// write: a channel released while it was in flight is unsubscribed
+// here, by the writer (see shardPart.pending). A fresh part whose node
+// manager closed under it — pruned between the lookup and the write,
+// handing out a handle born closed — is replaced and the write retried.
+// A failed dial leaves the channels placed — the engine keeps their
+// registration for its reconnect replay, and a part they move off keeps
+// delivering meanwhile — and is reported. Callers must hold no lock.
+func (h *clusterShardHandle) writePlacement(ctx context.Context, pl *placement) error {
+	for {
+		target := pl.target
+		_, err := target.handle.SSubscribe(ctx, slices.Sorted(maps.Keys(pl.moved))...)
+
+		h.mu.Lock()
+		release := target.settleLocked(pl.moved)
+		retry := errors.Is(err, pool.ErrClosed) && pl.fresh && h.state == shardHandleOpen
+		if retry {
+			// The dead part's forwarder exits on its own; its channels
+			// and moving marks go to the replacement now, so nothing
+			// joins it meanwhile.
+			delete(h.parts, target)
+			for ch := range pl.moved {
+				delete(target.schannels, ch)
+			}
+			for ch, dest := range h.moving {
+				if dest == target {
+					delete(h.moving, ch)
+				}
+			}
+			h.m.forgetNodeManager(pl.addr, pl.nm)
+			err = h.placeLocked(pl)
+		}
+		h.mu.Unlock()
+
+		if len(release) > 0 {
+			_ = target.handle.SUnsubscribe(context.Background(), release...)
+		}
+		if !retry || err != nil {
+			return err
+		}
+	}
 }
 
 // endReroute reverses the close-accounting hold taken by reroute and
@@ -762,31 +900,25 @@ func (h *clusterShardHandle) PSubscribe(ctx context.Context, patterns ...string)
 }
 
 // Unsubscribe removes regular channel subscriptions from the broadcast
-// part; a no-op if none were ever added.
+// part, created for the purpose (no dial) if the handle has none: a
+// handle that owns none of the channels still gets the confirmations
+// the server would have answered with — synthesized by the part's
+// manager, as for a standalone handle — so a Receive awaiting them
+// returns instead of blocking.
 func (h *clusterShardHandle) Unsubscribe(ctx context.Context, channels ...string) error {
-	h.mu.Lock()
-	bh, closed := h.broadcast, h.state != shardHandleOpen
-	h.mu.Unlock()
-	if closed {
-		return pool.ErrClosed
-	}
-	if bh == nil {
-		return nil
+	bh, err := h.broadcastPart()
+	if err != nil {
+		return err
 	}
 	return bh.Unsubscribe(ctx, channels...)
 }
 
-// PUnsubscribe removes pattern subscriptions from the broadcast part; a
-// no-op if none were ever added.
+// PUnsubscribe removes pattern subscriptions from the broadcast part,
+// created for the purpose if the handle has none (see Unsubscribe).
 func (h *clusterShardHandle) PUnsubscribe(ctx context.Context, patterns ...string) error {
-	h.mu.Lock()
-	bh, closed := h.broadcast, h.state != shardHandleOpen
-	h.mu.Unlock()
-	if closed {
-		return pool.ErrClosed
-	}
-	if bh == nil {
-		return nil
+	bh, err := h.broadcastPart()
+	if err != nil {
+		return err
 	}
 	return bh.PUnsubscribe(ctx, patterns...)
 }
@@ -801,10 +933,15 @@ func (h *clusterShardHandle) SSubscribe(ctx context.Context, channels ...string)
 		return nil, ErrNoShardChannels
 	}
 
-	// Serialize with the re-route sweep: an unserialized overlap can
-	// register the same channel on two parts of one node.
-	h.m.rerouteMu.Lock()
-	defer h.m.rerouteMu.Unlock()
+	// Serialized with the handle's other operations and the re-route
+	// sweep through the placement (an unserialized overlap could place a
+	// channel on two parts of one node), released for the writes (see
+	// ops). The wait honors ctx.
+	if err := h.lockOps(ctx); err != nil {
+		return nil, err
+	}
+	unlock := sync.OnceFunc(h.unlockOps)
+	defer unlock()
 
 	// Record the intent and snapshot the placement in one critical
 	// section: resolving against the placement makes a re-added channel
@@ -829,25 +966,19 @@ func (h *clusterShardHandle) SSubscribe(ctx context.Context, channels ...string)
 		return nil, err
 	}
 
-	var firstErr error
-	for addr, chs := range groups {
-		if !h.open() {
-			return nil, pool.ErrClosed
-		}
-		if err := h.handleSSubscribe(ctx, addr, chs, current); err != nil {
-			if errors.Is(err, pool.ErrClosed) {
-				return nil, err
-			}
-			// A failed dial: the part is attached and recovers on its
-			// own; keep going with the remaining groups.
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
+	placements, err := h.placeGroups(groups, current)
+	unlock()
+	if err != nil {
+		return nil, err
 	}
-	if firstErr != nil {
+	if err := h.writePlacements(ctx, placements); err != nil {
+		if errors.Is(err, pool.ErrClosed) {
+			return nil, err
+		}
+		// A failed dial: the part is attached and recovers on its own,
+		// and the reload's sweep retries the placement.
 		h.m.hooks.RequestReload()
-		return nil, firstErr
+		return nil, err
 	}
 	return h, nil
 }
@@ -856,12 +987,21 @@ func (h *clusterShardHandle) SSubscribe(ctx context.Context, channels ...string)
 // channels, or to all of them if none are given, routed to the parts
 // owning them.
 func (h *clusterShardHandle) SUnsubscribe(ctx context.Context, channels ...string) error {
-	// Serialize with the sweep and SSubscribe: those paths subscribe on
-	// a node and register in the part map as separate steps, and an
-	// unsubscribe landing between them leaves the part map and the node
-	// registry disagreeing — a divergence nothing reconciles.
-	h.m.rerouteMu.Lock()
-	defer h.m.rerouteMu.Unlock()
+	// Serialized with SSubscribe and the sweep (see ops), through the
+	// writes: an unsubscribe written with the lock released could be
+	// overtaken by a later subscribe's write of the same channel, and
+	// nothing reconciles the node's registry with the parts then. The
+	// writes dial nothing.
+	if err := h.lockOps(ctx); err != nil {
+		return err
+	}
+	defer h.unlockOps()
+	// A cancelled caller gets nothing done on its behalf — before any
+	// state changes: the parts are written with the cancellation
+	// detached (below), so this is the one place ctx is honored.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	h.mu.Lock()
 	if h.state != shardHandleOpen {
@@ -870,44 +1010,103 @@ func (h *clusterShardHandle) SUnsubscribe(ctx context.Context, channels ...strin
 	}
 	// Every released channel becomes leaving on its part: the part is
 	// detached once its last confirmation came through (see
-	// drainedLocked).
+	// drainedLocked). A channel whose subscribe write is in flight is
+	// left to that writer to unsubscribe (see shardPart.pending). A
+	// channel on no part — never placed, or released already — gets its
+	// confirmation synthesized, as the server would have answered and
+	// as a standalone handle does for a channel it does not own, so a
+	// Receive awaiting it returns; so does a bare release that finds
+	// nothing placed at all.
 	targets := make(map[*shardPart][]string)
+	var synth []string
 	if len(channels) == 0 {
-		clear(h.schannels)
-		clear(h.moving)
+		placed := make(map[string]struct{})
 		for p := range h.parts {
 			if len(p.schannels) == 0 {
 				continue
 			}
-			targets[p] = nil // nil means: everything the part owns
+			var now []string
+			every := true
 			for ch := range p.schannels {
-				p.leaveLocked(ch)
+				placed[ch] = struct{}{}
+				if p.releaseLocked(ch) {
+					now = append(now, ch)
+				} else {
+					every = false
+				}
+			}
+			switch {
+			case every:
+				targets[p] = nil // nil means: everything the part owns
+			case len(now) > 0:
+				slices.Sort(now)
+				targets[p] = now
 			}
 		}
+		for ch := range h.schannels {
+			if _, ok := placed[ch]; !ok {
+				synth = append(synth, ch)
+			}
+		}
+		slices.Sort(synth)
+		if len(targets) == 0 && len(synth) == 0 {
+			synth = []string{""} // the bare reply: nothing was subscribed
+		}
+		clear(h.schannels)
+		clear(h.moving)
 	} else {
 		for _, ch := range channels {
 			delete(h.schannels, ch)
 			delete(h.moving, ch)
 		}
 		// A channel mid-move is released on both parts.
+		placed := make(map[string]struct{})
 		for p := range h.parts {
 			var subset []string
 			for _, ch := range channels {
-				if _, ok := p.schannels[ch]; ok {
+				if _, ok := p.schannels[ch]; !ok {
+					continue
+				}
+				placed[ch] = struct{}{}
+				if p.releaseLocked(ch) {
 					subset = append(subset, ch)
-					p.leaveLocked(ch)
 				}
 			}
 			if len(subset) > 0 {
 				targets[p] = subset
 			}
 		}
+		for _, ch := range channels {
+			if _, ok := placed[ch]; !ok {
+				synth = append(synth, ch)
+			}
+		}
 	}
 	h.mu.Unlock()
 
+	if len(synth) > 0 {
+		// Delivered off the caller's goroutine: deliver waits for room in
+		// events, and a release must not block on a slow consumer (the
+		// standalone handle's synthesized replies queue in its backlog).
+		go func() {
+			for _, ch := range synth {
+				h.deliver(nil, &Subscription{Kind: "sunsubscribe", Channel: ch})
+			}
+		}()
+	}
+
+	// The channels are leaving now, so every part must act: a part that
+	// bowed out on a cancellation that landed meanwhile would keep the
+	// node subscribed to channels nothing here places any more, with no
+	// retry to release them (a retry finds nothing placed). Writes are
+	// bounded by the write timeout, not by ctx. The errors left — a
+	// closed part, a failed write — leave nothing to roll back: the
+	// engine has dropped the registration either way and settles the
+	// confirmations owed itself.
+	writeCtx := context.WithoutCancel(ctx)
 	var firstErr error
 	for p, subset := range targets {
-		if err := p.handle.SUnsubscribe(ctx, subset...); err != nil && firstErr == nil {
+		if err := p.handle.SUnsubscribe(writeCtx, subset...); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

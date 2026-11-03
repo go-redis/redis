@@ -6,6 +6,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9/internal"
@@ -80,17 +81,37 @@ type ClusterManager struct {
 	// into the manager from under those.
 	mu sync.Mutex
 	// nodeManagers holds one owned manager per node addr, created lazily
-	// by subscribeOnNode and pruned once emptied (via CloseIfIdle).
+	// by nodeManager and pruned once emptied (via CloseIfIdle).
 	nodeManagers map[string]*Manager
 	// handles are the live composite handles, re-routed after state
 	// reloads.
 	handles map[*clusterShardHandle]struct{}
 	closed  bool
 
-	// rerouteMu serializes re-route sweeps, and the composite handles'
-	// SSubscribe/SUnsubscribe with them (see clusterShardHandle.SSubscribe).
-	rerouteMu sync.Mutex
+	// sweeping and sweepPending coalesce re-route requests the way
+	// clusterStateHolder.LazyReload coalesces reloads: at most one
+	// sweeper goroutine runs (sweeping), and requests arriving while it
+	// runs set sweepPending for it to serve with one more sweep after a
+	// cooldown, instead of each starting a goroutine of its own to queue
+	// behind it (see ScheduleReroute, sweep).
+	sweeping     atomic.Bool
+	sweepPending atomic.Bool
+	// sweepCtx bounds the sweeper's work and is cancelled by Close: a
+	// sweep parked in a dial, a resolve or a handle's lock then ends
+	// instead of outliving the manager.
+	sweepCtx    context.Context
+	sweepCancel context.CancelFunc
+	// sweepMu serializes sweeps with each other — the sweeper's with a
+	// test's direct rerouteShards call. A sweep's work on one handle is
+	// serialized with that handle's own operations by the handle's
+	// operation lock (see clusterShardHandle.ops), never with another
+	// handle's.
+	sweepMu sync.Mutex
 }
+
+// sweepCooldown is the pause between a sweep and the one serving the
+// requests that arrived during it (clusterStateHolder.LazyReload's).
+const sweepCooldown = 200 * time.Millisecond
 
 var _ PubSubManagerer = (*ClusterManager)(nil)
 
@@ -105,6 +126,7 @@ func NewClusterManager(cfg Config, hooks ClusterHooks) *ClusterManager {
 		nodeManagers: make(map[string]*Manager),
 		handles:      make(map[*clusterShardHandle]struct{}),
 	}
+	m.sweepCtx, m.sweepCancel = context.WithCancel(context.Background())
 	m.broadcast = m.newNodeManager("")
 	return m
 }
@@ -321,6 +343,7 @@ func (m *ClusterManager) Close() error {
 	nodeManagers := slices.Collect(maps.Values(m.nodeManagers))
 	m.nodeManagers = make(map[string]*Manager)
 	m.mu.Unlock()
+	m.sweepCancel()
 
 	var firstErr error
 	for _, h := range handles {
@@ -365,36 +388,11 @@ func (m *ClusterManager) forgetNodeManager(addr string, nm *Manager) {
 	}
 }
 
-// subscribeOnNode subscribes the given shard channels on a fresh handle
-// of addr's owned manager, creating the manager lazily. A prune may
-// close the manager between lookup and subscribe; the resulting
-// ErrClosed retries with a fresh manager. Any other error — a failed
-// dial or write — comes back WITH the handle: the engine keeps the
-// registration for its reconnect replay, so the caller attaches the
-// part and the subscription establishes itself once the node is back
-// (or the re-route sweep moves it). A nil handle means the cluster
-// manager closed.
-func (m *ClusterManager) subscribeOnNode(ctx context.Context, addr string, channels map[string]struct{}) (PubSuber, error) {
-	names := slices.Sorted(maps.Keys(channels))
-	for {
-		nm := m.nodeManager(addr)
-		if nm == nil {
-			return nil, pool.ErrClosed
-		}
-		part := nm.NewHandle()
-		_, err := part.SSubscribe(ctx, names...)
-		if errors.Is(err, pool.ErrClosed) {
-			m.forgetNodeManager(addr, nm)
-			continue
-		}
-		return part, err
-	}
-}
-
 // prune closes and removes owned node managers with no subscriptions
 // left (CloseIfIdle never kills a manager with live handles). A
-// subscribeOnNode racing the close finds ErrClosed and retries with a
-// fresh manager.
+// placement racing the close gets a handle born closed, finds ErrClosed
+// on its write and retries with a fresh manager (see
+// clusterShardHandle.writePlacement).
 func (m *ClusterManager) prune() {
 	m.mu.Lock()
 	snapshot := maps.Clone(m.nodeManagers)
@@ -415,8 +413,12 @@ func (m *ClusterManager) dropShardHandle(h *clusterShardHandle) {
 	m.prune()
 }
 
-// ScheduleReroute triggers an asynchronous re-route sweep; the cluster
-// client wires it to its state-reload notification. It does not block.
+// ScheduleReroute requests a re-route sweep; the cluster client wires
+// it to its state-reload notification. It does not block: the sweep
+// runs on the sweeper goroutine, started here if none runs, and a
+// request made while one runs is served by one more sweep after it
+// (see sweep) — a sweep is an idempotent full recompute, so any number
+// of requests during one collapse into that single follow-up.
 func (m *ClusterManager) ScheduleReroute() {
 	m.mu.Lock()
 	n := len(m.handles)
@@ -425,16 +427,64 @@ func (m *ClusterManager) ScheduleReroute() {
 	if n == 0 || closed {
 		return
 	}
-	go m.rerouteShards(context.Background())
+	// Pending is set before the start attempt: a sweeper that is on its
+	// way out re-checks it after giving sweeping up, so the request is
+	// served either by it or by the goroutine started here.
+	m.sweepPending.Store(true)
+	if m.sweeping.CompareAndSwap(false, true) {
+		go m.sweep()
+	}
+}
+
+// sweep is the sweeper goroutine: it sweeps, pauses for the cooldown,
+// and sweeps again while requests arrived meanwhile — a failed move
+// requests the reload whose notification lands here, so this is also
+// the retry loop, throttled by the cooldown and the cluster's own
+// reload throttle. It exits once no request is pending or the manager
+// closed. Callers must hold sweeping (see ScheduleReroute).
+func (m *ClusterManager) sweep() {
+	ctx := m.sweepCtx
+	for {
+		m.sweepPending.Store(false)
+		m.rerouteShards(ctx)
+		if !waitCooldown(ctx, sweepCooldown) {
+			m.sweeping.Store(false)
+			return
+		}
+		if m.sweepPending.Load() {
+			continue
+		}
+		// Give the flag up, then look once more: a request that landed
+		// between the check above and this store found sweeping held and
+		// started nothing, so it is ours to serve — unless another
+		// starter got the flag first, in which case it is theirs.
+		m.sweeping.Store(false)
+		if !m.sweepPending.Load() || !m.sweeping.CompareAndSwap(false, true) {
+			return
+		}
+	}
+}
+
+// waitCooldown pauses for d, reporting false if ctx ends first.
+func waitCooldown(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // rerouteShards recomputes every live shard subscription's owner and
 // moves the channels whose owner changed; sweeps are serialized,
 // idempotent full recomputes. Emptied node managers are pruned
-// afterwards.
+// afterwards. A ctx that ends mid-sweep (the manager closing) ends it
+// quietly.
 func (m *ClusterManager) rerouteShards(ctx context.Context) {
-	m.rerouteMu.Lock()
-	defer m.rerouteMu.Unlock()
+	m.sweepMu.Lock()
+	defer m.sweepMu.Unlock()
 
 	m.mu.Lock()
 	handles := slices.Collect(maps.Keys(m.handles))
@@ -443,6 +493,9 @@ func (m *ClusterManager) rerouteShards(ctx context.Context) {
 	var failed bool
 	for _, h := range handles {
 		if err := h.reroute(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			failed = true
 			internal.Logger.Printf(ctx, "redis: pubsub: shard subscription re-route failed: %v", err)
 		}

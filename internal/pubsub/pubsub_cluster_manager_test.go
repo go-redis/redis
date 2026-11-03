@@ -24,14 +24,20 @@ type fakeCluster struct {
 	reloads   chan struct{}
 	// onDial, when set, observes every NewConn call before the dial.
 	onDial func(ctx context.Context, addr string)
+	// resolveGate, when set, parks every ResolveOwners call (after
+	// signaling resolveHit) until the gate is closed — how a test holds
+	// a handle's operation lock mid-operation.
+	resolveGate chan struct{}
+	resolveHit  chan struct{}
 }
 
 func newFakeCluster(addrs ...string) *fakeCluster {
 	c := &fakeCluster{
-		nodes:     make(map[string]*fakeServer, len(addrs)),
-		owners:    make(map[string]string),
-		broadcast: newFakeServer(),
-		reloads:   make(chan struct{}, 64),
+		nodes:      make(map[string]*fakeServer, len(addrs)),
+		owners:     make(map[string]string),
+		broadcast:  newFakeServer(),
+		reloads:    make(chan struct{}, 64),
+		resolveHit: make(chan struct{}, 16),
 	}
 	c.broadcast.autoConfirm = true
 	for _, addr := range addrs {
@@ -91,6 +97,17 @@ func (c *fakeCluster) ResolveAddress(prev *pool.Conn, current string) string {
 // stays where it is while that node still owns it.
 func (c *fakeCluster) ResolveOwners(_ context.Context, channels []string, current map[string]string) (map[string]map[string]struct{}, error) {
 	c.mu.Lock()
+	gate := c.resolveGate
+	c.mu.Unlock()
+	if gate != nil {
+		select {
+		case c.resolveHit <- struct{}{}:
+		default:
+		}
+		<-gate
+	}
+
+	c.mu.Lock()
 	defer c.mu.Unlock()
 	groups := make(map[string]map[string]struct{})
 	for _, ch := range channels {
@@ -107,6 +124,24 @@ func (c *fakeCluster) ResolveOwners(_ context.Context, channels []string, curren
 		groups[owner][ch] = struct{}{}
 	}
 	return groups, nil
+}
+
+// setResolveGate arms (or, with nil, disarms) the resolve gate. Closing
+// the gate channel releases every parked and future resolve.
+func (c *fakeCluster) setResolveGate(gate chan struct{}) {
+	c.mu.Lock()
+	c.resolveGate = gate
+	c.mu.Unlock()
+}
+
+// waitResolveHit blocks until a resolve parks at the gate.
+func (c *fakeCluster) waitResolveHit(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.resolveHit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for a resolve to reach the gate")
+	}
 }
 
 func (c *fakeCluster) RequestReload() {
@@ -921,5 +956,439 @@ func TestClusterJoinSurvivesPartRelease(t *testing.T) {
 	}
 	if parts, _ := h.(*clusterShardHandle).openParts(); len(parts) != 1 {
 		t.Fatalf("parts = %d, want 1", len(parts))
+	}
+}
+
+// awaitErr receives a call's result, failing the test if it takes
+// longer than d: how a test pins that one operation does not wait on
+// another's dial.
+func awaitErr(t *testing.T, done <-chan error, d time.Duration) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(d):
+		t.Fatalf("call did not return within %v", d)
+		return nil
+	}
+}
+
+// TestClusterSSubscribeIndependentOfOtherHandleDial pins that one
+// handle's subscribe, parked in the dial of a node that stopped
+// answering, does not stall another handle's subscribe to a healthy
+// node: the handles share no lock across a dial.
+func TestClusterSSubscribeIndependentOfOtherHandleDial(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster("n1:6379", "n2:6379")
+	c.own("a", "n1:6379")
+	c.own("b", "n2:6379")
+	m := newTestClusterManager(t, c)
+	gate := make(chan struct{})
+	t.Cleanup(func() { close(gate) })
+	c.nodes["n1:6379"].setDialGate(gate)
+
+	// The first handle parks in n1's dial.
+	parked := make(chan error, 1)
+	go func() {
+		_, err := m.SSubscribe(ctx, "a")
+		parked <- err
+	}()
+	c.nodes["n1:6379"].waitGateHit(t)
+
+	// The second handle's subscribe to n2 completes within its deadline.
+	short, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.SSubscribe(short, "b")
+		done <- err
+	}()
+	if err := awaitErr(t, done, 2*time.Second); err != nil {
+		t.Fatalf("SSubscribe b: %v", err)
+	}
+	c.nodes["n2:6379"].waitDial(t).expectCmd(t, "ssubscribe", "b")
+
+	// Releasing the gate lets the first one land.
+	close(gate)
+	t.Cleanup(func() { gate = make(chan struct{}) }) // the deferred close must not close it twice
+	if err := awaitErr(t, parked, 5*time.Second); err != nil {
+		t.Fatalf("SSubscribe a: %v", err)
+	}
+	c.nodes["n1:6379"].waitDial(t).expectCmd(t, "ssubscribe", "a")
+}
+
+// TestClusterSSubscribeIndependentOfSweepDial pins that a re-route
+// sweep parked in a dial — moving one of the handle's channels to a
+// node that stopped answering — does not stall the same handle's
+// subscribe to a healthy node: the handle's operation lock is released
+// for the writes.
+func TestClusterSSubscribeIndependentOfSweepDial(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster("n1:6379", "n2:6379", "n3:6379")
+	c.own("a", "n1:6379")
+	c.own("b", "n2:6379")
+	m := newTestClusterManager(t, c)
+
+	h, err := m.SSubscribe(ctx, "a")
+	if err != nil {
+		t.Fatalf("SSubscribe a: %v", err)
+	}
+	events := h.ChannelWithSubscriptions()
+	n1 := c.nodes["n1:6379"].waitDial(t)
+	n1.expectCmd(t, "ssubscribe", "a")
+	recvSubscription(t, events)
+
+	// a moves to n3, which does not answer its dial: the sweep parks.
+	gate := make(chan struct{})
+	c.nodes["n3:6379"].setDialGate(gate)
+	c.own("a", "n3:6379")
+	swept := make(chan struct{})
+	go func() {
+		m.rerouteShards(ctx)
+		close(swept)
+	}()
+	c.nodes["n3:6379"].waitGateHit(t)
+
+	// The handle's subscribe to n2 completes within its deadline.
+	short, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.SSubscribe(short, "b")
+		done <- err
+	}()
+	if err := awaitErr(t, done, 2*time.Second); err != nil {
+		t.Fatalf("SSubscribe b: %v", err)
+	}
+	c.nodes["n2:6379"].waitDial(t).expectCmd(t, "ssubscribe", "b")
+	if sub := recvSubscription(t, events); sub.Kind != "ssubscribe" || sub.Channel != "b" {
+		t.Fatalf("confirmation = %v, want ssubscribe b", sub)
+	}
+
+	// The sweep lands once n3 answers, and releases a on n1.
+	close(gate)
+	c.nodes["n3:6379"].waitDial(t).expectCmd(t, "ssubscribe", "a")
+	n1.expectCmd(t, "sunsubscribe", "a")
+	select {
+	case <-swept:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sweep did not finish")
+	}
+	_, _, schannels := h.Subscriptions()
+	slices.Sort(schannels)
+	if !slices.Equal(schannels, []string{"a", "b"}) {
+		t.Fatalf("Subscriptions = %v, want [a b]", schannels)
+	}
+}
+
+// TestClusterSUnsubscribeDuringSubscribeDial pins the write protocol
+// behind the released lock: a channel released while its subscribe
+// write is parked in the node's dial is not unsubscribed by the
+// releaser — that could reach the node before the subscribe — but by
+// the writer once the write returned, so the node ends up unsubscribed
+// and the emptied part is pruned. The release itself does not wait on
+// the dial.
+func TestClusterSUnsubscribeDuringSubscribeDial(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster("n1:6379")
+	c.own("a", "n1:6379")
+	m := newTestClusterManager(t, c)
+	gate := make(chan struct{})
+	c.nodes["n1:6379"].setDialGate(gate)
+
+	h := m.NewHandle()
+	events := h.ChannelWithSubscriptions()
+	subscribed := make(chan error, 1)
+	go func() {
+		_, err := h.SSubscribe(ctx, "a")
+		subscribed <- err
+	}()
+	c.nodes["n1:6379"].waitGateHit(t)
+
+	done := make(chan error, 1)
+	go func() { done <- h.SUnsubscribe(ctx, "a") }()
+	if err := awaitErr(t, done, 2*time.Second); err != nil {
+		t.Fatalf("SUnsubscribe a: %v", err)
+	}
+	// Nothing reached the node yet: the dial is still parked.
+	select {
+	case <-c.nodes["n1:6379"].dialCh:
+		t.Fatal("the node was dialed while the gate was closed")
+	default:
+	}
+
+	// The dial lands: the subscribe is written first, the release after.
+	close(gate)
+	n1 := c.nodes["n1:6379"].waitDial(t)
+	n1.expectCmd(t, "ssubscribe", "a")
+	n1.expectCmd(t, "sunsubscribe", "a")
+	if err := awaitErr(t, subscribed, 5*time.Second); err != nil {
+		t.Fatalf("SSubscribe a: %v", err)
+	}
+	// The stream ends on the release, with the composite unsubscribed.
+	// The subscribe confirmation shows only when it is read before the
+	// release reaches the node's manager (as for a standalone handle
+	// that subscribes and unsubscribes back to back).
+	sub := recvSubscription(t, events)
+	if sub.Kind == "ssubscribe" && sub.Channel == "a" && sub.Count == 1 {
+		sub = recvSubscription(t, events)
+	}
+	if sub.Kind != "sunsubscribe" || sub.Channel != "a" || sub.Count != 0 {
+		t.Fatalf("confirmation = %v (count %d), want sunsubscribe a with count 0", sub, sub.Count)
+	}
+	n1.expectClosed(t)
+	waitNodeManagerGone(t, m, "n1:6379")
+	if _, _, schannels := h.Subscriptions(); len(schannels) != 0 {
+		t.Fatalf("Subscriptions = %v, want none", schannels)
+	}
+	if parts, _ := h.(*clusterShardHandle).openParts(); len(parts) != 0 {
+		t.Fatalf("parts = %d, want none", len(parts))
+	}
+}
+
+// TestClusterOperationLockWaitHonorsContext pins that waiting for the
+// handle's operation lock gives up when the caller's context ends: a
+// subscribe held up by another operation of the same handle returns
+// that context's error within its deadline, instead of waiting it out.
+func TestClusterOperationLockWaitHonorsContext(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster("n1:6379")
+	c.own("a", "n1:6379")
+	c.own("b", "n1:6379")
+	m := newTestClusterManager(t, c)
+	gate := make(chan struct{})
+	t.Cleanup(func() { close(gate) })
+	c.setResolveGate(gate)
+
+	// One operation holds the lock, parked in its resolve.
+	h := m.NewHandle()
+	parked := make(chan error, 1)
+	go func() {
+		_, err := h.SSubscribe(ctx, "a")
+		parked <- err
+	}()
+	c.waitResolveHit(t)
+
+	short, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.SSubscribe(short, "b")
+		done <- err
+	}()
+	if err := awaitErr(t, done, 2*time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SSubscribe b = %v, want context.DeadlineExceeded", err)
+	}
+	// b was never recorded: the call did nothing (a is the parked call's
+	// intent).
+	if _, _, schannels := h.Subscriptions(); slices.Contains(schannels, "b") {
+		t.Fatalf("Subscriptions = %v, want b absent", schannels)
+	}
+}
+
+// TestClusterSUnsubscribeCanceledContextLeavesState pins that an
+// SUnsubscribe with a cancelled context changes nothing: the channels
+// stay subscribed on their node and in the composite's view, and a
+// retry with a live context releases them. (A release recorded but not
+// written would leave the node subscribed with nothing to retry.)
+func TestClusterSUnsubscribeCanceledContextLeavesState(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster("n1:6379")
+	c.own("a", "n1:6379")
+	m := newTestClusterManager(t, c)
+
+	h, err := m.SSubscribe(ctx, "a")
+	if err != nil {
+		t.Fatalf("SSubscribe a: %v", err)
+	}
+	events := h.ChannelWithSubscriptions()
+	n1 := c.nodes["n1:6379"].waitDial(t)
+	n1.expectCmd(t, "ssubscribe", "a")
+	recvSubscription(t, events)
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := h.SUnsubscribe(cancelled, "a"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("SUnsubscribe with a cancelled context = %v, want context.Canceled", err)
+	}
+	n1.expectNoCmd(t, 50*time.Millisecond)
+	if _, _, schannels := h.Subscriptions(); !slices.Equal(schannels, []string{"a"}) {
+		t.Fatalf("Subscriptions = %v, want [a]", schannels)
+	}
+	// The node still delivers.
+	n1.sendMessage(t, "smessage", "a", "hello")
+	if msg, ok := recvEvent(t, events).(*Message); !ok || msg.Payload != "hello" {
+		t.Fatalf("event = %v, want the message on a", msg)
+	}
+
+	// The retry releases it.
+	if err := h.SUnsubscribe(ctx, "a"); err != nil {
+		t.Fatalf("SUnsubscribe a: %v", err)
+	}
+	n1.expectCmd(t, "sunsubscribe", "a")
+	if sub := recvSubscription(t, events); sub.Kind != "sunsubscribe" || sub.Channel != "a" || sub.Count != 0 {
+		t.Fatalf("confirmation = %v (count %d), want sunsubscribe a with count 0", sub, sub.Count)
+	}
+	n1.expectClosed(t)
+	waitNodeManagerGone(t, m, "n1:6379")
+}
+
+// TestClusterUnsubscribeWithoutSubscriptionConfirms pins that releasing
+// what the handle does not hold still answers, as the server and a
+// standalone handle do: a confirmation per named channel or pattern, a
+// bare one for a release of everything, each with the composite's
+// Count — so a Receive awaiting the reply returns. Nothing is dialed.
+func TestClusterUnsubscribeWithoutSubscriptionConfirms(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster("n1:6379")
+	c.own("s", "n1:6379")
+	m := newTestClusterManager(t, c)
+
+	h := m.NewHandle()
+	events := h.ChannelWithSubscriptions()
+	expect := func(call string, err error, kind, channel string) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", call, err)
+		}
+		if sub := recvSubscription(t, events); sub.Kind != kind || sub.Channel != channel || sub.Count != 0 {
+			t.Fatalf("%s: confirmation = %v (count %d), want %s %q with count 0", call, sub, sub.Count, kind, channel)
+		}
+	}
+	expect("Unsubscribe x", h.Unsubscribe(ctx, "x"), "unsubscribe", "x")
+	expect("Unsubscribe", h.Unsubscribe(ctx), "unsubscribe", "")
+	expect("PUnsubscribe p*", h.PUnsubscribe(ctx, "p*"), "punsubscribe", "p*")
+	expect("PUnsubscribe", h.PUnsubscribe(ctx), "punsubscribe", "")
+	expect("SUnsubscribe s", h.SUnsubscribe(ctx, "s"), "sunsubscribe", "s")
+	expect("SUnsubscribe", h.SUnsubscribe(ctx), "sunsubscribe", "")
+
+	select {
+	case <-c.broadcast.dialCh:
+		t.Fatal("the broadcast connection was dialed")
+	case <-c.nodes["n1:6379"].dialCh:
+		t.Fatal("a node was dialed")
+	default:
+	}
+
+	// A release naming a placed channel and one no part carries answers
+	// both: the node's confirmation for the first, a synthesized one for
+	// the second.
+	if _, err := h.SSubscribe(ctx, "s"); err != nil {
+		t.Fatalf("SSubscribe s: %v", err)
+	}
+	n1 := c.nodes["n1:6379"].waitDial(t)
+	n1.expectCmd(t, "ssubscribe", "s")
+	recvSubscription(t, events)
+	if err := h.SUnsubscribe(ctx, "s", "zz"); err != nil {
+		t.Fatalf("SUnsubscribe s zz: %v", err)
+	}
+	n1.expectCmd(t, "sunsubscribe", "s")
+	got := []string{recvSubscription(t, events).Channel, recvSubscription(t, events).Channel}
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"s", "zz"}) {
+		t.Fatalf("confirmations for = %v, want [s zz]", got)
+	}
+	n1.expectClosed(t)
+	waitNodeManagerGone(t, m, "n1:6379")
+}
+
+// countResolveHits counts the resolves that reach the gate within d.
+func (c *fakeCluster) countResolveHits(d time.Duration) int {
+	deadline := time.After(d)
+	n := 0
+	for {
+		select {
+		case <-c.resolveHit:
+			n++
+		case <-deadline:
+			return n
+		}
+	}
+}
+
+// waitSweepIdle waits until no sweeper goroutine runs.
+func waitSweepIdle(t *testing.T, m *ClusterManager) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for m.sweeping.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("the sweeper did not exit")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestClusterScheduleRerouteCoalesces pins that re-route requests made
+// while a sweep runs do not each start a sweep of their own: one
+// sweeper serves them all with a single follow-up sweep after the
+// cooldown, then exits.
+func TestClusterScheduleRerouteCoalesces(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster("n1:6379")
+	c.own("a", "n1:6379")
+	m := newTestClusterManager(t, c)
+
+	h, err := m.SSubscribe(ctx, "a")
+	if err != nil {
+		t.Fatalf("SSubscribe a: %v", err)
+	}
+	c.nodes["n1:6379"].waitDial(t).expectCmd(t, "ssubscribe", "a")
+	recvSubscription(t, h.ChannelWithSubscriptions())
+
+	// The first request's sweep parks in its resolve; ten more arrive.
+	gate := make(chan struct{})
+	c.setResolveGate(gate)
+	m.ScheduleReroute()
+	c.waitResolveHit(t)
+	for range 10 {
+		m.ScheduleReroute()
+	}
+	if got := c.countResolveHits(50 * time.Millisecond); got != 0 {
+		t.Fatalf("resolves while the sweep was parked = %d, want 0", got)
+	}
+
+	// Released, the sweeper serves them with exactly one more sweep.
+	close(gate)
+	if got := c.countResolveHits(sweepCooldown + 300*time.Millisecond); got != 1 {
+		t.Fatalf("follow-up sweeps = %d, want 1", got)
+	}
+	waitSweepIdle(t, m)
+
+	// A request once it is idle starts a sweeper again.
+	m.ScheduleReroute()
+	c.waitResolveHit(t)
+	waitSweepIdle(t, m)
+}
+
+// TestClusterCloseEndsSweep pins that closing the manager ends a sweep
+// parked in a dial, without it requesting a reload on the way out.
+func TestClusterCloseEndsSweep(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster("n1:6379", "n2:6379")
+	c.own("a", "n1:6379")
+	m := newTestClusterManager(t, c)
+
+	h, err := m.SSubscribe(ctx, "a")
+	if err != nil {
+		t.Fatalf("SSubscribe a: %v", err)
+	}
+	c.nodes["n1:6379"].waitDial(t).expectCmd(t, "ssubscribe", "a")
+	recvSubscription(t, h.ChannelWithSubscriptions())
+
+	gate := make(chan struct{})
+	t.Cleanup(func() { close(gate) })
+	c.nodes["n2:6379"].setDialGate(gate)
+	c.own("a", "n2:6379")
+	m.ScheduleReroute()
+	c.nodes["n2:6379"].waitGateHit(t)
+
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitSweepIdle(t, m)
+	select {
+	case <-c.reloads:
+		t.Fatal("the ending sweep requested a reload")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
