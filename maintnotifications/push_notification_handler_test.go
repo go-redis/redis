@@ -241,9 +241,32 @@ func TestHandleMoving_NullEndpointLeavesPubSubMarkedNotQueued(t *testing.T) {
 	// worker for PubSub connections (always IDLE). The worker re-inits the
 	// socket without SUBSCRIBE, MarkHandoffQueued clears ShouldHandoff, and
 	// messages stop arriving while Ping keeps succeeding.
+	t.Run("timeS=0", func(t *testing.T) {
+		cn, manager, hook := setupNullMovingPubSub(t, 0)
+		// Allow the zero-delay AfterFunc to run.
+		time.Sleep(50 * time.Millisecond)
+		assertPubSubMarkedNotQueued(t, cn, manager, hook)
+	})
+	t.Run("timeS=2 keeps the timeS/2 delay", func(t *testing.T) {
+		cn, manager, hook := setupNullMovingPubSub(t, 2)
+		// A null endpoint means "reconnect to the same address after timeS/2":
+		// PubSub must not be marked (and so must not reconnect) before then.
+		time.Sleep(300 * time.Millisecond)
+		if cn.ShouldHandoff() {
+			t.Fatal("PubSub conn marked before timeS/2")
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for !cn.ShouldHandoff() && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		assertPubSubMarkedNotQueued(t, cn, manager, hook)
+	})
+}
+
+func setupNullMovingPubSub(t *testing.T, timeS int64) (*pool.Conn, *Manager, *PoolHook) {
+	t.Helper()
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	t.Cleanup(func() { server.Close(); client.Close() })
 
 	psp := pool.NewPubSubPool(&pool.Options{Name: "pubsub-test"}, func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return client, nil
@@ -252,7 +275,7 @@ func TestHandleMoving_NullEndpointLeavesPubSubMarkedNotQueued(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PubSub NewConn: %v", err)
 	}
-	defer cn.Close()
+	t.Cleanup(func() { cn.Close() })
 	if !cn.IsPubSub() {
 		t.Fatal("expected IsPubSub")
 	}
@@ -261,7 +284,7 @@ func TestHandleMoving_NullEndpointLeavesPubSubMarkedNotQueued(t *testing.T) {
 
 	manager := createTestManager("127.0.0.1:6379")
 	hook := NewPoolHook(func(ctx context.Context, network, addr string) (net.Conn, error) {
-		t.Fatal("handoff worker must not dial for PubSub null-endpoint MOVING")
+		t.Error("handoff worker must not dial for PubSub null-endpoint MOVING")
 		return nil, nil
 	}, "tcp", DefaultConfig(), manager)
 	manager.poolHooksRef = hook
@@ -274,16 +297,17 @@ func TestHandleMoving_NullEndpointLeavesPubSubMarkedNotQueued(t *testing.T) {
 	notification := []interface{}{
 		"MOVING",
 		int64(42),
-		int64(0), // timeS=0 would fire AfterFunc immediately without the PubSub guard
-		nil,      // null endpoint
+		timeS,
+		nil, // null endpoint
 	}
 	if err := handler.handleMoving(context.Background(), push.NotificationHandlerContext{Conn: cn}, notification); err != nil {
 		t.Fatalf("handleMoving: %v", err)
 	}
+	return cn, manager, hook
+}
 
-	// Allow a zero-delay AfterFunc to run if the bug regresses.
-	time.Sleep(50 * time.Millisecond)
-
+func assertPubSubMarkedNotQueued(t *testing.T, cn *pool.Conn, manager *Manager, hook *PoolHook) {
+	t.Helper()
 	if !cn.ShouldHandoff() {
 		t.Fatal("expected ShouldHandoff so PubSub can reconnect and resubscribe")
 	}
