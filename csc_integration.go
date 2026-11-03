@@ -1044,6 +1044,10 @@ func (c *baseClient) cscCommandError(cmd Cmder) error {
 		return errUnverifiableCommandWithCSC
 	}
 	if strings.EqualFold(name, "client") {
+		if len(cmd.Args()) == 1 {
+			// Let the server report the missing subcommand.
+			return nil
+		}
 		subcommand, ok := cscCommandToken(cmd, 1)
 		if !ok {
 			return errUnverifiableCommandWithCSC
