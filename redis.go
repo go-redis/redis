@@ -1243,6 +1243,10 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 		// already bumped and evicted through onCscReinit before replacing the
 		// socket, so it must not bump a second time here.
 		c.cscEvictOwnedEntries(cn.GetID())
+	} else if !trackingEnabled && c.cscConnInitGen(cn.GetID()) != 0 {
+		// A re-init after CSC stopped skips TRACKING ON: the new socket is
+		// untracked, so it must not keep the OPTOUT NO prefix (#4236).
+		c.cscForgetConn(cn.GetID())
 	}
 	var trackingCmd *StatusCmd
 	initCmds, initErr := conn.Pipelined(ctx, func(pipe Pipeliner) error {
