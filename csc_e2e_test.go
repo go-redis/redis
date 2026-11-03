@@ -84,7 +84,7 @@ var _ = Describe("Client-side cache (standalone)", func() {
 		Expect(info.DB).To(Equal(0))
 	})
 
-	It("keeps parent cache invalidations after EphemeralConn RESET", func() {
+	It("keeps parent cache invalidations after EphemeralConn RESET", Label("NonRedisEnterprise"), func() {
 		key := "csc-e2e-ephemeral-reset"
 		Expect(mutator.Set(ctx, key, "before", 0).Err()).NotTo(HaveOccurred())
 		Expect(client.Get(ctx, key).Val()).To(Equal("before"))
