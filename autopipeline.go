@@ -662,22 +662,32 @@ type apBatch struct {
 // instead of self-deadlocking on the batch's own completion signal.
 func (b *apBatch) enterNodeDispatch() func() {
 	gid := curGoroutineID()
+	b.addExecutor(gid)
+	return func() { b.removeExecutor(gid) }
+}
+
+// addExecutor registers goroutine gid as an executor of this batch, like
+// enterNodeDispatch, for a caller that already knows its goroutine id: the
+// full-duplex reader resolves it once per session instead of once per reply.
+// Pair with removeExecutor(gid).
+func (b *apBatch) addExecutor(gid int64) {
 	b.nodeMu.Lock()
 	b.nodeGids = append(b.nodeGids, gid)
 	b.nodeCount.Store(int32(len(b.nodeGids)))
 	b.nodeMu.Unlock()
-	return func() {
-		b.nodeMu.Lock()
-		for i, g := range b.nodeGids {
-			if g == gid {
-				b.nodeGids[i] = b.nodeGids[len(b.nodeGids)-1]
-				b.nodeGids = b.nodeGids[:len(b.nodeGids)-1]
-				break
-			}
+}
+
+func (b *apBatch) removeExecutor(gid int64) {
+	b.nodeMu.Lock()
+	for i, g := range b.nodeGids {
+		if g == gid {
+			b.nodeGids[i] = b.nodeGids[len(b.nodeGids)-1]
+			b.nodeGids = b.nodeGids[:len(b.nodeGids)-1]
+			break
 		}
-		b.nodeCount.Store(int32(len(b.nodeGids)))
-		b.nodeMu.Unlock()
 	}
+	b.nodeCount.Store(int32(len(b.nodeGids)))
+	b.nodeMu.Unlock()
 }
 
 // isExecutorGoroutine reports whether the CALLING goroutine is currently
