@@ -866,6 +866,12 @@ func (p *ConnPool) checkMinIdleConns() {
 
 // addIdleConn is called with a dial slot already held by checkMinIdleConns.
 func (p *ConnPool) addIdleConn() error {
+	return p.addIdleConnTracked(nil)
+}
+
+// addIdleConnTracked is addIdleConn that reports whether a dial started (see
+// dialConnTracked).
+func (p *ConnPool) addIdleConnTracked(dialed *bool) error {
 	if err := p.reserveConn(); err != nil {
 		return err
 	}
@@ -876,7 +882,7 @@ func (p *ConnPool) addIdleConn() error {
 		}
 	}()
 	// Do not apply DialTimeout via context here; dialConn applies DialTimeout per attempt.
-	cn, err := p.dialConn(context.Background(), true)
+	cn, err := p.dialConnTracked(context.Background(), true, dialed)
 	if err != nil {
 		return err
 	}
@@ -959,13 +965,13 @@ func (p *ConnPool) addIdleConnRateLimited() {
 	// releaseDialSlotAndCheckMinIdleConns would not replay the refill.
 	if err := p.acquireDialSlot(context.Background()); err != nil {
 		// Pool closed while waiting.
-		p.dialLimiter.refund()
+		p.refundDialToken(true)
 		p.refillPending.Add(-1)
 		return
 	}
 	slotHeld = true
 	if !p.semaphore.TryAcquire() {
-		p.dialLimiter.refund()
+		p.refundDialToken(true)
 		p.refillPending.Add(-1)
 		return
 	}
@@ -981,15 +987,20 @@ func (p *ConnPool) addIdleConnRateLimited() {
 	if ps > p.cfg.PoolSize || idle > p.minIdleConns() {
 		p.poolSize.Add(-1)
 		p.idleConnsLen.Add(-1)
-		p.dialLimiter.refund()
+		p.refundDialToken(true)
 		turnHeld = false
 		p.freeTurn()
 		return
 	}
 	counted = true
 
-	err := p.addIdleConn()
+	dialed := false
+	err := p.addIdleConnTracked(&dialed)
 	added = err == nil
+	if err != nil && !dialed {
+		// Failed before dialing (e.g. MaxActiveConns reached).
+		p.refundDialToken(true)
+	}
 	if err != nil && err != ErrClosed {
 		p.poolSize.Add(-1)
 		p.idleConnsLen.Add(-1)
@@ -1085,6 +1096,12 @@ func (p *ConnPool) cancelConnReservation() {
 }
 
 func (p *ConnPool) newConn(ctx context.Context, pooled bool) (*Conn, error) {
+	return p.newConnTracked(ctx, pooled, nil)
+}
+
+// newConnTracked is newConn that reports whether a dial started (see
+// dialConnTracked).
+func (p *ConnPool) newConnTracked(ctx context.Context, pooled bool, dialed *bool) (*Conn, error) {
 	if err := p.reserveConn(); err != nil {
 		return nil, err
 	}
@@ -1103,7 +1120,7 @@ func (p *ConnPool) newConn(ctx context.Context, pooled bool) (*Conn, error) {
 
 	// Do not apply DialTimeout via context here; dialConn applies DialTimeout per attempt.
 	// We still propagate ctx so callers can cancel explicitly.
-	cn, err := p.dialConn(ctx, pooled)
+	cn, err := p.dialConnTracked(ctx, pooled, dialed)
 	if err != nil {
 		return nil, err
 	}
@@ -1150,12 +1167,22 @@ func (p *ConnPool) newConn(ctx context.Context, pooled bool) (*Conn, error) {
 }
 
 func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
+	return p.dialConnTracked(ctx, pooled, nil)
+}
+
+// dialConnTracked is dialConn that sets *dialed (if non-nil) once a dial
+// attempt starts, so a rate-limited caller can refund a token for a dial
+// that never started.
+func (p *ConnPool) dialConnTracked(ctx context.Context, pooled bool, dialed *bool) (*Conn, error) {
 	if p.closed() {
 		return nil, ErrClosed
 	}
 
 	if p.dialErrorsNum.Load() >= uint32(p.cfg.PoolSize) {
 		return nil, p.getLastDialError()
+	}
+	if dialed != nil {
+		*dialed = true
 	}
 
 	// Record dial start time for connection creation metric
@@ -1639,11 +1666,12 @@ func (p *ConnPool) queuedNewConn(ctx context.Context, wait, tokenHeld bool) (*Co
 		defer w.cancelCtx()
 
 		dialCtx := w.getCtxForDial()
-		cn, cnErr := p.newConn(dialCtx, true)
+		dialed := false
+		cn, cnErr := p.newConnTracked(dialCtx, true, &dialed)
 		if cnErr != nil {
-			if cnErr == ErrPoolExhausted || cnErr == ErrClosed {
-				// MaxActiveConns reservation failed or the pool closed:
-				// newConn returned before dialing.
+			if !dialed {
+				// Failed before dialing: MaxActiveConns reached, pool
+				// closed, or dial errors saturated (fast fail).
 				p.refundDialToken(tokenHeld)
 			}
 			w.tryDeliver(nil, cnErr) // deliver error to caller, notify connection creation failed
@@ -1843,10 +1871,13 @@ func (p *ConnPool) throttleDial(ctx context.Context, wait bool, poolDeadline tim
 	return true, nil
 }
 
-// refundDialToken returns a dial token taken for a dial that never started.
+// refundDialToken returns a dial token taken for a dial that never started,
+// and wakes one parked Get() so the token is used now rather than at the
+// waiter's next timer.
 func (p *ConnPool) refundDialToken(tokenHeld bool) {
 	if tokenHeld && p.dialLimiter != nil {
 		p.dialLimiter.refund()
+		p.signalDialWaiter()
 	}
 }
 

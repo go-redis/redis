@@ -58,6 +58,20 @@ func (p *ConnPool) DialWaitQueueLen() int {
 	return p.dialWaitQueue.len()
 }
 
+// DialTokens returns the dial rate limiter's current token count (after
+// refill), or 0 when rate limiting is disabled.
+func (p *ConnPool) DialTokens() float64 {
+	l := p.dialLimiter
+	if l == nil {
+		return 0
+	}
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.refillLocked(now)
+	return l.tokens
+}
+
 var NoExpiration = noExpiration
 
 func (p *ConnPool) CalcConnExpiresAt() time.Time {

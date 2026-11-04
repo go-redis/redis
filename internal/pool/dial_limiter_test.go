@@ -2,6 +2,7 @@ package pool_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -822,5 +823,138 @@ func TestDialRateLimitCanceledGetDoesNotDial(t *testing.T) {
 	}
 	if got := dials.Load(); got != 1 {
 		t.Fatalf("dials=%d, want 1: a canceled Get dialed", got)
+	}
+}
+
+// TestDialRateLimitRefundWakesParkedWaiter: a token refunded because a dial
+// never started must wake a parked Get() so it can use the token, instead of
+// sleeping until the next refill.
+func TestDialRateLimitRefundWakesParkedWaiter(t *testing.T) {
+	var dials atomic.Int32
+	gate := make(chan struct{})
+	p := pool.NewConnPool(&pool.Options{
+		Dialer: func(context.Context) (net.Conn, error) {
+			dials.Add(1)
+			<-gate
+			return newDummyConn(), nil
+		},
+		PoolSize:           10,
+		MaxConcurrentDials: 1,
+		DialRateLimit:      1,
+		DialRateBurst:      2,
+		PoolTimeout:        3 * time.Second,
+	})
+	defer p.Close()
+	ctx := context.Background()
+
+	type result struct {
+		cn  *pool.Conn
+		err error
+	}
+	// Get 1 takes token 1 and holds the only dial permit in a blocked dial.
+	r1 := make(chan result, 1)
+	go func() {
+		cn, err := p.Get(ctx)
+		r1 <- result{cn, err}
+	}()
+	waitFor(t, time.Second, func() bool { return dials.Load() == 1 })
+
+	// Get 2 takes token 2 and waits for a dial permit until its ctx expires.
+	r2 := make(chan error, 1)
+	go func() {
+		cctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer cancel()
+		_, err := p.Get(cctx)
+		r2 <- err
+	}()
+	waitFor(t, time.Second, func() bool { return p.DialTokens() < 1 })
+
+	// Get 3 finds no token and parks until the next refill (~1s).
+	r3 := make(chan result, 1)
+	go func() {
+		cn, err := p.Get(ctx)
+		r3 <- result{cn, err}
+	}()
+	waitFor(t, time.Second, func() bool { return p.DialWaitQueueLen() == 1 })
+
+	// Get 2 gives up and refunds its token: Get 3 must wake at once.
+	if err := <-r2; err != context.DeadlineExceeded {
+		t.Fatalf("Get 2 err=%v, want context.DeadlineExceeded", err)
+	}
+	waitFor(t, 200*time.Millisecond, func() bool { return p.DialWaitQueueLen() == 0 })
+
+	close(gate)
+	for _, ch := range []chan result{r1, r3} {
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("Get failed: %v", r.err)
+		}
+		p.Put(ctx, r.cn)
+	}
+}
+
+// TestDialRateLimitRefillRefundsOnPreDialFailure: a refill worker whose
+// addIdleConn fails before dialing (MaxActiveConns reached) returns its token.
+func TestDialRateLimitRefillRefundsOnPreDialFailure(t *testing.T) {
+	var dials atomic.Int32
+	p := pool.NewConnPool(&pool.Options{
+		Dialer:             countingDialer(&dials),
+		PoolSize:           10,
+		MaxConcurrentDials: 10,
+		MaxActiveConns:     1,
+		DialRateLimit:      1,
+		DialRateBurst:      2,
+		PoolTimeout:        time.Second,
+	})
+	defer p.Close()
+	ctx := context.Background()
+
+	// A dedicated conn (not paced) fills MaxActiveConns.
+	dedicated, err := p.NewConn(ctx)
+	if err != nil {
+		t.Fatalf("NewConn failed: %v", err)
+	}
+	defer p.RemoveWithoutTurn(ctx, dedicated, nil)
+
+	// The refill worker takes a token, then reserveConn fails.
+	p.RaiseMinIdleConns(1)
+	time.Sleep(100 * time.Millisecond)
+	if got := p.DialTokens(); got < 1.9 {
+		t.Fatalf("DialTokens=%.2f, want 2: pre-dial refill failure kept its token", got)
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials=%d, want 1", got)
+	}
+}
+
+// TestDialRateLimitRefundsOnDialFastFail: a Get whose dial fails fast because
+// dial errors are saturated (no dial attempt) returns its token.
+func TestDialRateLimitRefundsOnDialFastFail(t *testing.T) {
+	var dials atomic.Int32
+	p := pool.NewConnPool(&pool.Options{
+		Dialer: func(context.Context) (net.Conn, error) {
+			dials.Add(1)
+			return nil, errors.New("dial failed")
+		},
+		PoolSize:           1,
+		MaxConcurrentDials: 1,
+		DialerRetries:      1,
+		DialRateLimit:      1,
+		DialRateBurst:      3,
+		PoolTimeout:        time.Second,
+	})
+	defer p.Close()
+	ctx := context.Background()
+
+	// Get 1 takes a token and dials; the failure saturates dial errors.
+	if _, err := p.Get(ctx); err == nil {
+		t.Fatal("Get 1: want dial error")
+	}
+	// Get 2 takes a token but fails fast without dialing.
+	if _, err := p.Get(ctx); err == nil {
+		t.Fatal("Get 2: want dial error")
+	}
+	if got := p.DialTokens(); got < 1.9 {
+		t.Fatalf("DialTokens=%.2f, want 2: fast-failed Get kept its token", got)
 	}
 }
