@@ -1265,6 +1265,10 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 		// already bumped and evicted through onCscReinit before replacing the
 		// socket, so it must not bump a second time here.
 		c.cscEvictOwnedEntries(cn.GetID())
+	} else if !trackingEnabled && c.cscConnInitGen(cn.GetID()) != 0 {
+		// A re-init after CSC stopped skips TRACKING ON: the new socket is
+		// untracked, so it must not keep the OPTOUT NO prefix (#4236).
+		c.cscForgetConn(cn.GetID())
 	}
 	var trackingCmd *StatusCmd
 	initCmds, initErr := conn.Pipelined(ctx, func(pipe Pipeliner) error {
@@ -1998,9 +2002,11 @@ func (c *baseClient) _process(ctx context.Context, cmd Cmder, attempt int, captu
 		}
 		// Borrowed Conn/Tx wrappers do not serve cache hits, but can still hold
 		// a tracked connection and need NO for an ordinary uncached OPTOUT read.
+		// Per-socket init generation (not live client-level CSC) decides whether
+		// the socket still carries TRACKING after disableCSCServing (#4236 item 1).
 		flag := byte(0)
 		if c.cscPolicy.mode != TrackingModePlain {
-			tracked := c.cscTrackingRequested() && c.cscConnInitGen(cn.GetID()) != 0
+			tracked := c.cscConnInitGen(cn.GetID()) != 0
 			if capture != nil && !tracked {
 				capture.noStore = true
 			}
