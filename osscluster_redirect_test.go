@@ -376,6 +376,20 @@ func (h servingEndpointHook) ProcessPipelineHook(next ProcessPipelineHook) Proce
 	return next
 }
 
+// TestWatchKeepsServingEndpoint: Client.Watch returns the WATCH error with its
+// serving endpoint, so ClusterClient.Watch can resolve a hostless redirect.
+func TestWatchKeepsServingEndpoint(t *testing.T) {
+	ctx := context.Background()
+	moved := proto.ParseErrorReply([]byte("-MOVED 1 :6380"))
+	c := NewClient(&Options{Addr: "127.0.0.1:1"})
+	defer c.Close()
+	c.AddHook(servingEndpointHook{err: &errWithServingEndpoint{endpoint: "10.0.0.9:7000", err: moved}})
+	err := c.Watch(ctx, func(*Tx) error { return nil }, "k")
+	if got := servingEndpointFromErr(err); got != "10.0.0.9:7000" {
+		t.Fatalf("Watch err = %v, serving endpoint %q, want 10.0.0.9:7000", err, got)
+	}
+}
+
 // TestProcessStripsServingEndpointWrapper: Client, Tx and Conn keep the
 // serving-endpoint wrapper off cmd.Err().
 func TestProcessStripsServingEndpointWrapper(t *testing.T) {
