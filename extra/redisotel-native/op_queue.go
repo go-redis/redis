@@ -24,7 +24,10 @@ type opSample struct {
 //
 // A Collect still sees every sample queued before it began: the callback
 // registered in newOpQueue runs before the SDK aggregates, waits for the batch
-// the worker is recording (rmu), and records what is left.
+// the worker is recording (rmu), and records what is left. If a view drops the
+// internal gauge, the SDK skips the callback; the worker still records each
+// batch as it arrives, so a sample queued just before a Collect lands in the
+// next one.
 type opQueue struct {
 	hist metric.Float64Histogram
 
