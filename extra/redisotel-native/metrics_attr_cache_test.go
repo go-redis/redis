@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,7 +104,7 @@ func TestOperationDurationAttrCacheIsBounded(t *testing.T) {
 	for i := 0; i < n; i++ {
 		r.RecordOperationDuration(ctx, time.Millisecond, redis.NewCmd(ctx, fmt.Sprintf("cmd%d", i)), 1, nil, nil, 0)
 	}
-	if got := r.opAttrsLen.Load(); got > maxOpAttrSets {
+	if got := cachedSets(r); got > maxOpAttrSets {
 		t.Fatalf("cache holds %d sets, want at most %d", got, maxOpAttrSets)
 	}
 	var total uint64 // the SDK folds series past its cardinality limit into one overflow series
@@ -112,5 +113,38 @@ func TestOperationDurationAttrCacheIsBounded(t *testing.T) {
 	}
 	if total != uint64(n) {
 		t.Fatalf("recorded %d samples, want %d", total, n)
+	}
+}
+
+func cachedSets(r *metricsRecorder) int {
+	n := 0
+	r.opAttrs.Range(func(any, any) bool { n++; return true })
+	return n
+}
+
+// TestOperationDurationAttrCacheBoundedUnderConcurrentMisses: many goroutines
+// missing at once never grow the cache past its bound.
+func TestOperationDurationAttrCacheBoundedUnderConcurrentMisses(t *testing.T) {
+	ctx := context.Background()
+	r, _ := newDurationRecorder(t)
+	const workers, each = 16, maxOpAttrSets / 2
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				r.RecordOperationDuration(ctx, time.Millisecond, redis.NewCmd(ctx, fmt.Sprintf("cmd%d-%d", w, i)), 1, nil, nil, 0)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := cachedSets(r); got > maxOpAttrSets {
+		t.Fatalf("cache holds %d sets, want at most %d", got, maxOpAttrSets)
+	}
+	r.opAttrsMu.Lock()
+	defer r.opAttrsMu.Unlock()
+	if got := cachedSets(r); got != r.opAttrsLen {
+		t.Fatalf("counter %d, cache holds %d sets", r.opAttrsLen, got)
 	}
 }

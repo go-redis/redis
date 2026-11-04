@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -72,9 +71,11 @@ type metricsRecorder struct {
 	cfg *config
 
 	// opAttrs caches success-path operation attribute sets (opAttrKey ->
-	// attribute.Set); opAttrsLen counts its inserts since the last clear.
+	// attribute.Set). Hits only Load; misses go through storeOpAttrs, which
+	// holds opAttrsMu, so opAttrsLen is exactly the number of entries.
 	opAttrs    sync.Map
-	opAttrsLen atomic.Int64
+	opAttrsMu  sync.Mutex
+	opAttrsLen int
 
 	// opq records success-path operation durations off the caller's goroutine
 	// (op_queue.go); nil records them inline.
@@ -125,11 +126,7 @@ func (r *metricsRecorder) RecordOperationDuration(
 		}
 		set, ok := r.opAttrs.Load(key)
 		if !ok {
-			if r.opAttrsLen.Add(1) > maxOpAttrSets {
-				r.opAttrs.Clear()
-				r.opAttrsLen.Store(1)
-			}
-			set, _ = r.opAttrs.LoadOrStore(key, attribute.NewSet(operationAttrs(key.op, attempts, addrString(addr), dbIndex)...))
+			set = r.storeOpAttrs(key, addr)
 		}
 		if r.opq != nil {
 			r.opq.record(ctx, durationSeconds, set.(attribute.Set))
@@ -164,6 +161,24 @@ type opAttrKey struct {
 	remote   string
 	attempts int
 	db       int
+}
+
+// storeOpAttrs builds and caches the set for key, clearing the cache first
+// when it is full.
+func (r *metricsRecorder) storeOpAttrs(key opAttrKey, addr net.Addr) any {
+	r.opAttrsMu.Lock()
+	defer r.opAttrsMu.Unlock()
+	if set, ok := r.opAttrs.Load(key); ok {
+		return set
+	}
+	if r.opAttrsLen >= maxOpAttrSets {
+		r.opAttrs.Clear()
+		r.opAttrsLen = 0
+	}
+	set := attribute.NewSet(operationAttrs(key.op, key.attempts, addrString(addr), key.db)...)
+	r.opAttrs.Store(key, set)
+	r.opAttrsLen++
+	return set
 }
 
 func addrString(a net.Addr) string {
