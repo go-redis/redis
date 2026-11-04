@@ -323,7 +323,6 @@ func TestClassifyExecErrorCarriesServingEndpoint(t *testing.T) {
 	}
 }
 
-
 // wrapServingEndpoint attaches the held connection endpoint so pipeline /
 // ASK-retry Exec errors stay usable after maintenance handoff (#4233 Bugbot).
 func TestWrapServingEndpointOnHostlessRedirect(t *testing.T) {
@@ -360,5 +359,48 @@ func TestServingEndpointFromErrWalksUnwrap(t *testing.T) {
 	chained = fmt.Errorf("hook: %w", inner)
 	if got := servingEndpointFromErr(chained); got != "10.0.0.9:7000" {
 		t.Fatalf("fmt-wrapped = %q", got)
+	}
+}
+
+// servingEndpointHook short-circuits every command with a wrapped redirect,
+// as the process path returns it after a handoff.
+type servingEndpointHook struct{ err error }
+
+func (h servingEndpointHook) DialHook(next DialHook) DialHook { return next }
+
+func (h servingEndpointHook) ProcessHook(ProcessHook) ProcessHook {
+	return func(context.Context, Cmder) error { return h.err }
+}
+
+func (h servingEndpointHook) ProcessPipelineHook(next ProcessPipelineHook) ProcessPipelineHook {
+	return next
+}
+
+// TestProcessStripsServingEndpointWrapper: Client, Tx and Conn keep the
+// serving-endpoint wrapper off cmd.Err().
+func TestProcessStripsServingEndpointWrapper(t *testing.T) {
+	ctx := context.Background()
+	moved := proto.ParseErrorReply([]byte("-MOVED 1 :6380"))
+	hook := servingEndpointHook{err: &errWithServingEndpoint{endpoint: "10.0.0.9:7000", err: moved}}
+	c := NewClient(&Options{Addr: "127.0.0.1:1"})
+	defer c.Close()
+	c.AddHook(hook)
+	conn := c.Conn()
+	defer conn.Close()
+	tx := c.newTx()
+	defer tx.Close(ctx)
+	for name, process := range map[string]func(context.Context, Cmder) error{
+		"Client": c.Process,
+		"Conn":   conn.Process,
+		"Tx":     tx.Process,
+	} {
+		cmd := NewStatusCmd(ctx, "get", "k")
+		_ = process(ctx, cmd)
+		if _, ok := cmd.Err().(*errWithServingEndpoint); ok {
+			t.Fatalf("%s: cmd.Err() is the serving-endpoint wrapper, want the MOVED error", name)
+		}
+		if cmd.Err() != moved {
+			t.Fatalf("%s: cmd.Err() = %v, want %v", name, cmd.Err(), moved)
+		}
 	}
 }

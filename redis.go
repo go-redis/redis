@@ -3512,7 +3512,8 @@ func newConn(opt *Options, connPool pool.Pooler, parentHooks *hooksMixin, himpor
 
 func (c *Conn) Process(ctx context.Context, cmd Cmder) error {
 	err := c.processHook(ctx, cmd)
-	cmd.SetErr(err)
+	// Same as Client.Process: keep the serving-endpoint wrapper off cmd.Err().
+	cmd.SetErr(unwrapServingEndpoint(err))
 	return err
 }
 

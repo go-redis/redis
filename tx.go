@@ -85,7 +85,8 @@ func (c *Tx) init() {
 
 func (c *Tx) Process(ctx context.Context, cmd Cmder) error {
 	err := c.processHook(ctx, cmd)
-	cmd.SetErr(err)
+	// Same as Client.Process: keep the serving-endpoint wrapper off cmd.Err().
+	cmd.SetErr(unwrapServingEndpoint(err))
 	return err
 }
 

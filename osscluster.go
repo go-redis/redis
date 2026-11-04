@@ -2256,9 +2256,14 @@ func (c *ClusterClient) process(ctx context.Context, cmd Cmder) error {
 			if e.endpoint != "" {
 				servingEp = e.endpoint
 			}
-		} else if e, ok := lastErr.(*errWithServingEndpoint); ok {
+		}
+		// Also peel a wrapper left inside redirectFromNodeError, so a final
+		// error never surfaces as errWithServingEndpoint.
+		if e, ok := lastErr.(*errWithServingEndpoint); ok {
 			lastErr = e.err
-			servingEp = e.endpoint
+			if servingEp == "" {
+				servingEp = e.endpoint
+			}
 		}
 
 		// If there is no error - we are done.
