@@ -420,12 +420,12 @@ func (o *ObservabilityInstance) createRecorder(meter metric.Meter, cfg config) (
 	}
 
 	// The queue starts a goroutine: create it last, after every instrument
-	// above succeeded, so a failed Init leaves nothing running.
+	// above succeeded, so a failed Init leaves nothing running. It is only an
+	// optimization: a provider that rejects its gauge or callback gets inline
+	// recording (opq == nil), not a failed Init.
 	var opq *opQueue
 	if operationDuration != nil {
-		if opq, err = newOpQueue(meter, operationDuration); err != nil {
-			return nil, fmt.Errorf("failed to create operation duration queue: %w", err)
-		}
+		opq, _ = newOpQueue(meter, operationDuration)
 	}
 
 	// Create recorder
