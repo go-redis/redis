@@ -1524,7 +1524,7 @@ retryIdle:
 	}
 
 	var newcn *Conn
-	newcn, err = p.queuedNewConn(ctx, wait)
+	newcn, err = p.queuedNewConn(ctx, wait, throttle.token)
 	if err != nil {
 		return nil, err
 	}
@@ -1573,12 +1573,15 @@ retryIdle:
 	return newcn, nil
 }
 
-func (p *ConnPool) queuedNewConn(ctx context.Context, wait bool) (*Conn, error) {
+// tokenHeld reports that the caller took a dial rate-limit token for this
+// dial. It is refunded on every path where no dial starts.
+func (p *ConnPool) queuedNewConn(ctx context.Context, wait, tokenHeld bool) (*Conn, error) {
 	if wait {
 		select {
 		case p.dialsInProgress <- struct{}{}:
 			// Got permission, proceed to create connection
 		case <-ctx.Done():
+			p.refundDialToken(tokenHeld)
 			p.freeTurn()
 			return nil, ctx.Err()
 		}
@@ -1591,6 +1594,7 @@ func (p *ConnPool) queuedNewConn(ctx context.Context, wait bool) (*Conn, error) 
 		case p.dialsInProgress <- struct{}{}:
 			// Got permission, proceed to create connection
 		default:
+			p.refundDialToken(tokenHeld)
 			p.freeTurn()
 			return nil, ErrPoolTryFull
 		}
@@ -1637,6 +1641,11 @@ func (p *ConnPool) queuedNewConn(ctx context.Context, wait bool) (*Conn, error) 
 		dialCtx := w.getCtxForDial()
 		cn, cnErr := p.newConn(dialCtx, true)
 		if cnErr != nil {
+			if cnErr == ErrPoolExhausted || cnErr == ErrClosed {
+				// MaxActiveConns reservation failed or the pool closed:
+				// newConn returned before dialing.
+				p.refundDialToken(tokenHeld)
+			}
 			w.tryDeliver(nil, cnErr) // deliver error to caller, notify connection creation failed
 			p.dialsQueue.discardDoneAtFront()
 			p.freeTurn()
@@ -1749,6 +1758,7 @@ type dialThrottleState struct {
 	parked   bool      // this Get() actually slept in waitForDialSlot
 	counted  bool      // RateLimitedDials incremented for this Get()
 	escaped  bool      // the deadline escape already re-checked the idle pool once
+	token    bool      // a dial token was taken for the dial that follows
 }
 
 // throttleDial decides, for a Get() that found no idle connection, whether it
@@ -1761,13 +1771,21 @@ type dialThrottleState struct {
 // that conn stays acquirable, so the idle re-checks must not count it, or the
 // Get() would loop on it without parking.
 func (p *ConnPool) throttleDial(ctx context.Context, wait bool, poolDeadline time.Time, idleRejected bool, st *dialThrottleState) (retry bool, err error) {
+	// waitForDialSlot can return without reaching its ctx.Done case (deadline
+	// due, or a token due now), so check cancellation on every pass before
+	// taking a token or dialing.
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	// Fairness: a fresh Get() must not steal a refilled token from callers
 	// already parked in the wait queue (they arrived earlier). Only a Get()
 	// that has genuinely parked (slept in waitForDialSlot) is
 	// queue-conditioned and may compete for tokens.
 	mayTakeToken := st.parked || p.dialWaitQueue.empty()
 	if mayTakeToken && p.dialLimiter.Allow() {
-		// A dial token was available: dial now.
+		// A dial token was available: dial now. queuedNewConn refunds it if
+		// the dial does not start.
+		st.token = true
 		return false, nil
 	}
 
@@ -1801,6 +1819,9 @@ func (p *ConnPool) throttleDial(ctx context.Context, wait bool, poolDeadline tim
 	if err != nil {
 		return false, err
 	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if escape {
 		// Waited past PoolTimeout without a reusable connection or a dial
 		// token. Re-check the idle pool one final time: a connection may have
@@ -1820,6 +1841,13 @@ func (p *ConnPool) throttleDial(ctx context.Context, wait bool, poolDeadline tim
 	// Woken because a connection was returned (or a token should now be
 	// free): re-check the idle pool, then re-try the limiter.
 	return true, nil
+}
+
+// refundDialToken returns a dial token taken for a dial that never started.
+func (p *ConnPool) refundDialToken(tokenHeld bool) {
+	if tokenHeld && p.dialLimiter != nil {
+		p.dialLimiter.refund()
+	}
 }
 
 // hasAcquirableIdleConn reports whether the idle pool currently holds a

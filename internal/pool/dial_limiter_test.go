@@ -698,3 +698,129 @@ func TestDialRateLimitRefillRechecksAfterTokenWait(t *testing.T) {
 		t.Fatalf("dials=%d, want 2", got)
 	}
 }
+
+// TestDialRateLimitRefundsTokenWhenNoDial: a Get or TryGet that takes a dial
+// token but never starts a dial (no dial permit) must return the token.
+func TestDialRateLimitRefundsTokenWhenNoDial(t *testing.T) {
+	var dials atomic.Int32
+	gate := make(chan struct{})
+	p := pool.NewConnPool(&pool.Options{
+		Dialer: func(context.Context) (net.Conn, error) {
+			dials.Add(1)
+			<-gate
+			return newDummyConn(), nil
+		},
+		PoolSize:           10,
+		MaxConcurrentDials: 1,
+		DialRateLimit:      1,
+		DialRateBurst:      3,
+		PoolTimeout:        100 * time.Millisecond,
+	})
+	defer p.Close()
+	ctx := context.Background()
+
+	// Get 1 takes a token and holds the only dial permit in a blocked dial.
+	got1 := make(chan *pool.Conn, 1)
+	go func() {
+		cn, err := p.Get(ctx)
+		if err != nil {
+			t.Errorf("Get 1 failed: %v", err)
+		}
+		got1 <- cn
+	}()
+	waitFor(t, time.Second, func() bool { return dials.Load() == 1 })
+
+	// TryGet takes a token, then finds no free dial permit.
+	if _, err := p.TryGet(ctx); err != pool.ErrPoolTryFull {
+		t.Fatalf("TryGet err=%v, want ErrPoolTryFull", err)
+	}
+	// Get takes a token, then times out waiting for a dial permit.
+	cctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	_, err := p.Get(cctx)
+	cancel()
+	if err != context.DeadlineExceeded {
+		t.Fatalf("Get err=%v, want context.DeadlineExceeded", err)
+	}
+
+	close(gate)
+	c1 := <-got1
+	defer p.Put(ctx, c1)
+
+	// Both unused tokens are back: two more dials need no throttling.
+	c2, err := p.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get 2 failed: %v", err)
+	}
+	defer p.Put(ctx, c2)
+	c3, err := p.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get 3 failed: %v", err)
+	}
+	defer p.Put(ctx, c3)
+	if st := p.Stats(); st.RateLimitedDials != 0 {
+		t.Fatalf("RateLimitedDials=%d, want 0: unused tokens were not refunded", st.RateLimitedDials)
+	}
+}
+
+// cancelOnIdleGetHook cancels the Get's context and rejects the idle conn.
+type cancelOnIdleGetHook struct {
+	cancel atomic.Pointer[context.CancelFunc]
+}
+
+func (h *cancelOnIdleGetHook) OnGet(_ context.Context, _ *pool.Conn, isNewConn bool) (bool, error) {
+	if isNewConn {
+		return true, nil
+	}
+	if c := h.cancel.Load(); c != nil {
+		(*c)()
+	}
+	return false, nil
+}
+
+func (h *cancelOnIdleGetHook) OnPut(context.Context, *pool.Conn) (bool, bool, error) {
+	return true, false, nil
+}
+
+func (h *cancelOnIdleGetHook) OnRemove(context.Context, *pool.Conn, error) {}
+
+// TestDialRateLimitCanceledGetDoesNotDial: a Get canceled while throttled must
+// return the context error, even when the throttle returns without parking
+// (here the PoolTimeout deadline is already due), and must not dial.
+func TestDialRateLimitCanceledGetDoesNotDial(t *testing.T) {
+	var dials atomic.Int32
+	p := pool.NewConnPool(&pool.Options{
+		Dialer:             countingDialer(&dials),
+		PoolSize:           10,
+		MaxConcurrentDials: 10,
+		DialRateLimit:      1,
+		DialRateBurst:      1,
+		PoolTimeout:        time.Nanosecond,
+	})
+	defer p.Close()
+	ctx := context.Background()
+
+	c1, err := p.Get(ctx)
+	if err != nil {
+		t.Fatalf("first Get failed: %v", err)
+	}
+	p.Put(ctx, c1)
+
+	hook := &cancelOnIdleGetHook{}
+	p.AddPoolHook(hook)
+
+	for i := 0; i < 20; i++ {
+		cctx, cancel := context.WithCancel(ctx)
+		hook.cancel.Store(&cancel)
+		cn, err := p.Get(cctx)
+		cancel()
+		if err == nil {
+			p.Put(ctx, cn)
+		}
+		if err != context.Canceled {
+			t.Fatalf("iteration %d: Get err=%v, want context.Canceled", i, err)
+		}
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials=%d, want 1: a canceled Get dialed", got)
+	}
+}
