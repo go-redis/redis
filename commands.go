@@ -575,7 +575,8 @@ func (c cmdable) ClientInfo(ctx context.Context) *ClientInfoCmd {
 //
 // CLIENT MAINT_NOTIFICATIONS is per-connection state, exactly like CLIENT
 // TRACKING: it lives on statefulCmdable and is directly usable on a dedicated
-// connection (Client.Conn) and inside Pipeline/Tx. The library enables it on
+// connection (Client.EphemeralConn, which is discarded on Close so the state
+// does not return to the pool) and in a Pipeline/Tx on it. The library enables it on
 // every connection automatically during connection init when
 // Options.MaintNotificationsConfig is set — that is the supported way to turn
 // it on for a whole client. The pooled clients keep a same-named method for
@@ -609,7 +610,7 @@ type ClientTrackingOptions struct {
 // ClientTracking enables or disables server-assisted client-side caching for
 // the ONE connection that happens to serve this command. On a pooled client
 // that connection is arbitrary, so this is only meaningful on a dedicated
-// connection (see Client.Conn). When on is false, opt is ignored. Invalid
+// connection (see Client.EphemeralConn). When on is false, opt is ignored. Invalid
 // option combinations are reported via the returned command's Err and nothing
 // is sent to the server.
 //
@@ -620,7 +621,7 @@ type ClientTrackingOptions struct {
 //
 // CLIENT TRACKING is per-connection state, so this lives on statefulCmdable
 // next to ClientSetName/ClientSetInfo: it is directly usable on a dedicated
-// connection (Client.Conn) and inside Pipeline/Tx. The pooled clients keep
+// connection (Client.EphemeralConn) and in a Pipeline/Tx on it. The pooled clients keep
 // same-named methods for interface compatibility, but those return an error
 // explaining that the command must target a specific connection — on a pooled
 // client it would land on an arbitrary connection that is immediately
