@@ -511,10 +511,11 @@ type baseClient struct {
 	// initConn's internal conn wrapper: the handshake it runs (HELLO, AUTH,
 	// SELECT, CLIENT SETINFO, CLIENT MAINT_NOTIFICATIONS) belongs to the
 	// command that dials the connection, which the caller already admitted and
-	// reports as one operation. Admitting each handshake command again double
-	// counts against a rate limiter and, with a circuit breaker in half-open,
-	// lets a handshake exhaust the probe budget and report the breaker's own
-	// rejection back as a failure, so the breaker never closes.
+	// reports as one operation. The OnConnect callback is exempt for the same
+	// reason: it sends its commands on that wrapper. Admitting each handshake
+	// command again double counts against a rate limiter and, with a circuit
+	// breaker in half-open, lets a handshake exhaust the probe budget and report
+	// the breaker's own rejection back as a failure, so the breaker never closes.
 	limiterExempt bool
 
 	// The following are OWNER-ONLY and NOT copied by clone(): derived clients
@@ -709,24 +710,48 @@ func (c *baseClient) getConn(ctx context.Context) (*pool.Conn, error) {
 // dial), so a caller can tell an explicit admission denial apart from a
 // dial/transport failure. getConn wraps it for the common case, leaving every
 // other caller unchanged. Allow is reported (ReportResult) only for dial results,
-// never for admission denials — matching the original getConn.
+// never for admission denials — matching the original getConn. A panic inside
+// _getConn settles the admission too, as admitted() does for the other paths, so
+// an Allow is never left unpaired.
 func (c *baseClient) getConnLimited(ctx context.Context) (cn *pool.Conn, limited bool, err error) {
 	limiter := c.limiter()
-	if limiter != nil {
-		if err := limiter.Allow(); err != nil {
-			return nil, true, err
-		}
+	if limiter == nil {
+		cn, err = c._getConn(ctx)
+		return cn, false, err
+	}
+	if err := limiter.Allow(); err != nil {
+		return nil, true, err
 	}
 
-	cn, err = c._getConn(ctx)
-	if err != nil {
-		if limiter != nil {
-			limiter.ReportResult(err)
+	settled := false
+	defer func() {
+		if !settled {
+			limiter.ReportResult(errInitPanic)
 		}
+	}()
+
+	cn, err = c._getConn(ctx)
+	settled = true
+	if err != nil {
+		limiter.ReportResult(err)
 		return nil, false, err
 	}
 
 	return cn, false, nil
+}
+
+// initConnWaitContext caps ctx at dialTimeout, but never extends a deadline the
+// caller already set. A non-positive dialTimeout means the option is disabled
+// (ParseURL uses a value of 0 or less for that), so ctx is returned unchanged:
+// context.WithTimeout would expire the wait immediately.
+func initConnWaitContext(ctx context.Context, dialTimeout time.Duration) (context.Context, context.CancelFunc) {
+	if dialTimeout <= 0 {
+		return ctx, nil
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < dialTimeout {
+		return ctx, nil
+	}
+	return context.WithTimeout(ctx, dialTimeout)
 }
 
 func (c *baseClient) _getConn(ctx context.Context) (*pool.Conn, error) {
@@ -970,12 +995,21 @@ func (c *baseClient) reAuthConnection() func(poolCn *pool.Conn, credentials auth
 func (c *baseClient) onAuthenticationErr() func(poolCn *pool.Conn, err error) {
 	return func(poolCn *pool.Conn, err error) {
 		if err != nil {
-			if isBadConn(err, false, c.opt.Addr) {
+			// A server-side rejection of the re-auth AUTH (WRONGPASS, NOPERM) is
+			// not a bad-conn error, so isBadConn alone would leave the connection
+			// pooled while it is still authenticated with the credentials the
+			// provider has already replaced. Retire it too, so the reconnect
+			// authenticates with the provider's current credentials. Other server
+			// errors keep the current path.
+			if isBadConn(err, false, c.opt.Addr) || IsAuthError(err) || IsPermissionError(err) {
 				// Close the connection to force a reconnection.
 				// Re-auth happens on connections that were idle in the pool (the pool hook
 				// waits for IDLE state before transitioning to UNUSABLE for re-auth).
 				// From metrics perspective, the connection was never "used" by a client.
 				// Note: Using context.Background() as this callback doesn't have access to caller's context.
+				// Mark the conn CLOSED first so a concurrent popIdle cannot acquire it
+				// between OnRemove and its removal from the idle list.
+				poolCn.GetStateMachine().Transition(pool.StateClosed)
 				err := c.poolForConn(poolCn).CloseConn(context.Background(), poolCn, pool.CloseReasonAuthError, pool.MetricStateIdle)
 				if err != nil {
 					internal.Logger.Printf(context.Background(), "redis: failed to close connection: %v", err)
@@ -1048,28 +1082,14 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 			}
 
 			if finalState == pool.StateInitializing {
-				// Another goroutine is initializing - WAIT for it to complete
-				// Use a context with timeout = min(remaining command timeout, DialTimeout)
-				// This prevents waiting too long while respecting the caller's deadline
-				var waitCtx context.Context
-				var cancel context.CancelFunc
-				dialTimeout := c.opt.DialTimeout
-
-				if cmdDeadline, hasCmdDeadline := ctx.Deadline(); hasCmdDeadline {
-					// Calculate remaining time until command deadline
-					remainingTime := time.Until(cmdDeadline)
-					// Use the minimum of remaining time and DialTimeout
-					if remainingTime < dialTimeout {
-						// Command deadline is sooner, use it
-						waitCtx = ctx
-					} else {
-						// DialTimeout is shorter, cap the wait at DialTimeout
-						waitCtx, cancel = context.WithTimeout(ctx, dialTimeout)
-					}
-				} else {
-					// No command deadline, use DialTimeout to prevent waiting indefinitely
-					waitCtx, cancel = context.WithTimeout(ctx, dialTimeout)
-				}
+				// Another goroutine is initializing - WAIT for it to complete.
+				// The wait is capped at DialTimeout while respecting a sooner command
+				// deadline. A non-positive DialTimeout means the option is disabled
+				// (ParseURL uses 0 or less for that), so it must not cap the wait at
+				// all: context.WithTimeout(ctx, 0) expires the wait immediately, the
+				// same way it would have with the -1 sentinel. pool.go guards its own
+				// WithTimeout calls with "DialTimeout > 0"; this path does the same.
+				waitCtx, cancel := initConnWaitContext(ctx, c.opt.DialTimeout)
 				if cancel != nil {
 					defer cancel()
 				}
@@ -1113,6 +1133,9 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 	// can suppress tracking on an OPTOUT connection.
 	conn.baseClient.cscPolicy = c.cscPolicy
 	conn.baseClient.cscPoolHook = c.cscPoolHook
+	// Custom CommandMetadata lives on the parent store; without it, OnConnect
+	// reads of overridden commands fall back to the static table and skip NO.
+	c.shareCommandMetadata(&conn.baseClient)
 	// This internal conn's init pipeline issues CLIENT TRACKING ON itself;
 	// exempt it from the guard that blocks user-issued CLIENT TRACKING. Setting
 	// the field after newConn is safe: initHooks bound the pipeline hook as a
@@ -1133,8 +1156,9 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 			return fmt.Errorf("failed to create credentials listener: %w", initErr)
 		}
 
-		credentials, unsubscribeFromCredentialsProvider, initErr := c.opt.StreamingCredentialsProvider.
-			Subscribe(credListener)
+		credentials, unsubscribeFromCredentialsProvider, initErr := subscribeStreamingCredentials(
+			ctx, c.opt.StreamingCredentialsProvider, credListener,
+		)
 		if initErr != nil {
 			cn.GetStateMachine().Transition(pool.StateClosed)
 			return fmt.Errorf("failed to subscribe to streaming credentials: %w", initErr)
@@ -1171,6 +1195,14 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 			}
 		}
 		cn.SetOnClose(onClose)
+
+		// Close may have run while subscription setup was waiting, before
+		// onClose was installed. Re-run teardown in that case; Conn.Close
+		// atomically claims callbacks, so unsubscribe still runs only once.
+		if cn.IsClosed() {
+			_ = cn.Close()
+			return fmt.Errorf("connection closed during streaming credentials setup: %w", pool.ErrClosed)
+		}
 
 		username, password = credentials.BasicAuth()
 	} else {
@@ -1243,6 +1275,10 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 		// already bumped and evicted through onCscReinit before replacing the
 		// socket, so it must not bump a second time here.
 		c.cscEvictOwnedEntries(cn.GetID())
+	} else if !trackingEnabled && c.cscConnInitGen(cn.GetID()) != 0 {
+		// A re-init after CSC stopped skips TRACKING ON: the new socket is
+		// untracked, so it must not keep the OPTOUT NO prefix (#4236).
+		c.cscForgetConn(cn.GetID())
 	}
 	var trackingCmd *StatusCmd
 	initCmds, initErr := conn.Pipelined(ctx, func(pipe Pipeliner) error {
@@ -1418,7 +1454,7 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 	}
 
 	// Set the connection initialization function for potential reconnections
-	// This must be set before transitioning to IDLE so that handoff/reauth can use it
+	// This must be set before transitioning to IDLE so that a handoff can use it
 	cn.SetInitConnFunc(c.createInitConnFunc())
 
 	// Initialization succeeded - transition to IDLE state
@@ -2020,9 +2056,11 @@ func (c *baseClient) _process(ctx context.Context, cmd Cmder, attempt int, captu
 		}
 		// Borrowed Conn/Tx wrappers do not serve cache hits, but can still hold
 		// a tracked connection and need NO for an ordinary uncached OPTOUT read.
+		// Per-socket init generation (not live client-level CSC) decides whether
+		// the socket still carries TRACKING after disableCSCServing (#4236 item 1).
 		flag := byte(0)
 		if c.cscPolicy.mode != TrackingModePlain {
-			tracked := c.cscTrackingRequested() && c.cscConnInitGen(cn.GetID()) != 0
+			tracked := c.cscConnInitGen(cn.GetID()) != 0
 			if capture != nil && !tracked {
 				capture.noStore = true
 			}
@@ -2195,8 +2233,11 @@ func (c *baseClient) context(ctx context.Context) context.Context {
 }
 
 // createInitConnFunc creates a connection initialization function that can be used for reconnections.
-// A reconnect (a maintenance handoff or a re-auth) dials outside getConnLimited,
-// so the handshake it runs is admitted once and reported once against Options.Limiter.
+// Only the maintenance handoff runs it, through SetNetConnAndInitConn: it dials outside
+// getConnLimited, so the handshake it runs is admitted once and reported once against
+// Options.Limiter. Streaming re-auth does not come through here: it sends AUTH on the
+// pooled connection through the Conn built by reAuthConnection, which getConnLimited
+// admits per command.
 func (c *baseClient) createInitConnFunc() func(context.Context, *pool.Conn) error {
 	return func(ctx context.Context, cn *pool.Conn) error {
 		closeConn := func(error) { cn.GetStateMachine().Transition(pool.StateClosed) }
@@ -2491,6 +2532,72 @@ func (c *baseClient) generalProcessPipelineFrom(
 	return lastErr
 }
 
+// pipelineExecutedKey carries an *executedCmds that execution paths populate
+// the moment a batch's commands may have reached the server. MultiDBClient uses
+// it to distinguish "a hook aborted before execution" from "the batch executed
+// and a hook then replaced the error": command state alone cannot tell those
+// apart, and confusing them either fabricates phantom outcomes or replays
+// writes that already applied.
+type pipelineExecutedKey struct{}
+
+// executedCmds records which commands of a batch actually reached (or
+// attempted) the server. It is per-command, not a single flag, because a
+// cluster pipeline fans one batch out into independent node sub-batches: one
+// node executing must not make another node's short-circuited (untouched,
+// nil-error) commands look like served database successes.
+type executedCmds struct {
+	mu sync.Mutex
+	// Keyed by the command's embedded baseCmd, not by the Cmder interface
+	// value: a value-type decorator that embeds a command plus a slice or map
+	// field is not comparable and cannot be a map key, and skipping such
+	// commands left a batch of them looking never-executed after a transport
+	// error, so a retry could replay writes that had applied. Every command
+	// embeds a baseCmd, and a decorator promotes base() from the command it
+	// embeds, so this key identifies the command that executed.
+	done map[*baseCmd]struct{}
+}
+
+func newExecutedCmds(size int) *executedCmds {
+	return &executedCmds{done: make(map[*baseCmd]struct{}, size)}
+}
+
+func (e *executedCmds) mark(cmds []Cmder) {
+	e.mu.Lock()
+	for _, cmd := range cmds {
+		if cmd == nil {
+			continue
+		}
+		e.done[cmd.base()] = struct{}{}
+	}
+	e.mu.Unlock()
+}
+
+func (e *executedCmds) has(cmd Cmder) bool {
+	if cmd == nil {
+		return false
+	}
+	e.mu.Lock()
+	_, ok := e.done[cmd.base()]
+	e.mu.Unlock()
+	return ok
+}
+
+func (e *executedCmds) any() bool {
+	e.mu.Lock()
+	n := len(e.done)
+	e.mu.Unlock()
+	return n > 0
+}
+
+// markPipelineExecuted records that cmds reached (or attempted) the server for
+// the batch tracked in ctx, if any. Safe to call from multiple cluster-node
+// goroutines concurrently.
+func markPipelineExecuted(ctx context.Context, cmds []Cmder) {
+	if ec, ok := ctx.Value(pipelineExecutedKey{}).(*executedCmds); ok {
+		ec.mark(cmds)
+	}
+}
+
 func (c *baseClient) pipelineProcessCmds(
 	ctx context.Context, cn *pool.Conn, cmds []Cmder,
 ) (bool, error) {
@@ -2505,6 +2612,7 @@ func (c *baseClient) pipelineProcessCmds(
 		setCmdsErr(cmds, err)
 		return false, err
 	}
+	markPipelineExecuted(ctx, cmds)
 
 	// HIMPORT bookkeeping: pending discards for this session and PREPAREs
 	// for registered fieldsets the batch references get written ahead of
@@ -2618,6 +2726,7 @@ func (c *baseClient) txPipelineProcessCmds(
 		setCmdsErr(cmds, err)
 		return false, err
 	}
+	markPipelineExecuted(ctx, cmds)
 
 	// HIMPORT bookkeeping: pending discards for this session and PREPAREs
 	// for registered fieldsets the transaction references get written ahead
@@ -3082,6 +3191,9 @@ func (c *Client) conn(discardOnClose bool) *Conn {
 	// credentials listener when a cold Conn/EphemeralConn initializes a fresh
 	// pool connection (issue #4154).
 	conn.baseClient.streamingCredentialsManager = c.streamingCredentialsManager
+	// Conn() never serves cache hits, but OPTOUT still prefixes uncached reads
+	// when cscTrackable is true — that lookup needs the parent's overrides.
+	c.baseClient.shareCommandMetadata(&conn.baseClient)
 	return conn
 }
 

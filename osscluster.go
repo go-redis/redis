@@ -2682,6 +2682,36 @@ func (c *ClusterClient) AutoPipelineWithOptions(config *AutoPipelineOptions) (*A
 		})
 }
 
+// canPipeline reports whether cmd may join a merged batch on this cluster
+// client. It answers false for the commands the cluster autopipeliner keeps
+// out of its batches (see installAutoPipelineSharding): actual fan-out, a
+// custom multi-shard policy, and special (non-slot) routing. It also answers
+// false when cmd would fail the whole pipeline mapping (pipelineRoutingError)
+// or has no usable routing (policyErr): run alone, it fails only itself.
+//
+// The decision is computed without pinning it on cmd, so MultiDBClient can ask
+// several cluster members about one command.
+func (c *ClusterClient) canPipeline(ctx context.Context, cmd Cmder) bool {
+	var decision clusterRoutingDecision
+	if c.opt.DisableRoutingPolicies {
+		decision = c.legacyRoutingDecision(cmd)
+	} else {
+		decision = c.resolveCommandRoutingDecision(ctx, cmd)
+	}
+	if decision.policyErr != nil || c.pipelineRoutingError(cmd, &decision) != nil {
+		return false
+	}
+	if decision.policy == nil {
+		return true
+	}
+	// Same divert set as installAutoPipelineSharding's routeCommand.
+	if clusterCommandFansOut(cmd, &decision) ||
+		decision.policy.Request == routing.ReqMultiShard && !decision.policyFromMetadata {
+		return false
+	}
+	return decision.policy.Request != routing.ReqSpecial
+}
+
 // installAutoPipelineSharding buckets single-node commands by admitted slot.
 func (c *ClusterClient) installAutoPipelineSharding(ap *AutoPipeliner) {
 	ap.routeCommand = func(ctx context.Context, cmd Cmder) (bool, error) {
@@ -3020,6 +3050,18 @@ func (c *ClusterClient) mapCmdsByNodeInView(
 	cmds []Cmder,
 	route *clusterPipelineRouting,
 ) error {
+	return c.mapCmdsByNodeInViewWith(ctx, cmdsMap, cmds, route, nil)
+}
+
+// mapCmdsByNodeInViewWith is mapCmdsByNodeInView, but place, if not nil,
+// can queue cmds[i] itself instead of on node and then returns true.
+func (c *ClusterClient) mapCmdsByNodeInViewWith(
+	ctx context.Context,
+	cmdsMap *cmdsMap,
+	cmds []Cmder,
+	route *clusterPipelineRouting,
+	place func(i int, node *clusterNode) bool,
+) error {
 	state, err := c.state.Get(ctx)
 	if err != nil {
 		return err
@@ -3078,6 +3120,9 @@ func (c *ClusterClient) mapCmdsByNodeInView(
 		}
 		if err != nil {
 			return c.noteTopologySelectionError(err)
+		}
+		if place != nil && place(i, node) {
+			continue
 		}
 		cmdsMap.Add(node, cmd)
 	}
@@ -3225,6 +3270,7 @@ func (c *ClusterClient) processPipelineNodeConn(
 	failedCmds *cmdsMap,
 	route *clusterPipelineRouting,
 ) error {
+	markPipelineExecuted(ctx, cmds)
 	// HIMPORT bookkeeping: pending discards for this session and PREPAREs
 	// for registered fieldsets the batch references get written ahead of
 	// the batch (see himport.go).
@@ -3307,6 +3353,29 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 	route *clusterPipelineRouting,
 	flags []byte,
 ) error {
+	// Commands redirected by MOVED/ASK are queued for their new node at the
+	// end, in command order. A whole-batch retry queues them in their place
+	// instead, so it neither sends them twice nor reorders the batch.
+	// Track them by index: a Cmder value is not always comparable.
+	var redirects []pipelineRedirect
+	defer func() {
+		for _, r := range redirects {
+			if r.node != nil {
+				failedCmds.Add(r.node, r.cmds...)
+			}
+		}
+	}()
+	retryCmds := func() {
+		_ = c.mapCmdsByNodeInViewWith(ctx, failedCmds, cmds, route, func(i int, _ *clusterNode) bool {
+			if redirects == nil || redirects[i].node == nil {
+				return false
+			}
+			failedCmds.Add(redirects[i].node, redirects[i].cmds...)
+			redirects[i].node = nil
+			return true
+		})
+	}
+
 	for i, cmd := range cmds {
 		if flags != nil && flags[i] != 0 {
 			if err := node.Client.readCSCPipelinePrefix(ctx, cn, rd); err != nil {
@@ -3333,7 +3402,11 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 
 		// Resolve hostless redirects from the held connection's logical
 		// serving endpoint (set on dial/handoff), not a client-wide slot (#4233).
-		if c.checkMovedErr(ctx, node, cmd, err, failedCmds, cn.ServingEndpoint()) {
+		if r := c.checkMovedErr(ctx, node, cmd, err, cn.ServingEndpoint()); r.node != nil {
+			if redirects == nil {
+				redirects = make([]pipelineRedirect, len(cmds))
+			}
+			redirects[i] = r
 			continue
 		}
 
@@ -3343,7 +3416,7 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 
 		if !isRedisError(err) {
 			if shouldRetry(err, true) && !cmdsContainNoRetry(cmds) {
-				_ = c.mapCmdsByNodeInView(ctx, failedCmds, cmds, route)
+				retryCmds()
 			}
 			setCmdsErr(cmds[i+1:], err)
 			return err
@@ -3352,7 +3425,7 @@ func (c *ClusterClient) pipelineReadCmdsInView(
 
 	// rawErr: execution path; never await an async command's batch here.
 	if err := cmds[0].rawErr(); err != nil && shouldRetry(err, true) && !cmdsContainNoRetry(cmds) {
-		_ = c.mapCmdsByNodeInView(ctx, failedCmds, cmds, route)
+		retryCmds()
 		return err
 	}
 
@@ -3369,37 +3442,38 @@ func movedToSameConnAddr(cmds []Cmder, addr string) error {
 	return nil
 }
 
-// checkMovedErr queues cmd for the node a MOVED or ASK redirect points to.
+// pipelineRedirect holds the commands a MOVED or ASK redirect sends to node.
+type pipelineRedirect struct {
+	node *clusterNode
+	cmds []Cmder
+}
+
+// checkMovedErr returns where a MOVED or ASK redirect sends cmd. The node is
+// nil when err is not a redirect.
 //
 // It does not drop the connection itself. When a MOVED points back to the
 // address of the sending connection, processPipelineNodeConn returns that
 // MOVED (movedToSameConnAddr) so releaseConnToPool removes the connection, as
 // on the single-command path.
 func (c *ClusterClient) checkMovedErr(
-	ctx context.Context, from *clusterNode, cmd Cmder, err error, failedCmds *cmdsMap, servingEndpoint string,
-) bool {
+	ctx context.Context, from *clusterNode, cmd Cmder, err error, servingEndpoint string,
+) pipelineRedirect {
 	moved, ask, addr := isMovedError(err)
 	if !moved && !ask {
-		return false
+		return pipelineRedirect{}
 	}
 
 	node, err := c.nodes.GetOrCreate(redirectAddr(addr, from, servingEndpoint))
 	if err != nil {
-		return false
+		return pipelineRedirect{}
 	}
 
 	if moved {
 		c.state.LazyReload()
-		failedCmds.Add(node, cmd)
-		return true
+		return pipelineRedirect{node: node, cmds: []Cmder{cmd}}
 	}
 
-	if ask {
-		failedCmds.Add(node, NewCmd(ctx, "asking"), cmd)
-		return true
-	}
-
-	panic("not reached")
+	return pipelineRedirect{node: node, cmds: []Cmder{NewCmd(ctx, "asking"), cmd}}
 }
 
 // TxPipeline acts like Pipeline, but wraps queued commands with MULTI/EXEC.
@@ -3795,6 +3869,7 @@ func (c *ClusterClient) processTxPipelineNode(
 func (c *ClusterClient) processTxPipelineNodeConn(
 	ctx context.Context, node *clusterNode, cn *pool.Conn, wire []Cmder, cmds []Cmder, asking bool,
 ) *txOutcome {
+	markPipelineExecuted(ctx, cmds)
 	// HIMPORT bookkeeping: pending discards and PREPAREs for registered
 	// fieldsets the transaction references get written ahead of the wire
 	// batch (before ASKING/MULTI; the session state is visible at EXEC).
