@@ -2,10 +2,16 @@ package redisotel
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/embedded"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -192,5 +198,83 @@ func TestOpQueueDroppedGaugeRecordsInline(t *testing.T) {
 	}
 	if q.active.Load() {
 		t.Fatal("queue turned on with its gauge dropped")
+	}
+}
+
+// panicHistogram panics on every other Record.
+type panicHistogram struct {
+	embedded.Float64Histogram
+	n, ok atomic.Int64
+}
+
+func (h *panicHistogram) Record(context.Context, float64, ...otelmetric.RecordOption) {
+	if h.n.Add(1)%2 == 0 {
+		panic("record")
+	}
+	h.ok.Add(1)
+}
+
+func (h *panicHistogram) Enabled(context.Context) bool { return true }
+
+// TestOpQueueRecoversRecordPanic: a histogram that panics in Record does not end
+// the worker or the collecting goroutine; the other samples are still recorded.
+func TestOpQueueRecoversRecordPanic(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := metric.NewMeterProvider(metric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+	h := &panicHistogram{}
+	q, err := newOpQueue(mp.Meter("test"), h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.stop()
+	collect(t, reader) // turn the queue on
+	set := attribute.NewSet(attribute.String(AttrDBOperationName, "get"))
+	for i := 0; i < 1000; i++ {
+		func() {
+			// a sample recorded inline (queue busy) panics to the caller, as
+			// before the queue; the caller's own guard recovers it
+			defer func() { _ = recover() }()
+			q.record(context.Background(), 0.001, set)
+		}()
+	}
+	collect(t, reader) // drains on this goroutine: must not panic
+	q.stop()
+	select {
+	case <-q.exit:
+	default:
+		t.Fatal("worker still running after stop")
+	}
+	if got := h.ok.Load(); got != 500 {
+		t.Fatalf("recorded %d samples, want 500", got)
+	}
+}
+
+// gaugeRejectingMeter fails every observable gauge.
+type gaugeRejectingMeter struct{ otelmetric.Meter }
+
+func (gaugeRejectingMeter) Int64ObservableGauge(string, ...otelmetric.Int64ObservableGaugeOption) (otelmetric.Int64ObservableGauge, error) {
+	return nil, errors.New("observable gauges not supported")
+}
+
+// TestCreateRecorderWithoutQueueSupport: a meter that rejects the queue's gauge
+// still yields a recorder, recording durations inline.
+func TestCreateRecorderWithoutQueueSupport(t *testing.T) {
+	reader := metric.NewManualReader()
+	mp := metric.NewMeterProvider(metric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+	o := &ObservabilityInstance{}
+	cfg := NewConfig().WithEnabled(true).WithMeterProvider(mp)
+	rec, err := o.createRecorder(gaugeRejectingMeter{mp.Meter("test")}, o.configToInternal(cfg))
+	if err != nil {
+		t.Fatalf("createRecorder: %v", err)
+	}
+	if rec.opq != nil {
+		t.Fatal("queue created although its gauge was rejected")
+	}
+	ctx := context.Background()
+	rec.RecordOperationDuration(ctx, time.Millisecond, redis.NewStringCmd(ctx, "get", "k"), 1, nil, nil, 0)
+	if got, _ := collect(t, reader); got != 1 {
+		t.Fatalf("collected %d samples, want 1", got)
 	}
 }

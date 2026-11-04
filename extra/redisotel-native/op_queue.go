@@ -110,10 +110,18 @@ func (q *opQueue) flush() {
 	q.buf = q.spare[:0]
 	q.qmu.Unlock()
 	for i := range batch {
-		q.hist.Record(batch[i].ctx, batch[i].v, metric.WithAttributeSet(batch[i].set))
+		q.recordOne(batch[i])
 		batch[i] = opSample{} // drop the context
 	}
 	q.spare = batch[:0]
+}
+
+// recordOne records one queued sample. A panicking Record (a custom provider)
+// is recovered, as the inline path recovers it: here it would end the worker
+// or the collecting goroutine, and with it the process.
+func (q *opQueue) recordOne(s opSample) {
+	defer func() { _ = recover() }()
+	q.hist.Record(s.ctx, s.v, metric.WithAttributeSet(s.set))
 }
 
 func (q *opQueue) run() {
