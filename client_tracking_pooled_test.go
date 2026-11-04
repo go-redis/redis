@@ -85,6 +85,36 @@ func TestMultiDBClientRejectsConnStateCommands(t *testing.T) {
 	}
 }
 
+// TestFDPipelineRejectsConnStateCommands: a per-connection state command queued
+// on a full-duplex autopipeliner's Pipeline fails the batch before admission.
+func TestFDPipelineRejectsConnStateCommands(t *testing.T) {
+	if err := probeRedis(internalTestRedisAddr()); err != nil {
+		t.Skipf("no redis: %v", err)
+	}
+	ctx := context.Background()
+	client := NewClient(&Options{Addr: internalTestRedisAddr(), Protocol: 3})
+	defer client.Close()
+	const key = "fd-state-rejected"
+	client.Del(ctx, key)
+	ap, err := client.AutoPipelineWithOptions(&AutoPipelineOptions{FullDuplex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ap.Close()
+	pipe := ap.Pipeline()
+	set := pipe.Set(ctx, key, "v", 0)
+	pipe.ClientTrackingOff(ctx)
+	if _, err := pipe.Exec(ctx); !errors.Is(err, errClientTrackingOnPooledClient) {
+		t.Fatalf("Exec err = %v, want errClientTrackingOnPooledClient", err)
+	}
+	if !errors.Is(set.Err(), errClientTrackingOnPooledClient) {
+		t.Fatalf("keyed command err = %v, want errClientTrackingOnPooledClient", set.Err())
+	}
+	if n, err := client.Exists(ctx, key).Result(); err != nil || n != 0 {
+		t.Fatalf("Exists(%q) = %d, %v; the batch must not be dispatched", key, n, err)
+	}
+}
+
 // TestPooledClientMaintNotificationsDefaultEndpoint verifies the empty endpoint
 // type defaults to "none", matching the stateful command.
 func TestPooledClientMaintNotificationsDefaultEndpoint(t *testing.T) {

@@ -4008,6 +4008,12 @@ func (ap *AutoPipeliner) fdPipelineHooked(ctx context.Context, cmds []Cmder) err
 }
 
 func (ap *AutoPipeliner) fdPipelineExec(ctx context.Context, cmds []Cmder) error {
+	// Fail-before-admission, like generalProcessPipeline: a queued pooled-state
+	// rejection must not reach the shared connection.
+	if err := stateRejectedErr(cmds); err != nil {
+		setCmdsErr(cmds, err)
+		return err
+	}
 	opt := ap.fd.client.opt
 	var start time.Time
 	if otel.GetPipelineOperationDurationCallback() != nil {

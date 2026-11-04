@@ -3067,13 +3067,13 @@ func (c *Client) Close() error {
 var (
 	errClientTrackingOnPooledClient = errors.New(
 		"redis: CLIENT TRACKING is per-connection state and cannot be applied through a connection pool; " +
-			"use a dedicated connection (Client.Conn), " +
+			"use a dedicated connection (Client.EphemeralConn, which is discarded on Close), " +
 			"or configure the built-in client-side cache (the ClientSideCacheConfig option) instead",
 	)
 	errClientMaintNotificationsOnPooledClient = errors.New(
 		"redis: CLIENT MAINT_NOTIFICATIONS is per-connection state and cannot be applied through a connection pool; " +
 			"set the MaintNotificationsConfig option to enable it on every connection automatically, " +
-			"or use a dedicated connection (Client.Conn) for manual control",
+			"or use a dedicated connection (Client.EphemeralConn, which is discarded on Close) for manual control",
 	)
 )
 
@@ -3087,8 +3087,9 @@ func pooledConnStateCmd(ctx context.Context, err error, args ...interface{}) *St
 }
 
 // ClientTracking on a pooled client fails with guidance: CLIENT TRACKING is
-// per-connection state. Use Client.Conn, a Pipeline/Tx, or the built-in
-// client-side cache. See the statefulCmdable method for the working variant.
+// per-connection state. Use Client.EphemeralConn (discarded on Close, so the
+// state does not return to the pool), or the built-in client-side cache. See
+// the statefulCmdable method for the working variant.
 func (c *Client) ClientTracking(ctx context.Context, on bool, opt *ClientTrackingOptions) *StatusCmd {
 	if !on {
 		return c.ClientTrackingOff(ctx)

@@ -272,6 +272,12 @@ func (c *multidbCore) processPipeline(ctx context.Context, cmds []Cmder) error {
 // so a command already issued on the member's FD connection does not get a
 // fresh CommandRetries+1 executions.
 func (c *multidbCore) processPipelineRetries(ctx context.Context, cmds []Cmder, maxRetries int) error {
+	// Fail-before-dispatch: the attempts below reset command errors before
+	// handing the batch to a member, which would clear a pre-set rejection.
+	if err := stateRejectedErr(cmds); err != nil {
+		setCmdsErr(cmds, err)
+		return err
+	}
 	if len(cmds) == 0 {
 		return nil
 	}
@@ -544,6 +550,11 @@ func (c *multidbCore) processPipelineRetries(ctx context.Context, cmds []Cmder, 
 // recorded so the breaker and detector can move traffic for subsequent
 // operations.
 func (c *multidbCore) processTxPipeline(ctx context.Context, cmds []Cmder) error {
+	// Same fail-before-dispatch as processPipelineRetries.
+	if err := stateRejectedErr(cmds); err != nil {
+		setCmdsErr(cmds, err)
+		return err
+	}
 	if len(cmds) == 0 {
 		return nil
 	}
