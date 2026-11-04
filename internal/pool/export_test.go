@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"net"
 	"time"
 )
@@ -70,6 +71,11 @@ func (p *ConnPool) DialTokens() float64 {
 	defer l.mu.Unlock()
 	l.refillLocked(now)
 	return l.tokens
+}
+
+// dialConn is dialConnTracked without dial tracking, for the dial retry tests.
+func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
+	return p.dialConnTracked(ctx, pooled, nil)
 }
 
 var NoExpiration = noExpiration

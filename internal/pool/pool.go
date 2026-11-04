@@ -1166,12 +1166,8 @@ func (p *ConnPool) newConnTracked(ctx context.Context, pooled bool, dialed *bool
 	return cn, nil
 }
 
-func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
-	return p.dialConnTracked(ctx, pooled, nil)
-}
-
-// dialConnTracked is dialConn that sets *dialed (if non-nil) once a dial
-// attempt starts, so a rate-limited caller can refund a token for a dial
+// dialConnTracked dials a new connection and sets *dialed (if non-nil) once a
+// dial attempt starts, so a rate-limited caller can refund a token for a dial
 // that never started.
 func (p *ConnPool) dialConnTracked(ctx context.Context, pooled bool, dialed *bool) (*Conn, error) {
 	if p.closed() {
