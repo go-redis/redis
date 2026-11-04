@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,28 @@ import (
 )
 
 var ctx = context.TODO()
+
+type capturingLogger struct {
+	mu   sync.Mutex
+	logs []string
+}
+
+func (l *capturingLogger) Printf(_ context.Context, format string, v ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logs = append(l.logs, fmt.Sprintf(format, v...))
+}
+
+func (l *capturingLogger) contains(substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, msg := range l.logs {
+		if strings.Contains(msg, substr) {
+			return true
+		}
+	}
+	return false
+}
 
 var _ = Describe("newClusterState", func() {
 	var state *clusterState
@@ -77,7 +100,7 @@ var _ = Describe("newClusterState", func() {
 			Expect(slotAddr(state.slots[0])).To(Equal("10.10.10.10:7001"))
 			Expect(slotAddr(state.slots[1])).To(Equal("10.10.10.10:7002"))
 			Expect(slotAddr(state.slots[2])).To(Equal("1.2.3.4:1234"))
-			Expect(slotAddr(state.slots[3])).To(Equal(":1234"))
+			Expect(slotAddr(state.slots[3])).To(Equal("10.10.10.10:1234"))
 		})
 	})
 
@@ -460,6 +483,37 @@ func TestNewClusterState_PortZero(t *testing.T) {
 	})
 }
 
+// With `cluster-preferred-endpoint-type unknown-endpoint` the server sends a
+// null host in CLUSTER SLOTS, and the client is expected to reuse the host it
+// connected to.
+func TestNewClusterState_NullHost(t *testing.T) {
+	for _, null := range []string{"_\r\n", "$-1\r\n"} {
+		cmd := NewClusterSlotsCmd(context.Background())
+		reply := "*1\r\n*3\r\n:0\r\n:5460\r\n*2\r\n" + null + ":6380\r\n"
+		if err := cmd.readReply(proto.NewReader(strings.NewReader(reply))); err != nil {
+			t.Fatalf("reply %q: readReply() = %v", null, err)
+		}
+
+		opt := &ClusterOptions{}
+		opt.init()
+		nodes := newClusterNodes(opt)
+		defer nodes.Close()
+
+		state, err := newClusterState(nodes, cmd.Val(), "172.30.0.10:6379")
+		if err != nil {
+			t.Fatalf("newClusterState failed: %v", err)
+		}
+
+		client := state.slots[0].nodes[0].Client
+		if got := client.Options().Addr; got != "172.30.0.10:6380" {
+			t.Errorf("reply %q: Addr = %q, want %q", null, got, "172.30.0.10:6380")
+		}
+		if got := client.NodeAddress(); got != ":6380" {
+			t.Errorf("reply %q: NodeAddress = %q, want %q", null, got, ":6380")
+		}
+	}
+}
+
 type fixedHash string
 
 func (h fixedHash) Get(string) string {
@@ -548,6 +602,201 @@ func BenchmarkRingShardingRebalanceLocked(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ring.sharding.rebalanceLocked()
+	}
+}
+
+// CSC command-processing and metadata benchmarks.
+// Keep results observable without allocating a new command in each iteration.
+var (
+	cscBenchmarkString string
+	cscBenchmarkBool   bool
+	cscBenchmarkError  error
+	cscBenchmarkMeta   cscCommandMeta
+	cscBenchmarkView   *commandMetadataView
+	cscBenchmarkCount  int
+)
+
+func BenchmarkCSCCommandError(b *testing.B) {
+	var active atomic.Bool
+	active.Store(true)
+	c := &baseClient{opt: &Options{Protocol: 3}, cscActive: &active}
+	for _, tc := range []struct {
+		name string
+		arg  interface{}
+	}{
+		{"lowercase", "get"},
+		{"uppercase", "GET"},
+		{"bytes", []byte("GET")},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			cmd := NewCmd(context.Background(), tc.arg, "key")
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				cscBenchmarkError = c.cscCommandError(cmd)
+			}
+		})
+	}
+}
+
+func BenchmarkCSCEligibility(b *testing.B) {
+	view := (&baseClient{}).metadataView()
+	for _, args := range [][]interface{}{
+		{"get", "key"},
+		{"hget", "key", "field"},
+		{"xinfo", "consumers", "key", "group"},
+	} {
+		b.Run(args[0].(string), func(b *testing.B) {
+			cmd := NewCmd(context.Background(), args...)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				cscBenchmarkMeta, cscBenchmarkBool = cscEligibleMeta(view, cmd)
+			}
+		})
+	}
+}
+
+func BenchmarkBuildCacheKey(b *testing.B) {
+	cmd := NewStringCmd(context.Background(), "get", "key")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkString, cscBenchmarkBool = buildCacheKeyReference(cmd)
+	}
+}
+
+func BenchmarkCSCEntryKey(b *testing.B) {
+	cmd := NewStringCmd(context.Background(), "get", "key")
+	prefix := cscNamespacePrefix(0, "")
+	fingerprint := (&baseClient{}).metadataView().cscFingerprint
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkString, cscBenchmarkBool = cscRenderEntryKey(prefix, fingerprint, cmd)
+	}
+}
+
+func BenchmarkCommandArgsRepeatable(b *testing.B) {
+	for _, size := range []int{2, 10} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			args := make([]interface{}, size)
+			for i := range args {
+				args[i] = "key"
+			}
+			cmd := NewCmd(context.Background(), args...)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				cscBenchmarkBool = commandArgsRepeatable(cmd)
+			}
+		})
+	}
+}
+
+func BenchmarkCSCKeynumLayout(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		arg  interface{}
+	}{
+		{"int", 2},
+		{"string", "2"},
+		{"bytes", []byte("2")},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			cmd := NewCmd(context.Background(), "zunion", tc.arg, "key1", "key2")
+			meta, ok := cscEligibleMeta((&baseClient{}).metadataView(), cmd)
+			if !ok {
+				b.Fatal("ZUNION must be eligible")
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, cscBenchmarkCount = cscRedisKeyLayout(meta, cmd)
+			}
+		})
+	}
+}
+
+func BenchmarkCSCCanExtractRedisKeys(b *testing.B) {
+	cmd := NewCmd(context.Background(), "mget", []byte("key"), 42)
+	meta, ok := cscEligibleMeta((&baseClient{}).metadataView(), cmd)
+	if !ok {
+		b.Fatal("MGET must be eligible")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkBool = cscCanExtractRedisKeys(meta, cmd)
+	}
+}
+
+type cscBenchmarkMissPool struct{ pool.Pooler }
+
+func (cscBenchmarkMissPool) Get(context.Context) (*pool.Conn, error) {
+	return nil, pool.ErrClosed
+}
+
+func BenchmarkCSCProcessCachedHit(b *testing.B)  { benchmarkCSCProcessCached(b, true) }
+func BenchmarkCSCProcessCachedMiss(b *testing.B) { benchmarkCSCProcessCached(b, false) }
+
+func benchmarkCSCProcessCached(b *testing.B, hit bool) {
+	ctx := context.Background()
+	cache := NewLocalCache(CacheConfig{MaxEntries: 16})
+	c := &baseClient{
+		opt:           &Options{Protocol: 3},
+		csc:           cache,
+		cscKeyPrefix:  cscNamespacePrefix(0, ""),
+		connPool:      cscBenchmarkMissPool{},
+		staticCmdMeta: defaultCommandMetadataView(),
+	}
+	cmd := NewStringCmd(ctx, "get", "key")
+	view := c.metadataView()
+	meta, ok := cscEligibleMeta(view, cmd)
+	if !ok {
+		b.Fatal("GET must be eligible")
+	}
+	if hit {
+		rawKey, _ := buildCacheKeyReference(cmd)
+		key := cscEntryKey(c.cscKeyPrefix, view.cscFingerprint, rawKey)
+		if !cache.set(key, []string{cscNamespacedKey(c.cscKeyPrefix, "key")}, []byte("$5\r\nvalue\r\n")) {
+			b.Fatal("failed to seed cache")
+		}
+	}
+	// Misses stop at pool acquisition and cancel their reservation. This
+	// measures the cache lifecycle without a Redis server, dial, or unbounded
+	// fixture growth; it does not measure a successful network fetch.
+	var wantErr error
+	if !hit {
+		wantErr = pool.ErrClosed
+	}
+	if err := c.processCached(ctx, cmd, nil, view, meta, 0); err != wantErr {
+		b.Fatalf("processCached: got %v, want %v", err, wantErr)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkError = c.processCached(ctx, cmd, nil, view, meta, 0)
+	}
+	b.StopTimer()
+	if !hit && cache.Len() != 0 {
+		b.Fatal("miss reservation leaked")
+	}
+}
+
+func BenchmarkBuildDefaultView(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkView = buildCommandMetadataView(nil, nil)
+	}
+}
+
+func BenchmarkTableFingerprint(b *testing.B) {
+	table := (&baseClient{}).metadataView().cscTable
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkString = cscTableFingerprint(table)
 	}
 }
 
@@ -810,9 +1059,12 @@ var _ = Describe("isLoopback", func() {
 	)
 })
 
-// TestOnCloseHooks_RunInRegistrationOrder verifies that hooks registered under
-// distinct ids are all invoked on run() in the order they were registered.
-func TestOnCloseHooks_RunInRegistrationOrder(t *testing.T) {
+// TestOnCloseHooks_RunInReverseRegistrationOrder verifies that hooks are invoked in
+// REVERSE registration order (LIFO): a hook registered later is a consumer of state an
+// earlier registration provides, so it must run first. Concretely, an autopipeliner
+// drain (registered lazily) must run before the Sentinel failover teardown (registered
+// at construction) so the drain can still resolve the master address. See onCloseHooks.run.
+func TestOnCloseHooks_RunInReverseRegistrationOrder(t *testing.T) {
 	h := &onCloseHooks{}
 	var calls []string
 
@@ -823,9 +1075,9 @@ func TestOnCloseHooks_RunInRegistrationOrder(t *testing.T) {
 	if err := h.run(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"a", "b", "c"}
+	want := []string{"c", "b", "a"}
 	if !reflect.DeepEqual(calls, want) {
-		t.Fatalf("run order = %v, want %v", calls, want)
+		t.Fatalf("run order = %v, want %v (LIFO)", calls, want)
 	}
 }
 
@@ -857,6 +1109,42 @@ func TestOnCloseHooks_RegisterSameIDReplaces(t *testing.T) {
 	}
 	if got := lastSeen.Load(); got != iterations-1 {
 		t.Fatalf("last-registered callback not invoked: lastSeen = %d, want %d", got, iterations-1)
+	}
+}
+
+// TestOnCloseHooks_RegisterAfterRunIsRejected pins the contract the cluster FD
+// router's per-node evict hook relies on: once run has taken its snapshot the
+// owner is closing, and a callback registered from then on would never fire —
+// so register must report false and store nothing, instead of silently
+// accepting a hook that leaks whatever it was meant to clean up (cursor bugbot
+// on #4002: a node client closing between a child's publication and its evict
+// hook's registration left the child in the router map for good).
+func TestOnCloseHooks_RegisterAfterRunIsRejected(t *testing.T) {
+	h := &onCloseHooks{}
+	var early, late atomic.Int32
+
+	if !h.register("early", func() error { early.Add(1); return nil }) {
+		t.Fatal("register before run must report true")
+	}
+	if err := h.run(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := early.Load(); got != 1 {
+		t.Fatalf("early hook invoked %d times, want 1", got)
+	}
+
+	if h.register("late", func() error { late.Add(1); return nil }) {
+		t.Fatal("register after run must report false: the owner is closing and the hook would never fire")
+	}
+	if _, stored := h.hooks["late"]; stored {
+		t.Fatal("a rejected registration must not be stored")
+	}
+	// A second run (Close is idempotent at the owner level) must not surface it.
+	if err := h.run(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := late.Load(); got != 0 {
+		t.Fatalf("late hook invoked %d times, want 0", got)
 	}
 }
 
@@ -906,7 +1194,8 @@ func TestOnCloseHooks_Unregister(t *testing.T) {
 }
 
 // TestOnCloseHooks_AllRunOnError confirms every hook is invoked even if an
-// earlier one returns an error, and that the first error is returned.
+// earlier one returns an error, and that the first error in INVOCATION order (LIFO) is
+// returned. "b" runs before "a" under LIFO, so its error is the first non-nil one.
 func TestOnCloseHooks_AllRunOnError(t *testing.T) {
 	h := &onCloseHooks{}
 	var called [3]bool
@@ -917,9 +1206,10 @@ func TestOnCloseHooks_AllRunOnError(t *testing.T) {
 	h.register("b", func() error { called[1] = true; return errSecond })
 	h.register("c", func() error { called[2] = true; return nil })
 
+	// Invocation order is c, b, a (LIFO); the first non-nil error encountered is errSecond.
 	err := h.run()
-	if err != errFirst {
-		t.Fatalf("run() err = %v, want %v", err, errFirst)
+	if err != errSecond {
+		t.Fatalf("run() err = %v, want %v", err, errSecond)
 	}
 	for i, c := range called {
 		if !c {
@@ -1186,3 +1476,187 @@ func TestPubSubConn_PassesPersistedChannelsToNewConn(t *testing.T) {
 	}
 }
 
+// These benchmarks measure cluster routing without a Redis server. A custom
+// topology prevents discovery I/O, and each iteration creates fresh commands.
+func newClusterRoutingBenchmarkClient(b *testing.B) (*ClusterClient, []string) {
+	b.Helper()
+	slots := []ClusterSlot{
+		{Start: 0, End: 5460, Nodes: []ClusterNode{{Addr: "127.0.0.1:1"}, {Addr: "127.0.0.1:4"}}},
+		{Start: 5461, End: 10922, Nodes: []ClusterNode{{Addr: "127.0.0.1:2"}, {Addr: "127.0.0.1:5"}}},
+		{Start: 10923, End: 16383, Nodes: []ClusterNode{{Addr: "127.0.0.1:3"}, {Addr: "127.0.0.1:6"}}},
+	}
+	c := NewClusterClient(&ClusterOptions{
+		ClusterSlots: func(context.Context) ([]ClusterSlot, error) { return slots, nil },
+	})
+	b.Cleanup(func() { _ = c.Close() })
+	if _, err := c.state.Get(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	keys := make([]string, 1024)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("routing:key:%d", i)
+	}
+	return c, keys
+}
+
+func BenchmarkClusterRoutingGet(b *testing.B) {
+	c, keys := newClusterRoutingBenchmarkClient(b)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cmd := NewStringCmd(ctx, "get", keys[i%len(keys)])
+		decision := c.commandRoutingDecision(ctx, cmd)
+		if decision.policyErr != nil {
+			b.Fatal(decision.policyErr)
+		}
+		slot := c.cmdSlotWithDecision(cmd, &decision, -1)
+		if _, err := c.cmdNodeWithDecision(ctx, slot, &decision); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkClusterRoutingProcessGet(b *testing.B) {
+	c, keys := newClusterRoutingBenchmarkClient(b)
+	ctx := context.Background()
+	state, err := c.state.Get(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, node := range state.Masters {
+		node.Client.AddHook(clusterRoutingShortCircuitHook{})
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cmd := NewStringCmd(ctx, "get", keys[i%len(keys)])
+		if err := c.process(ctx, cmd); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkClusterRoutingPipeline100(b *testing.B) {
+	c, keys := newClusterRoutingBenchmarkClient(b)
+	ctx := context.Background()
+	cmds := make([]Cmder, 100)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := range cmds {
+			cmds[j] = NewStringCmd(ctx, "get", keys[(i*len(cmds)+j)%len(keys)])
+		}
+		if err := c.mapCmdsByNode(ctx, newCmdsMap(), cmds); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkClusterRoutingAutoPipelineAdmission(b *testing.B) {
+	c, keys := newClusterRoutingBenchmarkClient(b)
+	ap, err := c.AutoPipelineWithOptions(&AutoPipelineOptions{
+		MaxBatchSize: 512, MaxConcurrentBatches: 200, Unordered: true,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = ap.Close() })
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cmd := NewStringCmd(ctx, "get", keys[i%len(keys)])
+		if divert, err := ap.routeCommand(ctx, cmd); divert || err != nil {
+			b.Fatalf("GET routing: divert=%v, err=%v", divert, err)
+		}
+		_ = ap.shardFn(cmd)
+		cmd.setClusterRoutingDecision(nil)
+	}
+}
+
+func BenchmarkRoutingKeyPlan(b *testing.B) {
+	for _, n := range []int{2, 16, 100} {
+		b.Run(fmt.Sprintf("Range%d", n), func(b *testing.B) {
+			args := make([]interface{}, n+1)
+			args[0] = "mget"
+			for i := 1; i < len(args); i++ {
+				args[i] = fmt.Sprintf("{k}%d", i)
+			}
+			cmd := NewCmd(context.Background(), args...)
+			meta := defaultCommandMetadataView().routingTable["mget"]
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				plan, ok := routingResolveKeyPlan(meta, cmd)
+				if !ok || len(plan.positions) != n {
+					b.Fatal(plan, ok)
+				}
+			}
+		})
+	}
+	b.Run("Overlapping", func(b *testing.B) {
+		meta := deriveRoutingCommandMeta("overlap", &CommandInfo{KeySpecs: []KeySpec{
+			{Flags: []string{"RO", "access"}, BeginSearch: "index", Index: 1, FindKeys: "range", LastKey: 1, KeyStep: 1},
+			{Flags: []string{"RO", "access"}, BeginSearch: "index", Index: 2, FindKeys: "range", LastKey: 1, KeyStep: 1},
+		}})
+		cmd := NewCmd(context.Background(), "overlap", "a", "b", "c")
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			plan, ok := routingResolveKeyPlan(meta, cmd)
+			if !ok || len(plan.positions) != 3 {
+				b.Fatal(plan, ok)
+			}
+		}
+	})
+}
+
+func BenchmarkClusterRoutingAutoPipelineMap100(b *testing.B) {
+	c, keys := newClusterRoutingBenchmarkClient(b)
+	ap, err := c.AutoPipelineWithOptions(&AutoPipelineOptions{MaxBatchSize: 512, MaxConcurrentBatches: 200, Unordered: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = ap.Close() })
+	ctx := context.Background()
+	cmds := make([]Cmder, 100)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := range cmds {
+			cmd := NewStringCmd(ctx, "get", keys[(i*len(cmds)+j)%len(keys)])
+			if divert, err := ap.routeCommand(ctx, cmd); divert || err != nil {
+				b.Fatalf("GET routing: divert=%v, err=%v", divert, err)
+			}
+			_ = ap.shardFn(cmd)
+			cmds[j] = cmd
+		}
+		if err := c.mapCmdsByNode(ctx, newCmdsMap(), cmds); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRoutingFirstKey(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		key  interface{}
+	}{
+		{"String", "0123456789abcdef"}, {"Bytes", []byte("0123456789abcdef")}, {"Int", 1234567890},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			c := &ClusterClient{}
+			view := defaultCommandMetadataView()
+			cmd := NewCmd(context.Background(), "get", tc.key)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				d := c.routingDecisionInView(context.Background(), cmd, view, nil)
+				if d.policyErr != nil {
+					b.Fatal(d.policyErr)
+				}
+			}
+		})
+	}
+}

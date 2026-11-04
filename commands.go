@@ -89,14 +89,24 @@ func appendArg(dst []interface{}, arg interface{}) []interface{} {
 	case nil:
 		return dst
 	default:
-		// scan struct field
+		// scan struct field / typed string-key maps
 		v := reflect.ValueOf(arg)
-		if v.Type().Kind() == reflect.Ptr {
+		if v.Type().Kind() == reflect.Pointer {
 			if v.IsNil() {
 				// error: arg is not a valid object
 				return dst
 			}
 			v = v.Elem()
+		}
+
+		// Flatten map[string]T the same way as map[string]string /
+		// map[string]interface{}, so HSet/HMSet accept typed numeric maps.
+		if v.Kind() == reflect.Map && v.Type().Key().Kind() == reflect.String {
+			iter := v.MapRange()
+			for iter.Next() {
+				dst = append(dst, iter.Key().Interface(), iter.Value().Interface())
+			}
+			return dst
 		}
 
 		if v.Type().Kind() == reflect.Struct {
@@ -199,6 +209,9 @@ type Cmdable interface {
 	ClientUnblock(ctx context.Context, id int64) *IntCmd
 	ClientUnblockWithError(ctx context.Context, id int64) *IntCmd
 	ClientMaintNotifications(ctx context.Context, enabled bool, endpointType string) *StatusCmd
+	ClientTracking(ctx context.Context, on bool, opt *ClientTrackingOptions) *StatusCmd
+	ClientTrackingOn(ctx context.Context, opt *ClientTrackingOptions) *StatusCmd
+	ClientTrackingOff(ctx context.Context) *StatusCmd
 	ConfigGet(ctx context.Context, parameter string) *MapStringStringCmd
 	ConfigResetStat(ctx context.Context) *StatusCmd
 	ConfigSet(ctx context.Context, parameter, value string) *StatusCmd
@@ -248,6 +261,7 @@ type Cmdable interface {
 	TimeseriesCmdable
 	JSONCmdable
 	VectorSetCmdable
+	BlessCmdable
 }
 
 type StatefulCmdable interface {
@@ -354,17 +368,24 @@ func (info LibraryInfo) Validate() error {
 }
 
 // Hello sets the resp protocol used.
+// It sends AUTH only when password is not empty.
 func (c statefulCmdable) Hello(ctx context.Context,
 	ver int, username, password, clientName string,
 ) *MapStringInterfaceCmd {
+	return c.hello(ctx, ver, username, password, clientName, password != "")
+}
+
+// hello sends HELLO with AUTH when auth is true.
+func (c statefulCmdable) hello(ctx context.Context,
+	ver int, username, password, clientName string, auth bool,
+) *MapStringInterfaceCmd {
 	args := make([]interface{}, 0, 7)
 	args = append(args, "hello", ver)
-	if password != "" {
-		if username != "" {
-			args = append(args, "auth", username, password)
-		} else {
-			args = append(args, "auth", "default", password)
+	if auth {
+		if username == "" {
+			username = "default"
 		}
+		args = append(args, "auth", username, password)
 	}
 	if clientName != "" {
 		args = append(args, "setname", clientName)
@@ -564,6 +585,95 @@ func (c cmdable) ClientMaintNotifications(ctx context.Context, enabled bool, end
 	cmd := NewStatusCmd(ctx, args...)
 	_ = c(ctx, cmd)
 	return cmd
+}
+
+// ClientTrackingOptions configures CLIENT TRACKING ON. See
+// https://redis.io/commands/client-tracking/ for semantics.
+type ClientTrackingOptions struct {
+	Redirect int64
+	Bcast    bool
+	Prefixes []string
+	OptIn    bool
+	OptOut   bool
+	NoLoop   bool
+}
+
+// ClientTracking enables or disables server-assisted client-side caching for
+// the ONE connection that happens to serve this command. On a pooled client
+// that connection is arbitrary, so this is only meaningful on a dedicated
+// connection (see Client.Conn). When on is false, opt is ignored. Invalid
+// option combinations are reported via the returned command's Err and nothing
+// is sent to the server.
+//
+// Must not be combined with the built-in client-side cache: on a client
+// configured with Options.ClientSideCache or ClientSideCacheConfig this
+// command is rejected, because changing a pool connection's tracking state
+// would silently break the cache's invalidation.
+func (c cmdable) ClientTracking(ctx context.Context, on bool, opt *ClientTrackingOptions) *StatusCmd {
+	if !on {
+		return c.ClientTrackingOff(ctx)
+	}
+	return c.ClientTrackingOn(ctx, opt)
+}
+
+// ClientTrackingOn enables tracking on the serving connection. See
+// ClientTracking for the pooled-client and built-in-CSC caveats.
+func (c cmdable) ClientTrackingOn(ctx context.Context, opt *ClientTrackingOptions) *StatusCmd {
+	args := []interface{}{"client", "tracking", "on"}
+	if opt != nil {
+		if err := validateClientTrackingOptions(opt); err != nil {
+			cmd := NewStatusCmd(ctx, args...)
+			cmd.SetErr(err)
+			return cmd
+		}
+		args = appendClientTrackingOptions(args, opt)
+	}
+	cmd := NewStatusCmd(ctx, args...)
+	_ = c(ctx, cmd)
+	return cmd
+}
+
+// ClientTrackingOff disables tracking on the serving connection. See
+// ClientTracking for the pooled-client and built-in-CSC caveats.
+func (c cmdable) ClientTrackingOff(ctx context.Context) *StatusCmd {
+	cmd := NewStatusCmd(ctx, "client", "tracking", "off")
+	_ = c(ctx, cmd)
+	return cmd
+}
+
+func validateClientTrackingOptions(opt *ClientTrackingOptions) error {
+	if opt.OptIn && opt.OptOut {
+		return errors.New("redis: CLIENT TRACKING OPTIN and OPTOUT are mutually exclusive")
+	}
+	if opt.Bcast && (opt.OptIn || opt.OptOut) {
+		return errors.New("redis: CLIENT TRACKING BCAST cannot be combined with OPTIN or OPTOUT")
+	}
+	if len(opt.Prefixes) > 0 && !opt.Bcast {
+		return errors.New("redis: CLIENT TRACKING PREFIX requires BCAST")
+	}
+	return nil
+}
+
+func appendClientTrackingOptions(args []interface{}, opt *ClientTrackingOptions) []interface{} {
+	if opt.Redirect != 0 {
+		args = append(args, "redirect", opt.Redirect)
+	}
+	if opt.Bcast {
+		args = append(args, "bcast")
+	}
+	for _, p := range opt.Prefixes {
+		args = append(args, "prefix", p)
+	}
+	if opt.OptIn {
+		args = append(args, "optin")
+	}
+	if opt.OptOut {
+		args = append(args, "optout")
+	}
+	if opt.NoLoop {
+		args = append(args, "noloop")
+	}
+	return args
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -783,15 +893,17 @@ type ModuleLoadexConfig struct {
 }
 
 func (c *ModuleLoadexConfig) toArgs() []interface{} {
-	args := make([]interface{}, 3, 3+len(c.Conf)*3+len(c.Args)*2)
+	args := make([]interface{}, 3, 4+len(c.Conf)*3+len(c.Args))
 	args[0] = "MODULE"
 	args[1] = "LOADEX"
 	args[2] = c.Path
 	for k, v := range c.Conf {
 		args = append(args, "CONFIG", k, v)
 	}
-	for _, arg := range c.Args {
-		args = append(args, "ARGS", arg)
+	// ARGS comes once, and every argument after it goes to the module.
+	if len(c.Args) > 0 {
+		args = append(args, "ARGS")
+		args = append(args, c.Args...)
 	}
 	return args
 }

@@ -4,12 +4,113 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9/internal"
 	"github.com/redis/go-redis/v9/maintnotifications"
 )
+
+func TestParseURLConnectionValidation(t *testing.T) {
+	parsers := []struct {
+		name  string
+		parse func(string) (*Options, error)
+	}{
+		{"standalone", func(query string) (*Options, error) {
+			return ParseURL("redis://localhost:6379?" + query)
+		}},
+		{"cluster", func(query string) (*Options, error) {
+			o, err := ParseClusterURL("redis://localhost:6379?" + query)
+			if err != nil {
+				return nil, err
+			}
+			o.init()
+			return o.clientOptions(), nil
+		}},
+		{"failover", func(query string) (*Options, error) {
+			o, err := ParseFailoverURL("redis://localhost:6379?master_name=mymaster&" + query)
+			if err != nil {
+				return nil, err
+			}
+			return o.clientOptions(), nil
+		}},
+	}
+	for _, parser := range parsers {
+		t.Run(parser.name, func(t *testing.T) {
+			t.Run("omitted retry delay", func(t *testing.T) {
+				o, err := parser.parse("")
+				if err != nil {
+					t.Fatal(err)
+				}
+				o.init()
+				if o.DialerRetryTimeout != 100*time.Millisecond || o.DialerRetryBackoff != nil {
+					t.Fatal("omitted retry delay must retain the default backoff")
+				}
+			})
+			for _, value := range []string{"", "0", "0s", "1", "250ms", "-1", "-1s", "-1ns", "-0.1ns", "bad", "9223372036854775807"} {
+				t.Run("retry/"+value, func(t *testing.T) {
+					o, err := parser.parse("dialer_retry_timeout=" + value)
+					if strings.HasPrefix(value, "-") || value == "bad" || value == "9223372036854775807" {
+						if err == nil || !strings.Contains(err.Error(), "dialer_retry_timeout") {
+							t.Fatalf("expected dialer_retry_timeout error, got %v", err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					o.init()
+					want := 100 * time.Millisecond
+					switch value {
+					case "0", "0s":
+						want = 0
+					case "1":
+						want = time.Second
+					case "250ms":
+						want = 250 * time.Millisecond
+					}
+					got := o.DialerRetryTimeout
+					if o.DialerRetryBackoff != nil {
+						got = o.DialerRetryBackoff(0)
+					}
+					if got != want {
+						t.Fatalf("retry delay = %v, want %v", got, want)
+					}
+				})
+			}
+			for _, field := range []string{"read_buffer_size", "write_buffer_size"} {
+				for _, value := range []string{"-1", "bad", "0", "65536"} {
+					t.Run(field+"/"+value, func(t *testing.T) {
+						o, err := parser.parse(field + "=" + value)
+						if value == "-1" || value == "bad" {
+							if err == nil || !strings.Contains(err.Error(), field) {
+								t.Fatalf("expected %s error, got %v", field, err)
+							}
+							return
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						o.init()
+						want := 32768
+						if value == "65536" {
+							want = 65536
+						}
+						got := o.ReadBufferSize
+						if field == "write_buffer_size" {
+							got = o.WriteBufferSize
+						}
+						if got != want {
+							t.Fatalf("%s = %d, want %d", field, got, want)
+						}
+					})
+				}
+			}
+		})
+	}
+}
 
 func TestParseURL(t *testing.T) {
 	cases := []struct {
@@ -128,6 +229,10 @@ func TestParseURL(t *testing.T) {
 			url: "redis://localhost/?pool_fifo=yes",
 			err: errors.New(`redis: invalid pool_fifo boolean: expected true/false/1/0 or an empty string, got "yes"`),
 		}, {
+			// invalid skip_verify value
+			url: "rediss://localhost/?skip_verify=yes",
+			err: errors.New(`redis: invalid skip_verify boolean: expected true/false/1/0 or an empty string, got "yes"`),
+		}, {
 			// it returns first error
 			url: "redis://localhost/?db=foo&pool_size=five",
 			err: errors.New(`redis: invalid database number: strconv.Atoi: parsing "foo": invalid syntax`),
@@ -202,7 +307,7 @@ func comprareOptions(t *testing.T, actual, expected *Options) {
 		t.Errorf("got %q, want %q", actual.Addr, expected.Addr)
 	}
 	if actual.DB != expected.DB {
-		t.Errorf("DB: got %q, expected %q", actual.DB, expected.DB)
+		t.Errorf("DB: got %d, expected %d", actual.DB, expected.DB)
 	}
 	if actual.TLSConfig == nil && expected.TLSConfig != nil {
 		t.Errorf("got nil TLSConfig, expected a TLSConfig")
@@ -455,6 +560,41 @@ func TestClusterOptionsDialerRetries(t *testing.T) {
 	}
 }
 
+func TestClusterOptionsNodeTimeouts(t *testing.T) {
+	cases := []struct {
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{timeout: -1, want: 0},
+		{timeout: -2, want: -1},
+		{timeout: 0, want: 5 * time.Second},
+		{timeout: 3 * time.Second, want: 3 * time.Second},
+	}
+
+	for _, tc := range cases {
+		opt := &ClusterOptions{
+			ReadTimeout:  tc.timeout,
+			WriteTimeout: tc.timeout,
+		}
+		opt.init()
+		nodes := newClusterNodes(opt)
+
+		node, err := nodes.GetOrCreate("127.0.0.1:7000")
+		if err != nil {
+			t.Fatalf("GetOrCreate failed: %v", err)
+		}
+
+		nodeOpt := node.Client.Options()
+		if nodeOpt.ReadTimeout != tc.want {
+			t.Errorf("timeout %v: expected node ReadTimeout=%v, got %v", tc.timeout, tc.want, nodeOpt.ReadTimeout)
+		}
+		if nodeOpt.WriteTimeout != tc.want {
+			t.Errorf("timeout %v: expected node WriteTimeout=%v, got %v", tc.timeout, tc.want, nodeOpt.WriteTimeout)
+		}
+		_ = nodes.Close()
+	}
+}
+
 func TestRingOptionsDialerRetries(t *testing.T) {
 	ringOpt := &RingOptions{
 		DialerRetries:      10,
@@ -538,4 +678,282 @@ func TestOptionsCloneMaintNotificationsRace(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// TestOptionsInitSkipsEndpointDetectWhenMaintDisabled ensures Options.init does
+// not call DetectEndpointType when maintenance notifications are disabled.
+// DetectEndpointType never returns EndpointTypeAuto, so leaving Auto unchanged
+// is a deterministic signal that detection was skipped (no wall-clock bound).
+func TestOptionsInitSkipsEndpointDetectWhenMaintDisabled(t *testing.T) {
+	const addr = "go-redis-maint-disabled-must-not-resolve.invalid:6379"
+
+	t.Run("disabled leaves EndpointTypeAuto", func(t *testing.T) {
+		opt := &Options{
+			Addr: addr,
+			MaintNotificationsConfig: &maintnotifications.Config{
+				Mode:         maintnotifications.ModeDisabled,
+				EndpointType: maintnotifications.EndpointTypeAuto,
+			},
+		}
+		opt.init()
+		if got := opt.MaintNotificationsConfig.EndpointType; got != maintnotifications.EndpointTypeAuto {
+			t.Fatalf("EndpointType = %q, want %q (unchanged when ModeDisabled)", got, maintnotifications.EndpointTypeAuto)
+		}
+	})
+
+	t.Run("auto replaces EndpointTypeAuto", func(t *testing.T) {
+		opt := &Options{
+			Addr: addr,
+			MaintNotificationsConfig: &maintnotifications.Config{
+				Mode:         maintnotifications.ModeAuto,
+				EndpointType: maintnotifications.EndpointTypeAuto,
+			},
+		}
+		opt.init()
+		if got := opt.MaintNotificationsConfig.EndpointType; got == "" || got == maintnotifications.EndpointTypeAuto {
+			t.Fatalf("EndpointType = %q, want a concrete type after DetectEndpointType", got)
+		}
+	})
+
+	t.Run("explicit EndpointType is preserved", func(t *testing.T) {
+		opt := &Options{
+			Addr: addr,
+			MaintNotificationsConfig: &maintnotifications.Config{
+				Mode:         maintnotifications.ModeAuto,
+				EndpointType: maintnotifications.EndpointTypeInternalFQDN,
+			},
+		}
+		opt.init()
+		if got := opt.MaintNotificationsConfig.EndpointType; got != maintnotifications.EndpointTypeInternalFQDN {
+			t.Fatalf("EndpointType = %q, want %q", got, maintnotifications.EndpointTypeInternalFQDN)
+		}
+	})
+}
+
+func TestNewClientSkipsEndpointDetectWhenMaintDisabled(t *testing.T) {
+	c := NewClient(&Options{
+		Addr: "go-redis-maint-disabled-must-not-resolve.invalid:6379",
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode:         maintnotifications.ModeDisabled,
+			EndpointType: maintnotifications.EndpointTypeAuto,
+		},
+	})
+	defer c.Close()
+
+	if got := c.Options().MaintNotificationsConfig.EndpointType; got != maintnotifications.EndpointTypeAuto {
+		t.Fatalf("EndpointType = %q, want %q", got, maintnotifications.EndpointTypeAuto)
+	}
+}
+
+func TestClientSideCacheRESP2Warning(t *testing.T) {
+	origLogger := internal.Logger.Load()
+	defer func() { internal.Logger.Store(origLogger) }()
+
+	cases := []struct {
+		name     string
+		opt      *Options
+		wantWarn bool
+	}{
+		{
+			name:     "RESP2 with cache config warns",
+			opt:      &Options{Protocol: 2, ClientSideCacheConfig: &ClientSideCacheConfig{}},
+			wantWarn: true,
+		},
+		{
+			name:     "RESP2 with explicit cache warns",
+			opt:      &Options{Protocol: 2, ClientSideCache: NewLocalCache(CacheConfig{})},
+			wantWarn: true,
+		},
+		{
+			name:     "RESP2 without cache does not warn",
+			opt:      &Options{Protocol: 2},
+			wantWarn: false,
+		},
+		{
+			name:     "RESP3 with cache config does not warn",
+			opt:      &Options{Protocol: 3, ClientSideCacheConfig: &ClientSideCacheConfig{}},
+			wantWarn: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := &capturingLogger{}
+			internal.Logger.Store(logger)
+
+			tc.opt.init()
+
+			if got := logger.contains("client-side caching requires Protocol: 3"); got != tc.wantWarn {
+				t.Errorf("warning logged = %v, want %v (logs: %v)", got, tc.wantWarn, logger.logs)
+			}
+		})
+	}
+}
+
+func TestUniversalOptionsSimpleCopiesClientSideCache(t *testing.T) {
+	cfg := &ClientSideCacheConfig{MaxEntries: 10}
+	cache := NewLocalCache(CacheConfig{MaxEntries: 20})
+	const strategy = CSCStrategy(42)
+
+	opt := (&UniversalOptions{
+		ClientSideCacheConfig:   cfg,
+		ClientSideCache:         cache,
+		ClientSideCacheStrategy: strategy,
+	}).Simple()
+
+	if opt.ClientSideCacheConfig != cfg {
+		t.Fatal("Simple did not copy ClientSideCacheConfig")
+	}
+	if opt.ClientSideCache != cache {
+		t.Fatal("Simple did not copy ClientSideCache")
+	}
+	if opt.ClientSideCacheStrategy != strategy {
+		t.Fatal("Simple did not copy ClientSideCacheStrategy")
+	}
+}
+
+// TestParseURLPipelinePoolOptions verifies the URL parsers accept the pipeline
+// pool settings — notably pipeline_pool_size=-1 to opt out of the now-default
+// dedicated pipeline pool — instead of rejecting them as unexpected options
+// (#3959). Covers ParseURL, ParseClusterURL and ParseFailoverURL.
+func TestParseURLPipelinePoolOptions(t *testing.T) {
+	const q = "pipeline_pool_size=-1&pipeline_read_buffer_size=131072&pipeline_write_buffer_size=65536"
+
+	o, err := ParseURL("redis://localhost:6379?" + q)
+	if err != nil {
+		t.Fatalf("ParseURL: %v", err)
+	}
+	if o.PipelinePoolSize != -1 || o.PipelineReadBufferSize != 131072 || o.PipelineWriteBufferSize != 65536 {
+		t.Fatalf("ParseURL pipeline opts: size=%d rbuf=%d wbuf=%d", o.PipelinePoolSize, o.PipelineReadBufferSize, o.PipelineWriteBufferSize)
+	}
+
+	co, err := ParseClusterURL("redis://localhost:6379?" + q)
+	if err != nil {
+		t.Fatalf("ParseClusterURL: %v", err)
+	}
+	if co.PipelinePoolSize != -1 || co.PipelineReadBufferSize != 131072 || co.PipelineWriteBufferSize != 65536 {
+		t.Fatalf("ParseClusterURL pipeline opts: size=%d rbuf=%d wbuf=%d", co.PipelinePoolSize, co.PipelineReadBufferSize, co.PipelineWriteBufferSize)
+	}
+
+	fo, err := ParseFailoverURL("redis://localhost:6379?master_name=mymaster&" + q)
+	if err != nil {
+		t.Fatalf("ParseFailoverURL: %v", err)
+	}
+	if fo.PipelinePoolSize != -1 || fo.PipelineReadBufferSize != 131072 || fo.PipelineWriteBufferSize != 65536 {
+		t.Fatalf("ParseFailoverURL pipeline opts: size=%d rbuf=%d wbuf=%d", fo.PipelinePoolSize, fo.PipelineReadBufferSize, fo.PipelineWriteBufferSize)
+	}
+
+	const mi = "pipeline_min_idle_conns=2"
+	if o, err := ParseURL("redis://localhost:6379?" + mi); err != nil || o.PipelineMinIdleConns != 2 {
+		t.Fatalf("ParseURL pipeline_min_idle_conns: %v, %+v", err, o)
+	}
+	if co, err := ParseClusterURL("redis://localhost:6379?" + mi); err != nil || co.PipelineMinIdleConns != 2 {
+		t.Fatalf("ParseClusterURL pipeline_min_idle_conns: %v, %+v", err, co)
+	}
+	if fo, err := ParseFailoverURL("redis://localhost:6379?master_name=mymaster&" + mi); err != nil || fo.PipelineMinIdleConns != 2 {
+		t.Fatalf("ParseFailoverURL pipeline_min_idle_conns: %v, %+v", err, fo)
+	}
+}
+
+func TestParseClusterURLSkipVerify(t *testing.T) {
+	opt, err := ParseClusterURL("rediss://localhost:6379?skip_verify=true")
+	if err != nil {
+		t.Fatalf("ParseClusterURL(skip_verify=true): unexpected error: %v", err)
+	}
+	if opt.TLSConfig == nil || !opt.TLSConfig.InsecureSkipVerify {
+		t.Fatalf("expected TLSConfig.InsecureSkipVerify=true, got %+v", opt.TLSConfig)
+	}
+
+	optFalse, err := ParseClusterURL("rediss://localhost:6379?skip_verify=false")
+	if err != nil {
+		t.Fatalf("ParseClusterURL(skip_verify=false): unexpected error: %v", err)
+	}
+	if optFalse.TLSConfig == nil || optFalse.TLSConfig.InsecureSkipVerify {
+		t.Fatalf("expected TLSConfig.InsecureSkipVerify=false, got %+v", optFalse.TLSConfig)
+	}
+
+	_, err = ParseClusterURL("rediss://localhost:6379?skip_verify=yes")
+	if err == nil {
+		t.Fatal("expected error for invalid skip_verify value, got nil")
+	}
+	wantErr := `redis: invalid skip_verify boolean: expected true/false/1/0 or an empty string, got "yes"`
+	if err.Error() != wantErr {
+		t.Fatalf("got error %q, want %q", err.Error(), wantErr)
+	}
+
+	_, err = ParseClusterURL("redis://localhost?skip_verify=true")
+	if err == nil {
+		t.Fatal("expected error for skip_verify without TLS, got nil")
+	}
+	wantErr = "redis: unexpected option: skip_verify"
+	if err.Error() != wantErr {
+		t.Fatalf("got error %q, want %q", err.Error(), wantErr)
+	}
+}
+
+// TestParseURLConnectionOptions verifies that the URL parsers accept the
+// connection settings that ParseURL, ParseClusterURL and ParseFailoverURL
+// previously rejected as unexpected options, and that omitting them keeps the
+// zero values.
+func TestParseURLConnectionOptions(t *testing.T) {
+	const q = "dialer_retries=3&dialer_retry_timeout=2s&context_timeout_enabled=true" +
+		"&read_buffer_size=65536&write_buffer_size=32768&disable_identity=true&identity_suffix=app"
+
+	o, err := ParseURL("redis://localhost:6379?" + q)
+	if err != nil {
+		t.Fatalf("ParseURL: %v", err)
+	}
+	if o.DialerRetries != 3 || o.DialerRetryTimeout != 2*time.Second || !o.ContextTimeoutEnabled ||
+		o.ReadBufferSize != 65536 || o.WriteBufferSize != 32768 || !o.DisableIdentity || o.IdentitySuffix != "app" {
+		t.Fatalf("ParseURL connection opts: %+v", o)
+	}
+
+	co, err := ParseClusterURL("redis://localhost:6379?" + q)
+	if err != nil {
+		t.Fatalf("ParseClusterURL: %v", err)
+	}
+	if co.DialerRetries != 3 || co.DialerRetryTimeout != 2*time.Second || !co.ContextTimeoutEnabled ||
+		co.ReadBufferSize != 65536 || co.WriteBufferSize != 32768 || !co.DisableIdentity || co.IdentitySuffix != "app" {
+		t.Fatalf("ParseClusterURL connection opts: %+v", co)
+	}
+
+	fo, err := ParseFailoverURL("redis://localhost:6379?master_name=mymaster&" + q)
+	if err != nil {
+		t.Fatalf("ParseFailoverURL: %v", err)
+	}
+	if fo.DialerRetries != 3 || fo.DialerRetryTimeout != 2*time.Second || !fo.ContextTimeoutEnabled ||
+		fo.ReadBufferSize != 65536 || fo.WriteBufferSize != 32768 || !fo.DisableIdentity || fo.IdentitySuffix != "app" {
+		t.Fatalf("ParseFailoverURL connection opts: %+v", fo)
+	}
+
+	// ParseFailoverURL keeps accepting the original camelCase spellings.
+	fo, err = ParseFailoverURL("redis://localhost:6379?master_name=mymaster&disableIdentity=true&identitySuffix=legacy")
+	if err != nil {
+		t.Fatalf("ParseFailoverURL camelCase: %v", err)
+	}
+	if !fo.DisableIdentity || fo.IdentitySuffix != "legacy" {
+		t.Fatalf("ParseFailoverURL camelCase opts: disable=%v suffix=%q", fo.DisableIdentity, fo.IdentitySuffix)
+	}
+	// Both spellings of one option are rejected, like idle_timeout + conn_max_idle_time.
+	if _, err = ParseFailoverURL("redis://localhost:6379?master_name=mymaster&disable_identity=true&disableIdentity=true"); err == nil {
+		t.Fatal("ParseFailoverURL accepted both disable_identity and disableIdentity")
+	}
+
+	// Without the parameters every field keeps its zero value.
+	o, err = ParseURL("redis://localhost:6379")
+	if err != nil {
+		t.Fatalf("ParseURL defaults: %v", err)
+	}
+	if o.DialerRetries != 0 || o.DialerRetryTimeout != 0 || o.ContextTimeoutEnabled ||
+		o.ReadBufferSize != 0 || o.WriteBufferSize != 0 || o.DisableIdentity || o.IdentitySuffix != "" {
+		t.Fatalf("ParseURL defaults changed: %+v", o)
+	}
+
+	// Invalid values are reported, not ignored.
+	if _, err = ParseURL("redis://localhost:6379?context_timeout_enabled=maybe"); err == nil {
+		t.Fatal("ParseURL accepted an invalid context_timeout_enabled")
+	}
+	if _, err = ParseClusterURL("redis://localhost:6379?read_buffer_size=big"); err == nil {
+		t.Fatal("ParseClusterURL accepted an invalid read_buffer_size")
+	}
 }

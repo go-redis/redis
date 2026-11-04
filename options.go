@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9/auth"
+	"github.com/redis/go-redis/v9/internal"
 	"github.com/redis/go-redis/v9/internal/pool"
 	"github.com/redis/go-redis/v9/internal/proto"
 	"github.com/redis/go-redis/v9/internal/util"
@@ -46,6 +47,14 @@ type Limiter interface {
 
 // Options keeps the settings to set up redis connection.
 type Options struct {
+	// cscDisabled preserves a construction-time rejection through node factories.
+	// It prevents a factory-supplied Cache from re-enabling rejected CSC options.
+	cscDisabled bool
+	// cscPresenceOnly enables node-local presence filtering and redirect eviction.
+	// It owns no Cluster state and leaves standalone defaults unchanged.
+	cscPresenceOnly bool
+	// cscMetadataSource is borrowed from a ClusterClient; it grants no ownership.
+	cscMetadataSource *commandMetadataStore
 	// Network type, either tcp or unix.
 	//
 	// default: is tcp.
@@ -83,6 +92,8 @@ type Options struct {
 	// Username is used to authenticate the current connection
 	// with one of the connections defined in the ACL list when connecting
 	// to a Redis 6.0 instance, or greater, that is using the Redis ACL system.
+	// A Username without a Password sends no AUTH unless AuthEmptyPassword
+	// is set.
 	Username string
 
 	// Password is an optional password. Must match the password specified in the
@@ -90,6 +101,18 @@ type Options struct {
 	// or the User Password when connecting to a Redis 6.0 instance, or greater,
 	// that is using the Redis ACL system.
 	Password string
+
+	// AuthEmptyPassword, when true, makes a Username with an empty Password
+	// authenticate as that user with an empty password (AUTH user ""), as
+	// needed for ACL users created with nopass. The rule also applies to
+	// credentials from CredentialsProvider, CredentialsProviderContext and
+	// StreamingCredentialsProvider used when a connection is set up.
+	// Re-authentication on a credentials refresh is not affected.
+	//
+	// By default a Username without a Password sends no AUTH: some servers
+	// (Redis Enterprise, Redis Cloud databases with unauthenticated access)
+	// reject an empty password. Redis OSS accepts it.
+	AuthEmptyPassword bool
 
 	// CredentialsProvider allows the username and password to be updated
 	// before reconnecting. It should return the current username and password.
@@ -135,11 +158,15 @@ type Options struct {
 	DialTimeout time.Duration
 
 	// DialerRetries is the maximum number of retry attempts when dialing fails.
+	// A value <= 0 uses the default.
 	//
 	// default: 5
 	DialerRetries int
 
 	// DialerRetryTimeout is the backoff duration between retry attempts.
+	// Values <= 0 use the default; use DialerRetryBackoff to retry without delay.
+	// A URL dialer_retry_timeout=0 sets DialerRetryBackoff, which takes precedence
+	// over this field, including when this field is changed after parsing.
 	//
 	// default: 100 milliseconds
 	DialerRetryTimeout time.Duration
@@ -186,6 +213,144 @@ type Options struct {
 	//
 	// default: 32KiB (32768 bytes)
 	WriteBufferSize int
+
+	// PipelineReadBufferSize is the size of the bufio.Reader buffer for pipeline
+	// connections — the dedicated pipeline pool that serves Pipeline, AutoPipeline
+	// and AsyncAutoPipeline. That pool always exists (see PipelinePoolSize); this
+	// field only sizes its read buffers.
+	//
+	// This allows you to use large buffers for pipelining (to reduce syscalls and improve
+	// throughput) while keeping regular command buffers small (to save memory).
+	//
+	// If not set (0), the pipeline pool's read buffer is the larger of
+	// ReadBufferSize and DefaultPipelineBufferSize (128 KiB). The pipeline pool is
+	// always created and a pipeline uses it whenever it has a free turn; when it
+	// is saturated the pipeline spills to the regular pool without waiting (a
+	// non-blocking TryGet), and that connection has the regular ReadBufferSize.
+	// Size the pipeline pool (PipelinePoolSize) for the pipeline concurrency you
+	// expect if every pipeline must get this buffer.
+	//
+	// Recommended: 64–128 KiB for high-throughput pipelining. The benefit here is
+	// on the READ side: a batch's replies arrive as one large stream, and a bigger
+	// buffer consumes them in fewer syscalls instead of refilling repeatedly
+	// mid-batch. Size it to roughly the reply volume of a typical batch — which
+	// for read-heavy pipelines is dominated by value sizes, not command count.
+	// (The write-side counterpart, sizing to the outgoing wire bytes so the batch
+	// flushes without overflowing mid-write, belongs to PipelineWriteBufferSize.)
+	// Benchmarks show throughput climbs from the 32 KiB default up to ~64 KiB and
+	// then plateaus; going beyond ~128 KiB gives no further gain and very large
+	// buffers (≥512 KiB) can regress throughput and waste memory. Bigger is not
+	// better.
+	//
+	// Example:
+	//   client := redis.NewClient(&redis.Options{
+	//       Addr:                    "localhost:6379",
+	//       ReadBufferSize:          32 * 1024,   // 32 KiB for regular commands
+	//       PipelineReadBufferSize:  128 * 1024,  // 128 KiB for pipelining
+	//       PipelineWriteBufferSize: 128 * 1024,
+	//   })
+	//
+	// Memory impact: With PoolSize=100 and PipelinePoolSize=10:
+	//   - Raising ReadBufferSize to 128 KiB instead: 100 conns × 128 KiB = 12.8 MB
+	//   - Leaving it at 32 KiB, pipeline pool at its 128 KiB default:
+	//     (100 × 32 KiB) + (10 × 128 KiB) = 4.5 MB (~65% savings)
+	//
+	// default: 0 (the larger of ReadBufferSize and DefaultPipelineBufferSize)
+	PipelineReadBufferSize int
+
+	// PipelineWriteBufferSize is the size of the bufio.Writer buffer for pipeline
+	// connections — the dedicated pipeline pool that serves Pipeline, AutoPipeline
+	// and AsyncAutoPipeline. That pool always exists (see PipelinePoolSize); this
+	// field only sizes its write buffers.
+	//
+	// This allows you to use large buffers for pipelining (to reduce syscalls and improve
+	// throughput) while keeping regular command buffers small (to save memory).
+	//
+	// If not set (0), the pipeline pool's write buffer is the larger of
+	// WriteBufferSize and DefaultPipelineBufferSize (128 KiB). As with the read
+	// buffer, a pipeline that finds the pipeline pool saturated spills to the
+	// regular pool without waiting and then writes through the regular
+	// WriteBufferSize; size PipelinePoolSize for your pipeline concurrency if
+	// every pipeline must get this buffer.
+	//
+	// Recommended: 64–128 KiB for high-throughput pipelining (size to roughly
+	// MaxBatchSize × average-command-bytes). Throughput plateaus past ~64 KiB and
+	// gains nothing beyond ~128 KiB; very large buffers (≥512 KiB) can regress it.
+	// See PipelineReadBufferSize for the full rationale.
+	//
+	// default: 0 (the larger of WriteBufferSize and DefaultPipelineBufferSize)
+	PipelineWriteBufferSize int
+
+	// PipelinePoolSize is the pool size for the separate pipeline connection pool.
+	// Setting this alone still sizes the (now always-created) dedicated pipeline
+	// pool; its buffers default to the larger of the regular buffer size and
+	// DefaultPipelineBufferSize (128 KiB), unless PipelineReadBufferSize /
+	// PipelineWriteBufferSize are set.
+	//
+	// Pipelining typically needs fewer connections than regular operations because
+	// batching reduces connection contention. A smaller pool saves memory while
+	// maintaining high throughput.
+	//
+	// The dedicated pipeline pool is created unconditionally at NewClient —
+	// like the pubsub pool — so pipelines never compete with regular commands
+	// for main-pool connections. By default it never pre-dials (it does not
+	// inherit MinIdleConns; see PipelineMinIdleConns), so the size is a cap on
+	// burst capacity, not a standing footprint: an unused pipeline pool holds
+	// zero connections. A burst of
+	// concurrent pipelines wider than the cap spills to the main pool IMMEDIATELY
+	// (a non-blocking TryGet on the pipeline pool) rather than waiting a grace
+	// period — so a saturated pipeline pool never adds latency before falling back,
+	// and DefaultPipelinePoolTimeout does not gate that spill. Its connections use
+	// DefaultPipelineBufferSize buffers unless
+	// the pipeline buffer sizes are set explicitly. It does not inherit
+	// MaxActiveConns: rather than the ~2x total ceiling that inheriting it
+	// verbatim would allow, the pipeline pool adds at most PipelinePoolSize
+	// connections on top of the main pool's MaxActiveConns (so the effective
+	// ceiling is MaxActiveConns + PipelinePoolSize — a small, bounded addition),
+	// and the main pool the burst spills to still enforces MaxActiveConns.
+	//
+	// Set to a negative value to opt out of the dedicated pool entirely:
+	// pipelines then run on the main pool, as they did before the pool
+	// existed.
+	//
+	// default: DefaultPipelinePoolSize (10) connections
+	PipelinePoolSize int
+
+	// PipelineMinIdleConns is the minimum number of idle connections kept in the
+	// dedicated pipeline pool, like MinIdleConns for the main pool. They count
+	// against PipelinePoolSize and are dialed but not initialized (init runs on
+	// first use).
+	//
+	// Creating a full-duplex autopipeliner (AutoPipelineOptions.FullDuplex)
+	// raises it to at least 1 for the rest of the client's life: the engine
+	// holds one pipeline connection for its whole session, so without an idle
+	// spare a replacement after a connection error must dial first. The spare is
+	// added only when it fits: PipelinePoolSize and MaxIdleConns (if set) must
+	// both exceed the number of full-duplex engines (NumShards).
+	//
+	// The spare is replaced when the session connection is returned and leased
+	// again (at least every FullDuplexMaxHold) once it is half-way to
+	// ConnMaxIdleTime or to the end of ConnMaxLifetime, so it does not age out
+	// unused. Keep FullDuplexMaxHold below half of those limits, and below
+	// ConnMaxLifetime minus ConnMaxLifetimeJitter, for that to hold; the
+	// defaults (5s against 30m) do.
+	//
+	// Set a negative value to keep the pool at zero idle connections even with
+	// full-duplex.
+	//
+	// default: 0
+	PipelineMinIdleConns int
+
+	// AutoPipelineOptions is the default config for BOTH autopipeliner faces:
+	// AutoPipeline and AsyncAutoPipeline use it when called without an
+	// explicit config, falling back to their per-face defaults
+	// (DefaultBlockingAutoPipelineOptions / DefaultAutoPipelineOptions) when it
+	// is nil. Pass a config to either method to override. Commands issued
+	// through an autopipeliner are batched into pipelines to cut round-trips
+	// and raise throughput.
+	//
+	// EXPERIMENTAL: this API is subject to change, use with caution.
+	AutoPipelineOptions *AutoPipelineOptions
 
 	// PoolFIFO type of connection pool.
 	//
@@ -234,7 +399,9 @@ type Options struct {
 	// Scope: the limiter paces connections created through the pool — Get()
 	// dials and the MinIdleConns refill. Connections dialed outside the pool's
 	// dial path, such as dedicated pub/sub connections and maintenance-
-	// notification handoff redials, are not paced.
+	// notification handoff redials, are not paced. The limit applies per pool:
+	// the dedicated pipeline pool (see PipelinePoolSize) has its own bucket
+	// with the same DialRateLimit and DialRateBurst.
 	//
 	// The limit is soft under sustained overload: a throttled request that has
 	// waited a full PoolTimeout without obtaining a connection or a token stops
@@ -251,10 +418,25 @@ type Options struct {
 	// default: DialRateLimit
 	DialRateBurst int
 
+	// maxConcurrentDialsSet records whether MaxConcurrentDials was set explicitly
+	// by the caller (>0) BEFORE init() normalized it. init() rewrites a 0 to
+	// PoolSize, which makes an explicit MaxConcurrentDials==PoolSize afterward
+	// indistinguishable from the default; pipelinePoolOptions consults this to
+	// preserve an explicit dial cap for the pipeline pool instead of expanding it.
+	maxConcurrentDialsSet bool
+
+	// maxConcurrentDialsInit latches maxConcurrentDialsSet on the first init().
+	// A caller may reuse one *Options across more than one NewClient call. The
+	// first init() normalizes an unset MaxConcurrentDials (0) to PoolSize, so a
+	// second init() would recompute maxConcurrentDialsSet from the normalized value
+	// and wrongly mark it explicit, which stops the pipeline pool from widening its
+	// dial cap. The latch preserves the first decision. Clones copy both flags.
+	maxConcurrentDialsInit bool
+
 	// PoolTimeout is the amount of time client waits for connection if all connections
 	// are busy before returning an error.
 	//
-	// default: ReadTimeout + 1 second
+	// default: ReadTimeout + 1 second, or 30 seconds when ReadTimeout is not positive
 	PoolTimeout time.Duration
 
 	// MinIdleConns is the minimum number of idle connections which is useful when establishing
@@ -342,6 +524,8 @@ type Options struct {
 
 	// PushNotificationProcessor is the processor for handling push notifications.
 	// If nil, a default processor will be created for RESP3 connections.
+	// With client-side caching, a custom processor runs while an idle connection
+	// is borrowed from the pool and should return promptly.
 	PushNotificationProcessor push.NotificationProcessor
 
 	// FailingTimeoutSeconds is the timeout in seconds for marking a cluster node as failing.
@@ -355,11 +539,250 @@ type Options struct {
 	// transitions seamlessly. Requires Protocol: 3 (RESP3) for push notifications.
 	// If nil, maintnotifications are in "auto" mode and will be enabled if the server supports it.
 	MaintNotificationsConfig *maintnotifications.Config
+
+	// Client-side caching is eventually consistent. A cached value may be
+	// stale until its invalidation arrives, and reads are not guaranteed to
+	// be monotonic: a value observed through an uncached path can be newer
+	// than one a subsequent cached read returns. Applications that require
+	// monotonic reads must not rely on the cache for ordering.
+	// ClientSideCacheConfig enables client-side caching when non-nil. Together
+	// with ClientSideCache it is the on/off switch for the feature: leave both
+	// nil to disable CSC, set either one to enable it. If ClientSideCache is also set, it
+	// takes precedence over this config.
+	//
+	// Client-side caching is disabled when CredentialsProvider,
+	// CredentialsProviderContext, or StreamingCredentialsProvider is set:
+	// provider-backed credentials can change the ACL identity after the cache
+	// namespace is selected. Fixed Username/Password values are supported and
+	// the ACL user they authenticate as is included in the cache namespace.
+	//
+	// Invalidation freshness: a server invalidation is applied when the client
+	// next reads from the connection that carries it — at arrival on a
+	// full-duplex autopipeline connection, at the next command on an active
+	// connection, and at the next background drainer tick on an idle pooled
+	// connection. In every case a cached entry is never served past the cache's
+	// MaxStaleness, which is the hard upper bound.
+	//
+	// Requires the built-in push processor. Setting a custom
+	// PushNotificationProcessor together with CSC is not supported: the
+	// invalidation mechanism relies on the built-in processor to consume
+	// kernel-only readability and tolerate boundary read timeouts, so behavior is
+	// otherwise undefined (the client logs a warning at init in that case).
+	//
+	// Experimental: this API may change in a minor release.
+	ClientSideCacheConfig *ClientSideCacheConfig
+
+	// ClientSideCacheTrackingMode selects the tracking mode for each connection.
+	// The zero value is TrackingModePlain. An invalid value logs a warning and
+	// disables CSC at construction. Requires an enabled client-side cache.
+	// Experimental: this API may change in a minor release.
+	ClientSideCacheTrackingMode TrackingMode
+
+	// ClientSideCacheable selects eligible unmarked calls for caching. It also
+	// applies with a custom Cache. See CacheablePredicate for its callback contract.
+	// Experimental: this API may change in a minor release.
+	ClientSideCacheable CacheablePredicate
+
+	// ClientSideCache is an explicit Cache implementation used for client-side
+	// caching. When set, it overrides the storage settings of ClientSideCacheConfig;
+	// ClientSideCacheTrackingMode and ClientSideCacheable still apply. Intended for
+	// advanced users that want to share a cache across clients or supply a
+	// custom implementation.
+	//
+	// A shared Cache is only safe across clients on the same server and DB.
+	// Clients with different fixed Username/Password values are isolated by a
+	// username namespace.
+	// Client-side caching is restricted to DB 0 and disabled with a warning
+	// otherwise. It is also disabled with any credential provider; see
+	// ClientSideCacheConfig.
+	//
+	// Experimental: this API may change in a minor release.
+	ClientSideCache Cache
+
+	// CommandMetadata configures how the client resolves the COMMAND metadata
+	// that drives client-side-cache eligibility: static (shipped snapshot,
+	// the default), live-upgraded in the background, and per-command
+	// overrides. Nil is the static default.
+	//
+	// Experimental: this API may change in a minor release.
+	CommandMetadata *CommandMetadataConfig
+
+	// onServerHello lets cluster nodes report identity changes to their
+	// parent's metadata store without owning a store or refresh worker.
+	// A nil reply requests verification after a HELLO fallback. The parent
+	// fingerprints the reply only after live metadata has been requested.
+	onServerHello func(map[string]interface{})
+
+	// ClientSideCacheStrategy selects the invalidation architecture used when
+	// client-side caching is enabled (via ClientSideCacheConfig or
+	// ClientSideCache); it is ignored when CSC is disabled. The zero value is
+	// CSCStrategySharedTracking, currently the only implemented strategy.
+	//
+	// Experimental: this API may change in a minor release.
+	ClientSideCacheStrategy CSCStrategy
+
+	// ClientSideCacheRefreshOnInvalidate re-fetches every cached entry of an
+	// invalidated key as soon as its invalidation arrives, instead of waiting for
+	// a reader to miss. It does not look at how recently the entry was read, so
+	// each invalidation of a cached key costs one background read: on a
+	// write-heavy keyspace that is refetch traffic across the whole resident
+	// cache, not only its hot part.
+	//
+	// Requires the built-in cache (ClientSideCacheConfig, or ClientSideCache set
+	// to a *LocalCache), like the other CSC knobs: the refresher's hot-entry
+	// collection and publish path are LocalCache-specific. With a custom Cache
+	// implementation the option is ignored.
+	//
+	// Experimental: this API may change in a minor release.
+	ClientSideCacheRefreshOnInvalidate bool
+
+	// ClientSideCacheCoalesceMisses coalesces concurrent cache misses so they
+	// stream on a held tracked full-duplex connection instead of each taking a
+	// pool connection: a lone miss is written immediately (no batching delay —
+	// the caller is waiting), concurrent misses share writes opportunistically,
+	// and new misses go out while earlier replies are still in flight (~1 RTT
+	// per miss, no batch phase-lock). Cuts pool contention and the churn p99
+	// tail at a small pool.
+	//
+	// Requires the built-in cache (ClientSideCacheConfig, or ClientSideCache set
+	// to a *LocalCache): the coalescer's publish path (fetch capture, refresh
+	// integration, hot-entry collection) is LocalCache-specific. With a custom
+	// Cache implementation the option is ignored and every miss fetches on its
+	// caller's connection as usual.
+	//
+	// Pool sizing: under sustained miss traffic the engine holds one pool
+	// connection (released after a 1s idle gap and at the recycle age). Size
+	// PoolSize for that held connection — with PoolSize 1, continuous misses
+	// can make unrelated non-cacheable commands wait on the pool.
+	//
+	// Limiter: a coalescer session holds ONE connection and serves MANY misses on
+	// it, so Options.Limiter is admitted (Allow/ReportResult) once PER SESSION —
+	// per held connection — not per coalesced miss, unlike the plain per-command
+	// path. This is inherent to the held-connection model (a per-miss Allow would
+	// defeat the coalescing and re-admit a connection already held). A caller that
+	// needs strict per-command admission or circuit-breaking should not enable
+	// miss coalescing.
+	//
+	// Experimental: this API may change in a minor release.
+	ClientSideCacheCoalesceMisses bool
+
+	// ClientSideCacheInvalidationBatchWindow coalesces invalidation-driven cache
+	// deletes into windowed background batches instead of applying them inline on
+	// the connection reader. 0 (default) applies invalidations inline. Set it no
+	// larger than the cache MaxStaleness: deferring a delete by up to the window
+	// lets a reader see the pre-invalidation value for up to that long.
+	//
+	// Deferring a delete also defers ORDERING. A caller that reads the key
+	// through a non-cached path -- for example when a miss is shed to the
+	// pooled path -- can observe a newer value than the one a concurrent
+	// in-flight fetch is about to publish, and a later cached read can then
+	// return the older value. Client-side caching is eventually consistent
+	// and does not guarantee monotonic reads; the window widens that envelope,
+	// because a published value stays readable until its invalidation is
+	// APPLIED rather than observed.
+	//
+	// Requires the built-in cache (ClientSideCacheConfig, or ClientSideCache set
+	// to a *LocalCache), like ClientSideCacheCoalesceMisses: the batcher's
+	// hot-entry refresh integration is LocalCache-specific. With a custom Cache
+	// implementation the window is ignored and deletes apply inline.
+	//
+	// Experimental: this API may change in a minor release.
+	ClientSideCacheInvalidationBatchWindow time.Duration
 }
+
+// CSCStrategy selects the client-side caching invalidation architecture. Set via
+// Options.ClientSideCacheStrategy; fixed for the client's lifetime.
+//
+// CSCStrategySharedTracking is currently the only implemented strategy; the type
+// exists as an extension point for additional architectures (e.g. a BCAST sidecar)
+// without a breaking API change.
+//
+// Experimental: this API may change in a minor release.
+type CSCStrategy int
+
+const (
+	// CSCStrategySharedTracking (default, the zero value): one shared cache; every
+	// pool connection runs plain CLIENT TRACKING ON and a background drainer applies
+	// buffered invalidations. Portable (no BCAST), and matches the other Redis clients.
+	CSCStrategySharedTracking CSCStrategy = iota
+)
+
+// DefaultPipelinePoolSize is the pipeline pool size used when
+// PipelinePoolSize is not set. Pipelining batches many commands per round
+// trip, so it needs far fewer connections than regular traffic. The pool is
+// pure burst capacity: by default it never pre-dials idle connections (it does
+// not inherit MinIdleConns; see PipelineMinIdleConns), so an unused pipeline
+// pool holds no connections at all and the size is only a cap — bursts wider
+// than it spill to the main pool.
+const DefaultPipelinePoolSize = 10
+
+// DefaultPipelineBufferSize is the per-connection read/write buffer size for
+// the dedicated pipeline pool when no explicit pipeline buffer size is set
+// (the larger of this and the regular buffer size is used). Pipeline
+// connections move whole batches per round trip, so they earn bigger buffers
+// than regular per-command traffic: measured on the autopipeline engine,
+// throughput plateaus around 64 KiB and gains nothing past ~128 KiB for
+// TYPICAL (small-command) traffic, while very large buffers (>=512 KiB) can
+// regress it.
+//
+// Set to 128 KiB anyway: the extra headroom is not about typical-traffic
+// throughput but about full-duplex's large-payload backpressure guardrail
+// (see MaxBatchBytes's default) — more bufio headroom before a write() to a
+// slow-draining peer blocks widens the margin before that guardrail's cap is
+// reached. The aggregate memory cost stays negligible because the pool this
+// backs holds few connections: the dedicated pipeline pool does not pre-dial by
+// default (DefaultPipelinePoolSize, PipelineMinIdleConns 0), and full-duplex
+// holds one connection per engine plus one idle spare, regardless of pool size.
+const DefaultPipelineBufferSize = 128 * 1024
+
+// DefaultPipelinePoolTimeout caps the dedicated pipeline pool's PoolTimeout.
+// A shorter positive Options.PoolTimeout takes precedence.
+//
+// Ordinary pipelines and native full-duplex sessions without CSC acquire with
+// TryGet. On saturation, they spill to the main pool without waiting for this
+// timeout; that pool uses its own PoolTimeout.
+//
+// Native full-duplex sessions on clients with CSC attached use blocking Get and
+// do not spill to the main pool, whose connections may have tracking enabled.
+// This remains true after CSC serving stops. The timeout bounds the wait for a
+// pool turn and a drainer handoff, not dialing or connection initialization.
+// Lease failures follow the existing retry policy, and Close cancels acquisition.
+const DefaultPipelinePoolTimeout = 100 * time.Millisecond
 
 func (opt *Options) init() {
 	if opt.Addr == "" {
 		opt.Addr = "localhost:6379"
+	}
+	// An unknown strategy would thread the CSC gates inconsistently (e.g. tracking
+	// on with no drainer), serving stale data. Clamp to the only supported value.
+	switch opt.ClientSideCacheStrategy {
+	case CSCStrategySharedTracking:
+	default:
+		internal.Logger.Printf(context.Background(),
+			"redis: unknown ClientSideCacheStrategy %d; falling back to CSCStrategySharedTracking",
+			opt.ClientSideCacheStrategy)
+		opt.ClientSideCacheStrategy = CSCStrategySharedTracking
+	}
+	// Deferring invalidation deletes by more than the cache's MaxStaleness lets a
+	// reader see a value past the point a received invalidation should have evicted
+	// it — beyond the staleness contract. Warn (not clamp): the field is
+	// experimental and a caller may accept it knowingly, but a window larger than
+	// MaxStaleness is almost always a misconfiguration. Checkable for the built-in
+	// cache via its config AND for an injected *LocalCache via its effective bound;
+	// a custom Cache implementation has no MaxStaleness to compare against.
+	if opt.ClientSideCacheInvalidationBatchWindow > 0 {
+		staleness := time.Duration(0)
+		if opt.ClientSideCacheConfig != nil {
+			staleness = opt.ClientSideCacheConfig.MaxStaleness
+		} else if lc, ok := opt.ClientSideCache.(*LocalCache); ok && lc != nil {
+			staleness = lc.effectiveMaxStaleness()
+		}
+		if staleness > 0 && opt.ClientSideCacheInvalidationBatchWindow > staleness {
+			internal.Logger.Printf(context.Background(),
+				"redis: ClientSideCacheInvalidationBatchWindow (%s) exceeds the cache MaxStaleness (%s); "+
+					"invalidations can be deferred past the staleness bound, serving stale values",
+				opt.ClientSideCacheInvalidationBatchWindow, staleness)
+		}
 	}
 	if opt.Network == "" {
 		if strings.HasPrefix(opt.Addr, "/") {
@@ -377,10 +800,20 @@ func (opt *Options) init() {
 	if opt.Protocol < 2 {
 		opt.Protocol = 3
 	}
-	if opt.DialTimeout == 0 {
+	// A duration option is disabled with a value of 0 or less in ParseURL, and
+	// ReadTimeout/WriteTimeout turn that into "no deadline". A negative value
+	// cannot do that for DialTimeout: net.Dialer reads it as a deadline that has
+	// already passed and fails every dial at once, so it has to become 0.
+	if opt.DialTimeout < 0 {
+		opt.DialTimeout = 0
+	} else if opt.DialTimeout == 0 {
 		opt.DialTimeout = 5 * time.Second
 	}
-	if opt.DialerRetries == 0 {
+	// <= 0, not == 0: the pool already treats a nonpositive value as the default
+	// (internal/pool ConnPool.dialConn), so normalize here too — code that
+	// derives a budget from opt.DialerRetries (the miss-coalescer's acquire
+	// deadline) must see the same count the pool will actually use.
+	if opt.DialerRetries <= 0 {
 		opt.DialerRetries = 5
 	}
 	if opt.DialerRetryTimeout == 0 {
@@ -392,6 +825,16 @@ func (opt *Options) init() {
 	if opt.PoolSize == 0 {
 		opt.PoolSize = 10 * runtime.GOMAXPROCS(0)
 	}
+
+	// Record explicit-vs-default BEFORE normalizing (a 0 becomes PoolSize below),
+	// so pipelinePoolOptions can tell an explicit MaxConcurrentDials==PoolSize from
+	// the default. Latch on the FIRST init only: a caller may reuse one *Options
+	// across NewClient calls, and a second init() would see the already-normalized
+	// value and wrongly mark it explicit. Clones copy the latched flags.
+	if !opt.maxConcurrentDialsInit {
+		opt.maxConcurrentDialsSet = opt.MaxConcurrentDials > 0
+		opt.maxConcurrentDialsInit = true
+	}
 	if opt.MaxConcurrentDials <= 0 {
 		opt.MaxConcurrentDials = opt.PoolSize
 	} else if opt.MaxConcurrentDials > opt.PoolSize {
@@ -399,6 +842,13 @@ func (opt *Options) init() {
 	}
 	if opt.ReadBufferSize == 0 {
 		opt.ReadBufferSize = proto.DefaultBufferSize
+	} else if opt.Protocol == 3 && opt.ReadBufferSize < proto.MinRESP3ReadBufferSize {
+		// Too small to hold a push header, the processor would consume frames before
+		// knowing their name and could swallow a Pub/Sub frame. Clamp to the minimum.
+		internal.Logger.Printf(context.Background(),
+			"redis: ReadBufferSize=%d is below the RESP3 minimum %d; clamping.",
+			opt.ReadBufferSize, proto.MinRESP3ReadBufferSize)
+		opt.ReadBufferSize = proto.MinRESP3ReadBufferSize
 	}
 	if opt.WriteBufferSize == 0 {
 		opt.WriteBufferSize = proto.DefaultBufferSize
@@ -455,19 +905,60 @@ func (opt *Options) init() {
 		opt.FailingTimeoutSeconds = 15
 	}
 
-	opt.MaintNotificationsConfig = opt.MaintNotificationsConfig.ApplyDefaultsWithPoolConfig(opt.PoolSize, opt.MaxActiveConns)
-
-	// auto-detect endpoint type if not specified
-	endpointType := opt.MaintNotificationsConfig.EndpointType
-	if endpointType == "" || endpointType == maintnotifications.EndpointTypeAuto {
-		// Auto-detect endpoint type if not specified
-		endpointType = maintnotifications.DetectEndpointType(opt.Addr, opt.TLSConfig != nil)
+	if opt.ClientSideCacheTrackingMode > TrackingModeOptOut {
+		internal.Logger.Printf(context.Background(), "redis: invalid CSC tracking mode %s; caching is disabled", opt.ClientSideCacheTrackingMode)
+		opt.cscDisabled = true
 	}
-	opt.MaintNotificationsConfig.EndpointType = endpointType
+	if opt.cscDisabled {
+		opt.ClientSideCacheConfig = nil
+		opt.ClientSideCache = nil
+		opt.ClientSideCacheTrackingMode = TrackingModePlain
+		opt.ClientSideCacheable = nil
+	}
+
+	if opt.Protocol == 2 && (opt.ClientSideCache != nil || opt.ClientSideCacheConfig != nil) {
+		internal.Logger.Printf(context.Background(),
+			"redis: client-side caching requires Protocol: 3 (RESP3); caching is disabled")
+	}
+
+	// Maintnotifications defaults (handoff workers, queue depth) must cover
+	// every pool the manager hooks, not just the main one: the dedicated
+	// pipeline pool adds up to PipelinePoolSize connections whose handoffs run
+	// through hooks sized from this config (see enableMaintNotificationsUpgrades),
+	// so derive the defaults from the combined connection ceiling.
+	maintPoolSize := opt.PoolSize
+	maintMaxActive := opt.MaxActiveConns
+	if opt.PipelinePoolSize >= 0 {
+		pps := opt.PipelinePoolSize
+		if pps == 0 {
+			pps = DefaultPipelinePoolSize
+		}
+		maintPoolSize += pps
+		if maintMaxActive > 0 {
+			// The pipeline pool sits outside MaxActiveConns; its ceiling is
+			// MaxActiveConns + PipelinePoolSize (see the PipelinePoolSize doc).
+			maintMaxActive += pps
+		}
+	}
+	opt.MaintNotificationsConfig = opt.MaintNotificationsConfig.ApplyDefaultsWithPoolConfig(maintPoolSize, maintMaxActive)
+
+	// skip endpoint detection when maint notifications are disabled.
+	if opt.MaintNotificationsConfig.Mode != maintnotifications.ModeDisabled {
+		endpointType := opt.MaintNotificationsConfig.EndpointType
+		// auto-detect endpoint type if not specified
+		if endpointType == "" || endpointType == maintnotifications.EndpointTypeAuto {
+			endpointType = maintnotifications.DetectEndpointType(opt.Addr, opt.TLSConfig != nil)
+		}
+		opt.MaintNotificationsConfig.EndpointType = endpointType
+	}
 }
 
 func (opt *Options) clone() *Options {
 	clone := *opt
+	if opt.ClientSideCacheConfig != nil {
+		cfg := *opt.ClientSideCacheConfig
+		clone.ClientSideCacheConfig = &cfg
+	}
 
 	// Deep clone MaintNotificationsConfig to avoid sharing between clients
 	if opt.MaintNotificationsConfig != nil {
@@ -499,14 +990,23 @@ var defaultKeepAliveConfig = net.KeepAliveConfig{
 // when none is specified in Options.Dialer.
 func NewDialer(opt *Options) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// ParseURL disables DialTimeout with a value of 0 or less, and init turns
+		// that into 0 ("no deadline"). This dialer is exported and can be built
+		// straight from a parsed Options, without NewClient's clone or init, so it
+		// normalises the value itself: net.Dialer reads a negative timeout as a
+		// deadline that has already passed.
+		timeout := opt.DialTimeout
+		if timeout < 0 {
+			timeout = 0
+		}
 		netDialer := &net.Dialer{
-			Timeout:         opt.DialTimeout,
+			Timeout:         timeout,
 			KeepAliveConfig: defaultKeepAliveConfig,
 		}
 		if opt.TLSConfig == nil {
 			return netDialer.DialContext(ctx, network, addr)
 		}
-		return tls.DialWithDialer(netDialer, network, addr, opt.TLSConfig)
+		return (&tls.Dialer{NetDialer: netDialer, Config: opt.TLSConfig}).DialContext(ctx, network, addr)
 	}
 }
 
@@ -528,6 +1028,11 @@ func NewDialer(opt *Options) func(context.Context, string, string) (net.Conn, er
 //     additionally a plain integer as value (i.e. without unit) is interpreted as seconds
 //   - to disable a duration field, use value less than or equal to 0; to use the default
 //     value, leave the value blank or remove the parameter
+//   - dialer_retry_timeout is an exception: 0 means no retry delay, while negative
+//     values are rejected. Explicit zero sets DialerRetryBackoff to return 0.
+//   - read_buffer_size and write_buffer_size must be non-negative; 0 uses the default.
+//     Invalid negative values are rejected so a configuration typo is not silently
+//     replaced with an unintended default.
 //   - only the last value is interpreted if a parameter is given multiple times
 //   - fields "network", "addr", "username" and "password" can only be set using other
 //     URL attributes (scheme, host, userinfo, resp.), query parameters using these
@@ -667,6 +1172,45 @@ func (o *queryOptions) int(name string) int {
 	return 0
 }
 
+func (o *queryOptions) nonNegativeInt(name string) int {
+	i := o.int(name)
+	if i < 0 && o.err == nil {
+		o.err = fmt.Errorf("redis: invalid %s number: must be non-negative", name)
+	}
+	return i
+}
+
+func (o *queryOptions) dialerRetryTimeout() (time.Duration, func(int) time.Duration) {
+	const name = "dialer_retry_timeout"
+	s := o.string(name)
+	if s == "" {
+		return 0, nil
+	}
+	// Like duration, accept plain integers as seconds. ParseDuration also
+	// rejects overflow rather than letting multiplication wrap to a negative.
+	if _, err := strconv.Atoi(s); err == nil {
+		s += "s"
+	}
+	d, err := time.ParseDuration(s)
+	// Check the sign too: ParseDuration rounds negative fractions of a
+	// nanosecond to zero, but those are still invalid configuration values.
+	if err == nil && strings.HasPrefix(s, "-") {
+		err = errors.New("must be non-negative")
+	}
+	if err != nil {
+		if o.err == nil {
+			o.err = fmt.Errorf("redis: invalid %s duration: %w", name, err)
+		}
+		return 0, nil
+	}
+	if d == 0 {
+		// A zero Options field means unset. Use the backoff callback to retain
+		// an explicit URL zero through client initialization and pool defaults.
+		return 0, func(int) time.Duration { return 0 }
+	}
+	return d, nil
+}
+
 func (o *queryOptions) duration(name string) time.Duration {
 	s := o.string(name)
 	if s == "" {
@@ -732,12 +1276,20 @@ func setupConnParams(u *url.URL, o *Options) (*Options, error) {
 
 	o.Protocol = q.int("protocol")
 	o.ClientName = q.string("client_name")
+	o.AuthEmptyPassword = q.bool("auth_empty_password")
 	o.MaxRetries = q.int("max_retries")
 	o.MinRetryBackoff = q.duration("min_retry_backoff")
 	o.MaxRetryBackoff = q.duration("max_retry_backoff")
 	o.DialTimeout = q.duration("dial_timeout")
+	o.DialerRetries = q.int("dialer_retries")
+	o.DialerRetryTimeout, o.DialerRetryBackoff = q.dialerRetryTimeout()
 	o.ReadTimeout = q.duration("read_timeout")
 	o.WriteTimeout = q.duration("write_timeout")
+	o.ContextTimeoutEnabled = q.bool("context_timeout_enabled")
+	o.ReadBufferSize = q.nonNegativeInt("read_buffer_size")
+	o.WriteBufferSize = q.nonNegativeInt("write_buffer_size")
+	o.DisableIdentity = q.bool("disable_identity")
+	o.IdentitySuffix = q.string("identity_suffix")
 	o.PoolFIFO = q.bool("pool_fifo")
 	o.PoolSize = q.int("pool_size")
 	o.PoolTimeout = q.duration("pool_timeout")
@@ -747,6 +1299,13 @@ func setupConnParams(u *url.URL, o *Options) (*Options, error) {
 	o.MaxConcurrentDials = q.int("max_concurrent_dials")
 	o.DialRateLimit = q.int("dial_rate_limit")
 	o.DialRateBurst = q.int("dial_rate_burst")
+	// Pipeline pool (created by default): allow URL-configured clients to opt out
+	// (pipeline_pool_size=-1) or tune it, otherwise these would be rejected as
+	// unexpected options. q.int accepts a negative value.
+	o.PipelinePoolSize = q.int("pipeline_pool_size")
+	o.PipelineMinIdleConns = q.int("pipeline_min_idle_conns")
+	o.PipelineReadBufferSize = q.int("pipeline_read_buffer_size")
+	o.PipelineWriteBufferSize = q.int("pipeline_write_buffer_size")
 	if q.has("conn_max_idle_time") {
 		o.ConnMaxIdleTime = q.duration("conn_max_idle_time")
 	} else {
@@ -760,11 +1319,11 @@ func setupConnParams(u *url.URL, o *Options) (*Options, error) {
 	if q.has("conn_max_lifetime_jitter") {
 		o.ConnMaxLifetimeJitter = min(q.duration("conn_max_lifetime_jitter"), o.ConnMaxLifetime)
 	}
-	if q.err != nil {
-		return nil, q.err
-	}
 	if o.TLSConfig != nil && q.has("skip_verify") {
 		o.TLSConfig.InsecureSkipVerify = q.bool("skip_verify")
+	}
+	if q.err != nil {
+		return nil, q.err
 	}
 
 	// any parameters left?

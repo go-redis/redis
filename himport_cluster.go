@@ -41,7 +41,9 @@ type himportForEach func(ctx context.Context, fn func(ctx context.Context, clien
 // Bounded by the cluster pipeline's attempt budget.
 func (c *ClusterClient) himportRequeueFailedSets(ctx context.Context, cmds []Cmder, failedCmds *cmdsMap) {
 	for _, cmd := range cmds {
-		if set, ok := cmd.(*HImportSetCmd); ok && himportNoSuchFieldset(set.Err()) {
+		// rawErr: runs on the per-node execution goroutine, same
+		// self-deadlock rule as himportAfterBatch.
+		if set, ok := cmd.(*HImportSetCmd); ok && himportNoSuchFieldset(set.rawErr()) {
 			if _, registered := c.himport.lookup(set.fieldsetName); registered {
 				_ = c.mapCmdsByNode(ctx, failedCmds, []Cmder{set})
 			}
@@ -128,6 +130,8 @@ func himportFanOutDiscardAll(ctx context.Context, registry *himportRegistry, for
 // note: the API is experimental and may be subject to change.
 func (c *ClusterClient) HImportPrepare(ctx context.Context, fieldsetName string, fields ...string) *StatusCmd {
 	cmd := NewHImportPrepareCmd(ctx, fieldsetName, fields...)
+	ctx = cscUnmarkedContext(ctx)
+
 	himportFanOutPrepare(ctx, c.himport, c.ForEachMaster, cmd)
 	return &cmd.StatusCmd
 }
@@ -142,6 +146,8 @@ func (c *ClusterClient) HImportPrepare(ctx context.Context, fieldsetName string,
 // note: the API is experimental and may be subject to change.
 func (c *ClusterClient) HImportDiscard(ctx context.Context, fieldsetName string) *IntCmd {
 	cmd := NewHImportDiscardCmd(ctx, fieldsetName)
+	ctx = cscUnmarkedContext(ctx)
+
 	himportFanOutDiscard(ctx, c.himport, c.ForEachMaster, cmd)
 	return &cmd.IntCmd
 }
@@ -156,6 +162,8 @@ func (c *ClusterClient) HImportDiscard(ctx context.Context, fieldsetName string)
 // note: the API is experimental and may be subject to change.
 func (c *ClusterClient) HImportDiscardAll(ctx context.Context) *IntCmd {
 	cmd := NewHImportDiscardAllCmd(ctx)
+	ctx = cscUnmarkedContext(ctx)
+
 	himportFanOutDiscardAll(ctx, c.himport, c.ForEachMaster, cmd)
 	return &cmd.IntCmd
 }

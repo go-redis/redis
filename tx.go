@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/redis/go-redis/v9/internal/pool"
 	"github.com/redis/go-redis/v9/internal/proto"
 )
 
@@ -44,7 +43,7 @@ func (c *Client) newTx() *Tx {
 	tx := Tx{
 		baseClient: baseClient{
 			opt:           c.cloneOpt(), // Clone options under optLock to avoid race with initConn
-			connPool:      pool.NewStickyConnPool(c.connPool),
+			connPool:      c.baseClient.newStickyConnPool(),
 			hooksMixin:    c.hooksMixin.clone(),
 			pushProcessor: c.pushProcessor, // Copy push processor from parent client
 			onClose:       &onCloseHooks{},
@@ -53,8 +52,21 @@ func (c *Client) newTx() *Tx {
 			// prepared on them stay valid after the connections are
 			// returned.
 			himport: c.himport,
+			// Carry the shared eviction hook (not csc: a sticky Tx must not serve
+			// cached reads) so close/reinit hooks on a Watch-initialized conn still
+			// evict from the parent cache.
+			cscPoolHook: c.cscPoolHook,
+			cscActive:   c.cscActive,
+			cscPolicy:   c.cscPolicy,
+			// Carry the parent's streaming-credentials manager so initConn can
+			// create a credentials listener when Watch initializes a fresh
+			// connection (issue #4154).
+			streamingCredentialsManager: c.streamingCredentialsManager,
 		},
 	}
+	// Tx reads are uncached but still OPTOUT-prefix when trackable; share the
+	// parent's CommandMetadata overrides for custom read-only keyed commands.
+	c.baseClient.shareCommandMetadata(&tx.baseClient)
 	tx.init()
 	return &tx
 }
@@ -99,7 +111,8 @@ func (c *Tx) Close(ctx context.Context) error {
 	// WATCH/.../EXEC paths leave nothing to release and avoid the extra round
 	// trip.
 	if c.watchArmed {
-		_ = c.Unwatch(ctx).Err()
+		// Cleanup must not inherit the caller's cache intent.
+		_ = c.Unwatch(cscUnmarkedContext(ctx)).Err()
 	}
 	return c.baseClient.Close()
 }

@@ -86,6 +86,25 @@ type Recorder interface {
 	// consumerName: name of the consumer
 	RecordStreamLag(ctx context.Context, lag time.Duration, cn *pool.Conn, streamName, consumerGroup, consumerName string)
 
+	// RecordMultiDBFailover records a MultiDB (geo-failover) failover from one
+	// member database to another. fromFQDN/toFQDN are host-only database FQDNs,
+	// reason is "automatic" or "manual", and duration is the wall time of the
+	// failover.
+	RecordMultiDBFailover(ctx context.Context, fromFQDN, toFQDN, reason string, duration time.Duration)
+
+	// RecordMultiDBActiveDatabaseChange records a change of the active MultiDB
+	// member database (failover, fallback, or manual selection). fromFQDN/toFQDN
+	// are host-only database FQDNs.
+	RecordMultiDBActiveDatabaseChange(ctx context.Context, fromFQDN, toFQDN string)
+
+	// RecordMultiDBCircuitStateChange records a MultiDB circuit breaker state
+	// transition for the database identified by dbFQDN.
+	RecordMultiDBCircuitStateChange(ctx context.Context, dbFQDN, fromState, toState string)
+
+	// RecordMultiDBHealthCheck records the result of a MultiDB health-check pass
+	// for the database identified by dbFQDN. duration is the wall time of the check.
+	RecordMultiDBHealthCheck(ctx context.Context, dbFQDN string, success bool, duration time.Duration)
+
 	// RecordConnectionCount records a change in connection count (UpDownCounter)
 	// delta: +1 when connection added, -1 when connection removed
 	// state: connection state (e.g., "idle", "used")
@@ -120,6 +139,9 @@ type PoolRegistrar interface {
 }
 
 var (
+	// setRecorderMu serializes SetGlobalRecorder, so the recorder swap and the pool callbacks change together.
+	setRecorderMu sync.Mutex
+
 	// recorderMu protects globalRecorder and operation duration callbacks
 	recorderMu sync.RWMutex
 
@@ -155,18 +177,30 @@ func getRecorder() Recorder {
 	return r
 }
 
+// Enabled reports whether a real recorder is installed. Callers use it to
+// skip metric work whose INPUTS are expensive to obtain — e.g. reading a
+// command's result, which on the async autopipeline face blocks until the
+// command executes.
+func Enabled() bool {
+	_, noop := getRecorder().(noopRecorder)
+	return !noop
+}
+
 // SetGlobalRecorder sets the global recorder (called by Init() in extra/redisotel-native)
 func SetGlobalRecorder(r Recorder) {
-	recorderMu.Lock()
+	setRecorderMu.Lock()
+	defer setRecorderMu.Unlock()
 	if r == nil {
+		// Unregister pool callbacks first so their final deltas reach the current recorder.
+		pool.SetAllMetricCallbacks(nil)
+		recorderMu.Lock()
 		globalRecorder = noopRecorder{}
 		operationDurationCallback = nil
 		pipelineOperationDurationCallback = nil
 		recorderMu.Unlock()
-		// Unregister all pool metric callbacks atomically
-		pool.SetAllMetricCallbacks(nil)
 		return
 	}
+	recorderMu.Lock()
 	globalRecorder = r
 
 	// Register operation duration callbacks
@@ -204,11 +238,13 @@ func SetGlobalRecorder(r Recorder) {
 		ConnectionClosed: func(ctx context.Context, cn *pool.Conn, reason string, err error) {
 			getRecorder().RecordConnectionClosed(ctx, cn, reason, err)
 		},
+		// Uses r, not getRecorder(), so a delta captured before Shutdown reaches the recorder that counted it.
 		ConnectionCount: func(ctx context.Context, delta int, cn *pool.Conn, state string, isPubSub bool) {
-			getRecorder().RecordConnectionCount(ctx, delta, cn, state, isPubSub)
+			r.RecordConnectionCount(ctx, delta, cn, state, isPubSub)
 		},
+		// Uses r, not getRecorder(), so a request's -1 reaches the recorder that got its +1.
 		PendingRequests: func(ctx context.Context, delta int, cn *pool.Conn, poolName string) {
-			getRecorder().RecordPendingRequests(ctx, delta, cn, poolName)
+			r.RecordPendingRequests(ctx, delta, cn, poolName)
 		},
 	})
 }
@@ -243,10 +279,36 @@ func RecordStreamLag(ctx context.Context, lag time.Duration, cn *pool.Conn, stre
 	getRecorder().RecordStreamLag(ctx, lag, cn, streamName, consumerGroup, consumerName)
 }
 
+// RecordMultiDBFailover records a MultiDB failover from one database to another.
+func RecordMultiDBFailover(ctx context.Context, fromFQDN, toFQDN, reason string, duration time.Duration) {
+	getRecorder().RecordMultiDBFailover(ctx, fromFQDN, toFQDN, reason, duration)
+}
+
+// RecordMultiDBActiveDatabaseChange records a change of the active MultiDB database.
+func RecordMultiDBActiveDatabaseChange(ctx context.Context, fromFQDN, toFQDN string) {
+	getRecorder().RecordMultiDBActiveDatabaseChange(ctx, fromFQDN, toFQDN)
+}
+
+// RecordMultiDBCircuitStateChange records a MultiDB circuit breaker state transition.
+func RecordMultiDBCircuitStateChange(ctx context.Context, dbFQDN, fromState, toState string) {
+	getRecorder().RecordMultiDBCircuitStateChange(ctx, dbFQDN, fromState, toState)
+}
+
+// RecordMultiDBHealthCheck records the result of a MultiDB health-check pass.
+func RecordMultiDBHealthCheck(ctx context.Context, dbFQDN string, success bool, duration time.Duration) {
+	getRecorder().RecordMultiDBHealthCheck(ctx, dbFQDN, success, duration)
+}
+
+// NoopRecorder returns the recorder that discards everything. A test that
+// installs a partial recorder embeds it so the methods the test does not
+// care about still have an implementation.
+func NoopRecorder() Recorder { return noopRecorder{} }
+
 type noopRecorder struct{}
 
 func (noopRecorder) RecordOperationDuration(context.Context, time.Duration, Cmder, int, error, *pool.Conn, int) {
 }
+
 func (noopRecorder) RecordPipelineOperationDuration(context.Context, time.Duration, string, int, int, error, *pool.Conn, int) {
 }
 func (noopRecorder) RecordConnectionCreateTime(context.Context, time.Duration, *pool.Conn) {}
@@ -263,13 +325,24 @@ func (noopRecorder) RecordPubSubMessage(context.Context, *pool.Conn, string, str
 
 func (noopRecorder) RecordStreamLag(context.Context, time.Duration, *pool.Conn, string, string, string) {
 }
+
+func (noopRecorder) RecordMultiDBFailover(context.Context, string, string, string, time.Duration) {}
+func (noopRecorder) RecordMultiDBActiveDatabaseChange(context.Context, string, string)            {}
+func (noopRecorder) RecordMultiDBCircuitStateChange(context.Context, string, string, string)      {}
+func (noopRecorder) RecordMultiDBHealthCheck(context.Context, string, bool, time.Duration)        {}
+
 func (noopRecorder) RecordConnectionCount(context.Context, int, *pool.Conn, string, bool) {}
 func (noopRecorder) RecordPendingRequests(context.Context, int, *pool.Conn, string)       {}
 
-// RegisterPools registers connection pools with the global recorder.
-func RegisterPools(connPool pool.Pooler, pubSubPool PubSubPooler, addr string) {
-	// Check if the global recorder implements PoolRegistrar
-	if registrar, ok := globalRecorder.(PoolRegistrar); ok {
+// RegisterPools registers connection pools with the global recorder. pipelinePool
+// is the optional dedicated pipeline connection pool (nil when not configured);
+// it is registered as a regular pool under a "_pipeline" name suffix.
+func RegisterPools(connPool pool.Pooler, pubSubPool PubSubPooler, pipelinePool pool.Pooler, addr string) {
+	// Check if the global recorder implements PoolRegistrar. Read it through
+	// getRecorder: SetGlobalRecorder writes globalRecorder under recorderMu, and
+	// clients are created (and closed) concurrently with telemetry being
+	// installed, so an unlocked read here is a data race -race reports.
+	if registrar, ok := getRecorder().(PoolRegistrar); ok {
 		// Generate a unique ID for this client's pools
 		uniqueID := generateUniqueID()
 
@@ -281,18 +354,27 @@ func RegisterPools(connPool pool.Pooler, pubSubPool PubSubPooler, addr string) {
 			poolName := addr + "_" + uniqueID + "_pubsub"
 			registrar.RegisterPubSubPool(poolName, pubSubPool)
 		}
+		if pipelinePool != nil {
+			poolName := addr + "_" + uniqueID + "_pipeline"
+			registrar.RegisterPool(poolName, pipelinePool)
+		}
 	}
 }
 
-// UnregisterPools removes connection pools from the global recorder
-func UnregisterPools(connPool pool.Pooler, pubSubPool PubSubPooler) {
-	// Check if the global recorder implements PoolRegistrar
-	if registrar, ok := globalRecorder.(PoolRegistrar); ok {
+// UnregisterPools removes connection pools from the global recorder. pipelinePool
+// is the optional dedicated pipeline connection pool (nil when not configured).
+func UnregisterPools(connPool pool.Pooler, pubSubPool PubSubPooler, pipelinePool pool.Pooler) {
+	// Check if the global recorder implements PoolRegistrar (see RegisterPools
+	// for why this goes through getRecorder rather than reading directly).
+	if registrar, ok := getRecorder().(PoolRegistrar); ok {
 		if connPool != nil {
 			registrar.UnregisterPool(connPool)
 		}
 		if pubSubPool != nil {
 			registrar.UnregisterPubSubPool(pubSubPool)
+		}
+		if pipelinePool != nil {
+			registrar.UnregisterPool(pipelinePool)
 		}
 	}
 }

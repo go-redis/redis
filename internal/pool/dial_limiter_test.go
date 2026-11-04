@@ -111,6 +111,48 @@ func TestDialRateLimitReuseShortCircuit(t *testing.T) {
 	p.Put(ctx, r.cn)
 }
 
+// TestDialRateLimitTryGetDoesNotPark verifies that a throttled TryGet keeps its
+// non-blocking contract: it returns ErrPoolTryFull at once (so the caller can
+// spill) instead of parking for a dial token.
+func TestDialRateLimitTryGetDoesNotPark(t *testing.T) {
+	var dials atomic.Int32
+	p := pool.NewConnPool(&pool.Options{
+		Dialer:             countingDialer(&dials),
+		PoolSize:           10,
+		MaxConcurrentDials: 10,
+		DialRateLimit:      1,
+		DialRateBurst:      1,
+		PoolTimeout:        2 * time.Second,
+	})
+	defer p.Close()
+	ctx := context.Background()
+
+	c1, err := p.TryGet(ctx)
+	if err != nil {
+		t.Fatalf("first TryGet failed: %v", err)
+	}
+	defer p.Put(ctx, c1)
+
+	start := time.Now()
+	_, err = p.TryGet(ctx)
+	if err != pool.ErrPoolTryFull {
+		t.Fatalf("throttled TryGet err=%v, want ErrPoolTryFull", err)
+	}
+	if d := time.Since(start); d > 200*time.Millisecond {
+		t.Fatalf("throttled TryGet blocked for %v", d)
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials=%d, want 1", got)
+	}
+	st := p.Stats()
+	if st.RateLimitedDials != 1 {
+		t.Fatalf("RateLimitedDials=%d, want 1", st.RateLimitedDials)
+	}
+	if st.Timeouts != 0 {
+		t.Fatalf("Timeouts=%d, want 0", st.Timeouts)
+	}
+}
+
 // TestDialRateLimitEscapeHatch verifies that when no connection is returned and
 // no token frees up within PoolTimeout, the throttled Get() creates a new
 // connection anyway rather than erroring.

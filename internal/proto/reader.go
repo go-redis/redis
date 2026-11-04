@@ -43,6 +43,10 @@ const (
 
 const Nil = RedisError("redis: nil") // nolint:errname
 
+// ErrInvalidVerbatimString reports a malformed, fully consumed RESP3 verbatim
+// string. Parsing may resume at the next frame.
+var ErrInvalidVerbatimString = errors.New("redis: invalid verbatim string")
+
 type RedisError string
 
 func (e RedisError) Error() string { return string(e) }
@@ -76,6 +80,11 @@ func (r *Reader) Buffered() int {
 	return r.rd.Buffered()
 }
 
+// Size returns the size of the underlying read buffer.
+func (r *Reader) Size() int {
+	return r.rd.Size()
+}
+
 func (r *Reader) Peek(n int) ([]byte, error) {
 	return r.rd.Peek(n)
 }
@@ -99,6 +108,27 @@ func (r *Reader) PeekReplyType() (byte, error) {
 	}
 	return b[0], nil
 }
+
+// ReadAttributeLen consumes a RESP3 attribute header and returns its pair
+// count, leaving the pairs and wrapped reply unread.
+func (r *Reader) ReadAttributeLen() (int, error) {
+	line, err := r.readLine()
+	if err != nil {
+		return 0, err
+	}
+	if line[0] != RespAttr {
+		return 0, fmt.Errorf("redis: can't parse attribute reply: %.100q", line)
+	}
+	return replyLen(line)
+}
+
+// MinRESP3ReadBufferSize is the minimum buffer size used when RESP3 push
+// notifications must be inspected without consuming them.
+const MinRESP3ReadBufferSize = 128
+
+// ErrPushNotificationNameTooLong is returned when the push header does not fit
+// in the bounded peek window. Callers should consume the frame with ReadReply.
+var ErrPushNotificationNameTooLong = errors.New("redis: push notification name exceeds peek window")
 
 // PeekPushNotificationName returns the notification name of the next RESP3
 // push frame without consuming it. The caller is expected to have already
@@ -145,12 +175,15 @@ func (r *Reader) PeekPushNotificationName() (string, error) {
 			return name, nil
 		}
 		if avail >= maxPushHeaderPeek {
-			return "", fmt.Errorf("redis: push notification header exceeds %d bytes", maxPushHeaderPeek)
+			return "", ErrPushNotificationNameTooLong
 		}
 		// Valid but incomplete prefix: the rest of the frame is in flight.
 		// Block for exactly one more byte — the read that delivers it picks
 		// up whatever else has already arrived — then re-parse.
 		if _, err := r.rd.Peek(avail + 1); err != nil {
+			if errors.Is(err, bufio.ErrBufferFull) {
+				return "", ErrPushNotificationNameTooLong
+			}
 			return "", err
 		}
 	}
@@ -402,7 +435,7 @@ func (r *Reader) readVerb(line []byte) (string, error) {
 		return "", err
 	}
 	if len(s) < 4 || s[3] != ':' {
-		return "", fmt.Errorf("redis: can't parse verbatim string reply: %q", line)
+		return "", fmt.Errorf("%w: %q", ErrInvalidVerbatimString, line)
 	}
 	return s[4:], nil
 }
@@ -486,7 +519,7 @@ func (r *Reader) ReadInt() (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		return util.ParseInt([]byte(s), 10, 64)
+		return strconv.ParseInt(s, 10, 64)
 	case RespBigInt:
 		b, err := r.readBigInt(line)
 		if err != nil {
@@ -513,7 +546,7 @@ func (r *Reader) ReadUint() (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
-		return util.ParseUint([]byte(s), 10, 64)
+		return strconv.ParseUint(s, 10, 64)
 	case RespBigInt:
 		b, err := r.readBigInt(line)
 		if err != nil {
@@ -605,10 +638,33 @@ func (r *Reader) ReadStringInto(buf []byte) (int, error) {
 		// bufio.Reader.Read first drains its internal buffer, then for
 		// remaining data larger than its buffer size reads directly from the
 		// underlying reader (socket) — effectively zero-copy.
+		//
+		// Fast path: when the caller VISIBLY hands over room for the trailing
+		// CRLF too (len(buf) >= n+2), read the payload and the CRLF in a
+		// single io.ReadFull. For large values this is one direct socket read
+		// instead of a big read followed by a tiny separate Discard(2) read,
+		// which is what makes GetToBuffer beat a regular Get (no payload
+		// allocation and the same number of reads). The 2 trailing bytes land
+		// past the returned length and are ignored.
+		//
+		// The gate is on len, NOT cap: a sub-slice of a larger buffer (e.g.
+		// packed segments big[i*slot:(i+1)*slot]) exposes trailing capacity
+		// that belongs to the caller's NEXT segment — writing the CRLF there
+		// would silently corrupt caller-owned memory outside the slice they
+		// passed. Callers who want the fast path pass len == payload+2 (the
+		// returned length is still the payload length).
+		if len(buf) >= n+2 {
+			full := buf[:n+2]
+			if _, err := io.ReadFull(r.rd, full); err != nil {
+				return 0, err
+			}
+			return n, nil
+		}
+		// Slow path: buffer is exactly large enough for the payload only, so
+		// read the payload into it and discard the CRLF separately.
 		if _, err := io.ReadFull(r.rd, buf[:n]); err != nil {
 			return 0, err
 		}
-		// Discard trailing \r\n.
 		if _, err := r.rd.Discard(2); err != nil {
 			return 0, err
 		}
@@ -664,7 +720,12 @@ func (r *Reader) ReadSlice() ([]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return r.readSlice(line)
+	switch line[0] {
+	case RespArray, RespSet, RespPush:
+		return r.readSlice(line)
+	default:
+		return nil, fmt.Errorf("redis: can't parse array/set/push reply: %.100q", line)
+	}
 }
 
 // ReadFixedArrayLen read fixed array length.
