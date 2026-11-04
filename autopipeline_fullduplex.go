@@ -1696,11 +1696,9 @@ func (fd *fdEngine) session(bg context.Context, cn *pool.Conn, carry []fdReq) (u
 	go func() {
 		defer close(readerDone)
 		// The reader's goroutine id, for reportReplyMetrics' executor guard: read
-		// once here, not once per reply.
-		var readerGid int64
-		if otel.GetOperationDurationCallback() != nil {
-			readerGid = curGoroutineID()
-		}
+		// once here, not once per reply. Read it even without a duration callback:
+		// metrics may be enabled after the session starts.
+		readerGid := curGoroutineID()
 		// done counts commands completed in the CURRENT frontBatch snapshot that
 		// have not yet been advanced out of the in-flight deque; it is 0 outside the
 		// inner read loop (reset at the top of each iteration, advanced at the end).

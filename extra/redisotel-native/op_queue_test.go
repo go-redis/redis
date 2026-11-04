@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric"
@@ -134,25 +135,45 @@ func opQueueWorkers() int {
 	return strings.Count(string(buf), "(*opQueue).run(")
 }
 
+// waitOpQueueWorkers polls until want workers run: a new worker may not have
+// entered run yet, and a stopped one may still be leaving it.
+func waitOpQueueWorkers(t *testing.T, want int, when string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := opQueueWorkers()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %d workers, want %d", when, got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestOpQueueWorkerEndsOnShutdown: Init starts one worker and Shutdown ends it.
 func TestOpQueueWorkerEndsOnShutdown(t *testing.T) {
 	mp := metric.NewMeterProvider(metric.WithReader(metric.NewManualReader()))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 	inst := GetObservabilityInstance()
 	_ = inst.Shutdown()
+	// Let workers of earlier tests finish leaving run before taking the baseline.
 	before := opQueueWorkers()
+	for i := 0; i < 50; i++ {
+		time.Sleep(time.Millisecond)
+		if n := opQueueWorkers(); n != before {
+			before, i = n, 0
+		}
+	}
 	for i := 0; i < 3; i++ {
 		if err := inst.Init(NewConfig().WithEnabled(true).WithMeterProvider(mp)); err != nil {
 			t.Fatal(err)
 		}
-		if got := opQueueWorkers(); got != before+1 {
-			t.Fatalf("after Init: %d workers, want %d", got, before+1)
-		}
+		waitOpQueueWorkers(t, before+1, "after Init")
 		if err := inst.Shutdown(); err != nil {
 			t.Fatal(err)
 		}
-		if got := opQueueWorkers(); got != before {
-			t.Fatalf("after Shutdown: %d workers, want %d", got, before)
-		}
+		waitOpQueueWorkers(t, before, "after Shutdown")
 	}
 }
