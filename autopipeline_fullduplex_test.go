@@ -3803,7 +3803,7 @@ func TestFDReportReplyMetricsRecoversCallbackPanic(t *testing.T) {
 			}
 		}()
 		// A non-nil error routes to the panicking error callback.
-		fd.reportReplyMetrics(context.Background(), req, errors.New("WRONGTYPE Operation"), nil)
+		fd.reportReplyMetrics(context.Background(), req, errors.New("WRONGTYPE Operation"), nil, 0)
 	}()
 
 	if calls.Load() != 1 {
@@ -3828,7 +3828,7 @@ func TestFDReportReplyMetricsNilReplyType(t *testing.T) {
 	fd := &fdEngine{client: &Client{baseClient: &baseClient{opt: &Options{}}}}
 	req := fdReq{cmd: NewStringCmd(context.Background(), "get", "k"), attempts: 1}
 
-	fd.reportReplyMetrics(context.Background(), req, Nil, nil)
+	fd.reportReplyMetrics(context.Background(), req, Nil, nil, 0)
 	if got := gotType.Load(); got != "NIL" || gotInternal.Load() {
 		t.Fatalf("errorType = %v, internal = %v, want NIL, false", got, gotInternal.Load())
 	}
@@ -3999,7 +3999,7 @@ func TestFDReportReplyMetricsDurationCallbackNoDeadlock(t *testing.T) {
 		// e == nil exercises the duration callback (the blocking-view path). The
 		// batch is deliberately left open, matching the real order where
 		// reportReplyMetrics runs before req.complete().
-		fd.reportReplyMetrics(ctx, req, nil, nil)
+		fd.reportReplyMetrics(ctx, req, nil, nil, 0)
 	}()
 
 	select {
@@ -7657,5 +7657,119 @@ func TestPipelineMinIdleConnsWithoutFD(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if n := def.loadPipelinePool().pool.IdleLen(); n != 0 {
 		t.Fatalf("default pipeline IdleLen = %d, want 0", n)
+	}
+}
+
+// TestFDReaderDurationCallbackReadsOwnCommand runs the real reader with a duration
+// callback that reads its own command: the reader registers itself as the batch's
+// executor with the goroutine id it read once at session start, so the read must
+// return the just-set view instead of wedging the reader.
+func TestFDReaderDurationCallbackReadsOwnCommand(t *testing.T) {
+	if err := probeRedis(internalTestRedisAddr()); err != nil {
+		t.Skipf("no redis: %v", err)
+	}
+	rec := &fdBlockingDurationRecorder{}
+	otel.SetGlobalRecorder(rec)
+	defer otel.SetGlobalRecorder(nil)
+
+	ctx := context.Background()
+	client := NewClient(&Options{Addr: internalTestRedisAddr(), Protocol: 3})
+	defer client.Close()
+	for _, async := range []bool{false, true} {
+		var ap *AutoPipeliner
+		var err error
+		if async {
+			ap, err = client.AsyncAutoPipelineWithOptions(&AutoPipelineOptions{FullDuplex: true})
+		} else {
+			ap, err = client.AutoPipelineWithOptions(&AutoPipelineOptions{FullDuplex: true})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := rec.called.Load()
+		done := make(chan error, 1)
+		go func() {
+			cmds := make([]*StatusCmd, 200)
+			for i := range cmds {
+				cmds[i] = ap.Set(ctx, "fd-reader-gid", i, 0)
+			}
+			for _, c := range cmds {
+				if err := c.Err(); err != nil {
+					done <- err
+					return
+				}
+			}
+			done <- nil
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("async=%v: %v", async, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("async=%v: commands did not complete: a duration callback reading its own command wedged the reader", async)
+		}
+		if got := rec.called.Load() - before; got < 200 {
+			t.Fatalf("async=%v: duration callback invoked %d times, want at least 200", async, got)
+		}
+		if v, _ := rec.gotErr.Load().(string); v != "" {
+			t.Fatalf("async=%v: callback saw cmd.Err() = %q, want \"\"", async, v)
+		}
+		_ = ap.Close()
+	}
+}
+
+// TestFDReaderLateDurationCallbackReadsOwnCommand: the session starts before the
+// duration callback is registered (metrics enabled later); the reader's executor
+// guard still uses its session goroutine id, so a callback reading its own
+// command does not wedge the reader.
+func TestFDReaderLateDurationCallbackReadsOwnCommand(t *testing.T) {
+	if err := probeRedis(internalTestRedisAddr()); err != nil {
+		t.Skipf("no redis: %v", err)
+	}
+	otel.SetGlobalRecorder(nil)
+	ctx := context.Background()
+	client := NewClient(&Options{Addr: internalTestRedisAddr(), Protocol: 3})
+	defer client.Close()
+	ap, err := client.AsyncAutoPipelineWithOptions(&AutoPipelineOptions{FullDuplex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ap.Close()
+	if err := ap.Set(ctx, "fd-reader-gid-late", 0, 0).Err(); err != nil {
+		t.Fatal(err) // the session is up, with no callback registered
+	}
+
+	rec := &fdBlockingDurationRecorder{}
+	otel.SetGlobalRecorder(rec)
+	defer otel.SetGlobalRecorder(nil)
+
+	done := make(chan error, 1)
+	go func() {
+		cmds := make([]*StatusCmd, 200)
+		for i := range cmds {
+			cmds[i] = ap.Set(ctx, "fd-reader-gid-late", i, 0)
+		}
+		for _, c := range cmds {
+			if err := c.Err(); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("commands did not complete: a late duration callback reading its own command wedged the reader")
+	}
+	if got := rec.called.Load(); got < 200 {
+		t.Fatalf("duration callback invoked %d times, want at least 200", got)
+	}
+	if v, _ := rec.gotErr.Load().(string); v != "" {
+		t.Fatalf("callback saw cmd.Err() = %q, want \"\"", v)
 	}
 }

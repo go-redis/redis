@@ -1195,8 +1195,11 @@ func (fd *fdEngine) emitMetricsGuarded(octx context.Context, emit func()) {
 // callbacks (OTel operation-duration; native error callback for a non-retryable
 // Redis error, reporting attempts-1 retries like processWithRetry) for parity
 // with the process() path the FD reader bypasses. Guarded by emitMetricsGuarded
-// (panic containment; see there).
-func (fd *fdEngine) reportReplyMetrics(octx context.Context, req fdReq, e error, cn *pool.Conn) {
+// (panic containment; see there). gid is the calling goroutine's id, or 0 to
+// resolve it here: the reader passes its own, read once per session, because
+// curGoroutineID (runtime.Stack) once per reply capped the reader at about a
+// tenth of its throughput with OTel metrics on.
+func (fd *fdEngine) reportReplyMetrics(octx context.Context, req fdReq, e error, cn *pool.Conn, gid int64) {
 	fd.emitMetricsGuarded(octx, func() {
 		if cb := otel.GetOperationDurationCallback(); cb != nil {
 			// The reader has set req.cmd's final result but has NOT completed the
@@ -1210,11 +1213,13 @@ func (fd *fdEngine) reportReplyMetrics(octx context.Context, req fdReq, e error,
 			// this SAME batch from submit, so one registration covers the hook and
 			// hook-free async faces alike. NOT moved after complete(): complete()
 			// hands off to the hook host, which may rewrite/free the command, racing
-			// the callback's read. The curGoroutineID() cost is paid only when a
-			// duration callback is registered.
+			// the callback's read.
 			if req.batch != nil {
-				unregister := req.batch.enterNodeDispatch()
-				defer unregister()
+				if gid == 0 {
+					gid = curGoroutineID()
+				}
+				req.batch.addExecutor(gid)
+				defer req.batch.removeExecutor(gid)
 			}
 			cb(octx, fd.sinceWritten(req.writtenOff), req.cmd, req.attempts, e, cn, fd.client.opt.DB)
 		}
@@ -1909,6 +1914,10 @@ func (fd *fdEngine) session(bg context.Context, cn *pool.Conn, carry []fdReq) (u
 	// leaves the unread tail in the deque (it becomes the unacked recovery set).
 	go func() {
 		defer close(readerDone)
+		// The reader's goroutine id, for reportReplyMetrics' executor guard: read
+		// once here, not once per reply. Read it even without a duration callback:
+		// metrics may be enabled after the session starts.
+		readerGid := curGoroutineID()
 		// done counts commands completed in the CURRENT frontBatch snapshot that
 		// have not yet been advanced out of the in-flight deque; it is 0 outside the
 		// inner read loop (reset at the top of each iteration, advanced at the end).
@@ -2125,7 +2134,7 @@ func (fd *fdEngine) session(bg context.Context, cn *pool.Conn, carry []fdReq) (u
 						req.batch.fdAttempts = req.attempts // published by complete()
 						req.batch.fdConn = cn
 					} else {
-						fd.reportReplyMetrics(octx, req, e, cn)
+						fd.reportReplyMetrics(octx, req, e, cn, readerGid)
 					}
 					fd.finish(req) // wake the caller, or hand off to the hook host
 					done++
@@ -3621,7 +3630,7 @@ func (fd *fdEngine) flushReqsVia(bg context.Context, reqs []fdReq, maxRetries in
 				if octx == nil {
 					octx = bg
 				}
-				fd.reportReplyMetrics(octx, reqs[j], reqs[j].cmd.rawErr(), nil)
+				fd.reportReplyMetrics(octx, reqs[j], reqs[j].cmd.rawErr(), nil, 0)
 			}
 			if account {
 				fd.finish(reqs[j])
