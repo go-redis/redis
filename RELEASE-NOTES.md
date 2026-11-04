@@ -5,8 +5,9 @@
 - **Connection handshake and `Options.Limiter`:** the handshake of a new
   connection (`HELLO`, `AUTH`, `SELECT`, `CLIENT SETINFO`,
   `CLIENT MAINT_NOTIFICATIONS`) no longer calls `Limiter.Allow` per command. The
-  command that dials pays one admission and reports the handshake result once, and
-  so do the commands an `OnConnect` callback sends on that connection. A PubSub
+  command that dials pays one admission and reports the handshake result once;
+  that admission also covers the commands an `OnConnect` callback sends on the
+  connection. A PubSub
   connection, a reconnect after a maintenance handoff, and a fresh full-duplex
   session each pay one admission for their handshake. Before, a circuit breaker in
   the half-open state spent its probe budget on the handshake and never closed.
