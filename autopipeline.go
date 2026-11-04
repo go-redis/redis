@@ -1877,7 +1877,7 @@ func (ap *AutoPipeliner) HImportDiscardAll(ctx context.Context) *IntCmd {
 // ClientTracking and friends are per-connection commands (statefulCmdable);
 // through the autopipeliner they fail with guidance exactly as on the
 // underlying pooled client — a batch executes on an arbitrary pool
-// connection. Use a dedicated connection (Client.Conn) or the built-in
+// connection. Use a dedicated connection (Client.EphemeralConn) or the built-in
 // client-side cache. On a closed autopipeliner they return ErrClosed, like
 // every other dispatch path.
 func (ap *AutoPipeliner) ClientTracking(ctx context.Context, on bool, opt *ClientTrackingOptions) *StatusCmd {
