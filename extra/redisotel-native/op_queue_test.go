@@ -10,10 +10,10 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-func newTestOpQueue(t *testing.T) (*opQueue, *metric.ManualReader) {
+func newTestOpQueue(t *testing.T, opts ...metric.Option) (*opQueue, *metric.ManualReader) {
 	t.Helper()
 	reader := metric.NewManualReader()
-	mp := metric.NewMeterProvider(metric.WithReader(reader))
+	mp := metric.NewMeterProvider(append([]metric.Option{metric.WithReader(reader)}, opts...)...)
 	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
 	meter := mp.Meter("test")
 	h, err := meter.Float64Histogram(MetricOperationDuration)
@@ -114,6 +114,7 @@ func TestOpQueueConcurrentRecordAndCollect(t *testing.T) {
 // after stop is recorded on the caller's goroutine.
 func TestOpQueueStopRecordsQueued(t *testing.T) {
 	q, reader := newTestOpQueue(t)
+	collect(t, reader) // the first Collect turns the queue on
 	set := attribute.NewSet(attribute.String(AttrDBOperationName, "get"))
 	for i := 0; i < 1000; i++ {
 		q.record(context.Background(), 0.001, set)
@@ -153,5 +154,43 @@ func TestOpQueueWorkerEndsOnShutdown(t *testing.T) {
 		default:
 			t.Fatal("worker still running after Shutdown")
 		}
+	}
+}
+
+// TestOpQueueStartsAfterFirstCollect: samples are recorded inline until a
+// Collect has run the drain callback, then they are queued.
+func TestOpQueueStartsAfterFirstCollect(t *testing.T) {
+	q, reader := newTestOpQueue(t)
+	if q.active.Load() {
+		t.Fatal("queue on before any Collect")
+	}
+	collect(t, reader)
+	if !q.active.Load() {
+		t.Fatal("queue still off after a Collect")
+	}
+}
+
+// TestOpQueueDroppedGaugeRecordsInline: a View that drops the queue's gauge
+// leaves no drain callback, so the queue stays off and Collect still counts
+// every sample.
+func TestOpQueueDroppedGaugeRecordsInline(t *testing.T) {
+	drop := metric.NewView(
+		metric.Instrument{Name: "redis.client.internal.*"},
+		metric.Stream{Aggregation: metric.AggregationDrop{}},
+	)
+	q, reader := newTestOpQueue(t, metric.WithView(drop))
+	set := attribute.NewSet(attribute.String(AttrDBOperationName, "get"))
+	var want uint64
+	for round := 0; round < 20; round++ {
+		for i := 0; i < 500; i++ {
+			q.record(context.Background(), 0.001, set)
+		}
+		want += 500
+		if got, _ := collect(t, reader); got != want {
+			t.Fatalf("round %d: collected %d samples, want %d", round, got, want)
+		}
+	}
+	if q.active.Load() {
+		t.Fatal("queue turned on with its gauge dropped")
 	}
 }

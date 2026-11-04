@@ -3,6 +3,7 @@ package redisotel
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -24,12 +25,12 @@ type opSample struct {
 //
 // A Collect still sees every sample queued before it began: the callback
 // registered in newOpQueue runs before the SDK aggregates, waits for the batch
-// the worker is recording (rmu), and records what is left. If a view drops the
-// internal gauge, the SDK skips the callback; the worker still records each
-// batch as it arrives, so a sample queued just before a Collect lands in the
-// next one.
+// the worker is recording (rmu), and records what is left. The queue is used
+// only after that callback has run once: a View can drop the callback's gauge,
+// and then samples are recorded on the caller's goroutine, as without a queue.
 type opQueue struct {
-	hist metric.Float64Histogram
+	hist   metric.Float64Histogram
+	active atomic.Bool // the drain callback has run: Collect drains the queue
 
 	qmu     sync.Mutex
 	buf     []opSample
@@ -59,6 +60,7 @@ func newOpQueue(meter metric.Meter, hist metric.Float64Histogram) (*opQueue, err
 		return nil, err
 	}
 	reg, err := meter.RegisterCallback(func(context.Context, metric.Observer) error {
+		q.active.Store(true)
 		q.flush()
 		return nil
 	}, gauge)
@@ -70,11 +72,11 @@ func newOpQueue(meter metric.Meter, hist metric.Float64Histogram) (*opQueue, err
 	return q, nil
 }
 
-// record queues a sample, or records it here when the queue is busy (another
-// goroutine holds it: concurrent callers record in parallel, as before), full,
-// or stopped.
+// record queues a sample, or records it here when no Collect has drained the
+// queue yet, the queue is busy (another goroutine holds it: concurrent callers
+// record in parallel, as before), full, or stopped.
 func (q *opQueue) record(ctx context.Context, v float64, set attribute.Set) {
-	if !q.qmu.TryLock() {
+	if !q.active.Load() || !q.qmu.TryLock() {
 		q.hist.Record(ctx, v, metric.WithAttributeSet(set))
 		return
 	}
