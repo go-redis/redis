@@ -2,6 +2,8 @@ package redisotel
 
 import (
 	"context"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -122,5 +124,35 @@ func TestOpQueueStopRecordsQueued(t *testing.T) {
 	q.record(context.Background(), 0.001, set)
 	if got, _ := collect(t, reader); got != 1001 {
 		t.Fatalf("collected %d samples, want 1001", got)
+	}
+}
+
+// opQueueWorkers counts goroutines in the queue's worker loop.
+func opQueueWorkers() int {
+	buf := make([]byte, 1<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	return strings.Count(string(buf), "(*opQueue).run(")
+}
+
+// TestOpQueueWorkerEndsOnShutdown: Init starts one worker and Shutdown ends it.
+func TestOpQueueWorkerEndsOnShutdown(t *testing.T) {
+	mp := metric.NewMeterProvider(metric.WithReader(metric.NewManualReader()))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+	inst := GetObservabilityInstance()
+	_ = inst.Shutdown()
+	before := opQueueWorkers()
+	for i := 0; i < 3; i++ {
+		if err := inst.Init(NewConfig().WithEnabled(true).WithMeterProvider(mp)); err != nil {
+			t.Fatal(err)
+		}
+		if got := opQueueWorkers(); got != before+1 {
+			t.Fatalf("after Init: %d workers, want %d", got, before+1)
+		}
+		if err := inst.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+		if got := opQueueWorkers(); got != before {
+			t.Fatalf("after Shutdown: %d workers, want %d", got, before)
+		}
 	}
 }

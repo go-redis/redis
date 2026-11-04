@@ -211,12 +211,6 @@ func (o *ObservabilityInstance) createRecorder(meter metric.Meter, cfg config) (
 		}
 		operationDuration = operationDurationConv.Inst()
 	}
-	var opq *opQueue
-	if operationDuration != nil {
-		if opq, err = newOpQueue(meter, operationDuration); err != nil {
-			return nil, fmt.Errorf("failed to create operation duration queue: %w", err)
-		}
-	}
 
 	var connectionCount metric.Int64UpDownCounter // OTel semconv: UpDownCounter
 	var connectionCreateTime metric.Float64Histogram
@@ -422,6 +416,15 @@ func (o *ObservabilityInstance) createRecorder(meter metric.Meter, cfg config) (
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create multidb health check duration histogram: %w", err)
+		}
+	}
+
+	// The queue starts a goroutine: create it last, after every instrument
+	// above succeeded, so a failed Init leaves nothing running.
+	var opq *opQueue
+	if operationDuration != nil {
+		if opq, err = newOpQueue(meter, operationDuration); err != nil {
+			return nil, fmt.Errorf("failed to create operation duration queue: %w", err)
 		}
 	}
 
