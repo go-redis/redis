@@ -28,6 +28,11 @@ type opSample struct {
 // the worker is recording (rmu), and records what is left. The queue is used
 // only after that callback has run once: a View can drop the callback's gauge,
 // and then samples are recorded on the caller's goroutine, as without a queue.
+//
+// Not covered: with several readers on one provider, a reader that drops the
+// gauge (its own View or aggregation selector) while keeping the histogram
+// runs no callback. Its Collect can miss samples the worker has not recorded
+// yet; they land in its next Collect, and Shutdown records what is queued.
 type opQueue struct {
 	hist   metric.Float64Histogram
 	active atomic.Bool // the drain callback has run: Collect drains the queue
