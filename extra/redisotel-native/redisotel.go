@@ -137,6 +137,9 @@ func (o *ObservabilityInstance) shutdownLocked() error {
 	}
 
 	redis.SetOTelRecorder(nil)
+	if o.recorder != nil && o.recorder.opq != nil {
+		o.recorder.opq.stop() // record what is queued
+	}
 
 	// Note: We don't shutdown the MeterProvider since it's owned by the application
 	// The application should call provider.Shutdown() when appropriate
@@ -207,6 +210,12 @@ func (o *ObservabilityInstance) createRecorder(meter metric.Meter, cfg config) (
 			return nil, fmt.Errorf("failed to create operation duration histogram: %w", err)
 		}
 		operationDuration = operationDurationConv.Inst()
+	}
+	var opq *opQueue
+	if operationDuration != nil {
+		if opq, err = newOpQueue(meter, operationDuration); err != nil {
+			return nil, fmt.Errorf("failed to create operation duration queue: %w", err)
+		}
 	}
 
 	var connectionCount metric.Int64UpDownCounter // OTel semconv: UpDownCounter
@@ -418,6 +427,7 @@ func (o *ObservabilityInstance) createRecorder(meter metric.Meter, cfg config) (
 
 	// Create recorder
 	recorder := &metricsRecorder{
+		opq:                      opq,
 		operationDuration:        operationDuration,
 		connectionCount:          connectionCount,
 		connectionCreateTime:     connectionCreateTime,

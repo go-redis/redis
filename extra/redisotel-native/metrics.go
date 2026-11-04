@@ -75,6 +75,10 @@ type metricsRecorder struct {
 	// attribute.Set); opAttrsLen counts its inserts since the last clear.
 	opAttrs    sync.Map
 	opAttrsLen atomic.Int64
+
+	// opq records success-path operation durations off the caller's goroutine
+	// (op_queue.go); nil records them inline.
+	opq *opQueue
 }
 
 // RecordOperationDuration records db.client.operation.duration metric
@@ -99,11 +103,9 @@ func (r *metricsRecorder) RecordOperationDuration(
 	// Convert duration to seconds (OTel convention for duration metrics)
 	durationSeconds := duration.Seconds()
 
-	var remote string
+	var addr net.Addr
 	if cn != nil {
-		if ra := cn.RemoteAddr(); ra != nil {
-			remote = ra.String()
-		}
+		addr = cn.RemoteAddr()
 	}
 
 	failed := err != nil && !r.skipNilReply(err)
@@ -111,20 +113,33 @@ func (r *metricsRecorder) RecordOperationDuration(
 		// The success-path attributes depend only on the key, so the set is built
 		// once per key instead of once per command. That matters on full duplex,
 		// where every command is recorded on the one reader goroutine.
-		key := opAttrKey{op: cmd.FullName(), remote: remote, attempts: attempts, db: dbIndex}
+		key := opAttrKey{op: cmd.FullName(), attempts: attempts, db: dbIndex}
+		switch addr.(type) {
+		case nil:
+		case *net.TCPAddr, *net.UnixAddr:
+			// A connection returns the same address value every time, so the
+			// pointer is the key and String() is paid once per key, not per command.
+			key.addr = addr
+		default:
+			key.remote = addr.String() // may not be comparable: key by its text
+		}
 		set, ok := r.opAttrs.Load(key)
 		if !ok {
 			if r.opAttrsLen.Add(1) > maxOpAttrSets {
 				r.opAttrs.Clear()
 				r.opAttrsLen.Store(1)
 			}
-			set, _ = r.opAttrs.LoadOrStore(key, attribute.NewSet(operationAttrs(key.op, attempts, remote, dbIndex)...))
+			set, _ = r.opAttrs.LoadOrStore(key, attribute.NewSet(operationAttrs(key.op, attempts, addrString(addr), dbIndex)...))
+		}
+		if r.opq != nil {
+			r.opq.record(ctx, durationSeconds, set.(attribute.Set))
+			return
 		}
 		r.operationDuration.Record(ctx, durationSeconds, metric.WithAttributeSet(set.(attribute.Set)))
 		return
 	}
 
-	attrs := operationAttrs(cmd.FullName(), attempts, remote, dbIndex)
+	attrs := operationAttrs(cmd.FullName(), attempts, addrString(addr), dbIndex)
 	attrs = append(attrs, attribute.String(AttrErrorType, classifyError(err)))
 	attrs = append(attrs, attribute.String(AttrRedisClientErrorsCategory, getErrorCategory(err)))
 	if statusCode := extractRedisErrorPrefix(err); statusCode != "" {
@@ -140,13 +155,22 @@ func (r *metricsRecorder) RecordOperationDuration(
 const maxOpAttrSets = 4096
 
 // opAttrKey is everything the success-path operation attributes are built from.
-// remote is the connection's RemoteAddr().String(), not the connection, so the
-// cache keeps no closed connection reachable.
+// The connection's remote address is addr (a *net.TCPAddr or *net.UnixAddr) or
+// else remote, its String(); never the connection, so the cache keeps no closed
+// connection reachable.
 type opAttrKey struct {
 	op       string
+	addr     net.Addr
 	remote   string
 	attempts int
 	db       int
+}
+
+func addrString(a net.Addr) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
 }
 
 // operationAttrs is db.client.operation.duration's attributes without the
