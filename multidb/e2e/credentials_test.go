@@ -129,6 +129,35 @@ func clientInfo(t *testing.T, ctx context.Context, mdb *redis.MultiDBClient) (id
 	return id, user
 }
 
+// serverUsers returns the user of each connection in ids that the server
+// still has, read with CLIENT LIST ID through admin.
+func serverUsers(t *testing.T, ctx context.Context, admin *redis.Client, ids map[string]bool) map[string]string {
+	t.Helper()
+	args := []interface{}{"CLIENT", "LIST", "ID"}
+	for id := range ids {
+		args = append(args, id)
+	}
+	list, err := admin.Do(ctx, args...).Text()
+	if err != nil {
+		t.Fatalf("CLIENT LIST ID: %v", err)
+	}
+	users := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(list), "\n") {
+		var id, user string
+		for _, f := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(f, "id="); ok {
+				id = v
+			} else if v, ok := strings.CutPrefix(f, "user="); ok {
+				user = v
+			}
+		}
+		if id != "" {
+			users[id] = user
+		}
+	}
+	return users
+}
+
 const (
 	tokenUserA = "e2e-token-a"
 	tokenUserB = "e2e-token-b"
@@ -167,12 +196,18 @@ func TestStreamingCredentialsRotateAndFailover(t *testing.T) {
 	}
 
 	// Rotate: the pushed token re-authenticates the open connections. A
-	// connection opened after the rotation would get the new token anyway,
-	// so the check needs a connection that existed before it.
+	// connection opened after the rotation gets the new token anyway, so the
+	// check needs a connection that existed before it. Re-auth runs in the
+	// background and the pool may hand out a newer connection afterwards, so
+	// read the old connections' users on the server instead of through mdb.
 	p.rotate(tokenUserB, "token-b")
 	eventually(t, 10*time.Second, "a pre-rotation connection re-authenticated with the rotated token", func() bool {
-		id, user := clientInfo(t, ctx, mdb)
-		return before[id] && user == tokenUserB
+		for _, user := range serverUsers(t, ctx, admin, before) {
+			if user == tokenUserB {
+				return true
+			}
+		}
+		return false
 	})
 	if !whoamiIs(ctx, mdb, tokenUserB, 10) {
 		t.Fatal("a connection still uses the old token after the rotation")
