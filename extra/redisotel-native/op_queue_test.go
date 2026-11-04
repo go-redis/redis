@@ -2,11 +2,8 @@ package redisotel
 
 import (
 	"context"
-	"runtime"
-	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric"
@@ -128,52 +125,33 @@ func TestOpQueueStopRecordsQueued(t *testing.T) {
 	}
 }
 
-// opQueueWorkers counts goroutines in the queue's worker loop.
-func opQueueWorkers() int {
-	buf := make([]byte, 1<<20)
-	buf = buf[:runtime.Stack(buf, true)]
-	return strings.Count(string(buf), "(*opQueue).run(")
-}
-
-// waitOpQueueWorkers polls until want workers run: a new worker may not have
-// entered run yet, and a stopped one may still be leaving it.
-func waitOpQueueWorkers(t *testing.T, want int, when string) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		got := opQueueWorkers()
-		if got == want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: %d workers, want %d", when, got, want)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-// TestOpQueueWorkerEndsOnShutdown: Init starts one worker and Shutdown ends it.
+// TestOpQueueWorkerEndsOnShutdown: each Init starts a worker and each Shutdown
+// ends it (the worker closes exit when it returns).
 func TestOpQueueWorkerEndsOnShutdown(t *testing.T) {
 	mp := metric.NewMeterProvider(metric.WithReader(metric.NewManualReader()))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 	inst := GetObservabilityInstance()
 	_ = inst.Shutdown()
-	// Let workers of earlier tests finish leaving run before taking the baseline.
-	before := opQueueWorkers()
-	for i := 0; i < 50; i++ {
-		time.Sleep(time.Millisecond)
-		if n := opQueueWorkers(); n != before {
-			before, i = n, 0
-		}
-	}
 	for i := 0; i < 3; i++ {
 		if err := inst.Init(NewConfig().WithEnabled(true).WithMeterProvider(mp)); err != nil {
 			t.Fatal(err)
 		}
-		waitOpQueueWorkers(t, before+1, "after Init")
+		q := inst.recorder.opq
+		if q == nil {
+			t.Fatal("Init created no queue")
+		}
+		select {
+		case <-q.exit:
+			t.Fatal("worker ended before Shutdown")
+		default:
+		}
 		if err := inst.Shutdown(); err != nil {
 			t.Fatal(err)
 		}
-		waitOpQueueWorkers(t, before, "after Shutdown")
+		select {
+		case <-q.exit:
+		default:
+			t.Fatal("worker still running after Shutdown")
+		}
 	}
 }
