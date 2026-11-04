@@ -934,7 +934,7 @@ func (c *MultiDBClient) AddHook(hook Hook) {
 // to next so MultiDB can track execution. Replacing the context can cause a
 // successful command or batch to be treated as a local answer for accounting.
 //
-//// For a cluster member this installs the hook on the *ClusterClient's own
+// For a cluster member this installs the hook on the *ClusterClient's own
 // process and pipeline chains only. It does not reach the per-node *Client
 // instances the cluster dials internally, so a DialHook never runs for a
 // cluster member's connections. There is currently no MultiDB API to reach
