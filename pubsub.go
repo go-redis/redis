@@ -3,6 +3,8 @@ package redis
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +17,7 @@ import (
 )
 
 // PubSub implements Pub/Sub commands as described in
-// http://redis.io/topics/pubsub. Message receiving is NOT safe
+// https://redis.io/docs/latest/develop/pubsub. Message receiving is NOT safe
 // for concurrent use by multiple goroutines.
 //
 // PubSub automatically reconnects to Redis Server and resubscribes
@@ -35,6 +37,11 @@ type PubSub struct {
 	closed bool
 	exit   chan struct{}
 
+	// stickyErr is set when PubSub is constructed in a failed state (e.g. Ring
+	// shard lookup failure). Subsequent operations return this error instead of
+	// panicking at construction time.
+	stickyErr error
+
 	cmd *Cmd
 
 	chOnce sync.Once
@@ -43,6 +50,12 @@ type PubSub struct {
 
 	// Push notification processor for handling generic push notifications
 	pushProcessor push.NotificationProcessor
+	// processorFor, when set, picks the push processor for a given connection
+	// instead of pushProcessor. MultiDB sets it: the connections of one
+	// PubSub may be owned by different member clients over its lifetime, and
+	// a push must be handled by the processor of the member that owns the
+	// connection it arrived on.
+	processorFor func(*pool.Conn) push.NotificationProcessor
 
 	// Cleanup callback for maintenanceNotifications upgrade tracking
 	onClose func()
@@ -56,9 +69,9 @@ func (c *PubSub) String() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	channels := mapKeys(c.channels)
-	channels = append(channels, mapKeys(c.patterns)...)
-	channels = append(channels, mapKeys(c.schannels)...)
+	channels := slices.Collect(maps.Keys(c.channels))
+	channels = append(channels, slices.Collect(maps.Keys(c.patterns))...)
+	channels = append(channels, slices.Collect(maps.Keys(c.schannels))...)
 	return fmt.Sprintf("PubSub(%s)", strings.Join(channels, ", "))
 }
 
@@ -73,6 +86,9 @@ func (c *PubSub) conn(ctx context.Context, newChannels []string) (*pool.Conn, er
 	if c.closed {
 		return nil, pool.ErrClosed
 	}
+	if c.stickyErr != nil {
+		return nil, c.stickyErr
+	}
 	if c.cn != nil {
 		return c.cn, nil
 	}
@@ -85,7 +101,16 @@ func (c *PubSub) conn(ctx context.Context, newChannels []string) (*pool.Conn, er
 		c.opt.Addr = internal.RedisNull
 	}
 
-	channels := mapKeys(c.channels)
+	// Include c.schannels so reconnect-time routing of an SSubscribe-only
+	// PubSub picks the slot owner (channels[0] in ClusterClient.pubSub()'s
+	// newConn closure) instead of a random node.
+	// See https://github.com/redis/go-redis/issues/3806.
+	// c.patterns is intentionally NOT included: patterns are not slot-
+	// addressable, and adding them would force PSubscribe-only PubSubs to
+	// pin to a single node based on pattern-string hash, regressing the
+	// existing random-node behaviour.
+	channels := slices.Collect(maps.Keys(c.channels))
+	channels = append(channels, slices.Collect(maps.Keys(c.schannels))...)
 	channels = append(channels, newChannels...)
 
 	cn, err := c.newConn(ctx, c.opt.Addr, channels)
@@ -112,34 +137,24 @@ func (c *PubSub) resubscribe(ctx context.Context, cn *pool.Conn) error {
 	var firstErr error
 
 	if len(c.channels) > 0 {
-		firstErr = c._subscribe(ctx, cn, "subscribe", mapKeys(c.channels))
+		firstErr = c._subscribe(ctx, cn, "subscribe", slices.Collect(maps.Keys(c.channels)))
 	}
 
 	if len(c.patterns) > 0 {
-		err := c._subscribe(ctx, cn, "psubscribe", mapKeys(c.patterns))
+		err := c._subscribe(ctx, cn, "psubscribe", slices.Collect(maps.Keys(c.patterns)))
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 
 	if len(c.schannels) > 0 {
-		err := c._subscribe(ctx, cn, "ssubscribe", mapKeys(c.schannels))
+		err := c._subscribe(ctx, cn, "ssubscribe", slices.Collect(maps.Keys(c.schannels)))
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 
 	return firstErr
-}
-
-func mapKeys(m map[string]struct{}) []string {
-	s := make([]string, len(m))
-	i := 0
-	for k := range m {
-		s[i] = k
-		i++
-	}
-	return s
 }
 
 func (c *PubSub) _subscribe(
@@ -172,11 +187,34 @@ func (c *PubSub) releaseConn(ctx context.Context, cn *pool.Conn, err error, allo
 
 	if !cn.IsUsable() || cn.ShouldHandoff() {
 		c.reconnect(ctx, fmt.Errorf("pubsub: connection is not usable"))
+		return
 	}
 
 	if isBadConn(err, allowTimeout, c.opt.Addr) {
 		c.reconnect(ctx, err)
 	}
+}
+
+// forceReconnect closes the current connection and re-dials through the
+// PubSub's connection factory, resubscribing to all channels and patterns.
+// MultiDBClient uses it to move subscriptions to the new active database after
+// a failover.
+func (c *PubSub) forceReconnect(ctx context.Context, reason error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	// A canceled ctx means a newer switch superseded this one; its own
+	// reconnect may already hold the new connection.
+	if ctx.Err() != nil {
+		return
+	}
+	// Nothing to move: an empty handle dials lazily on first use.
+	if c.cn == nil && len(c.channels) == 0 && len(c.patterns) == 0 && len(c.schannels) == 0 {
+		return
+	}
+	c.reconnect(ctx, reason)
 }
 
 func (c *PubSub) reconnect(ctx context.Context, reason error) {
@@ -284,9 +322,7 @@ func (c *PubSub) Unsubscribe(ctx context.Context, channels ...string) error {
 		}
 	} else {
 		// Unsubscribe from all channels.
-		for channel := range c.channels {
-			delete(c.channels, channel)
-		}
+		clear(c.channels)
 	}
 
 	err := c.subscribe(ctx, "unsubscribe", channels...)
@@ -305,9 +341,7 @@ func (c *PubSub) PUnsubscribe(ctx context.Context, patterns ...string) error {
 		}
 	} else {
 		// Unsubscribe from all patterns.
-		for pattern := range c.patterns {
-			delete(c.patterns, pattern)
-		}
+		clear(c.patterns)
 	}
 
 	err := c.subscribe(ctx, "punsubscribe", patterns...)
@@ -326,9 +360,7 @@ func (c *PubSub) SUnsubscribe(ctx context.Context, channels ...string) error {
 		}
 	} else {
 		// Unsubscribe from all channels.
-		for channel := range c.schannels {
-			delete(c.schannels, channel)
-		}
+		clear(c.schannels)
 	}
 
 	err := c.subscribe(ctx, "sunsubscribe", channels...)
@@ -352,6 +384,25 @@ func (c *PubSub) Ping(ctx context.Context, payload ...string) error {
 		args = append(args, payload[0])
 	}
 	cmd := NewCmd(ctx, args...)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	cn, err := c.conn(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	err = c.writeCmd(ctx, cn, cmd)
+	c.releaseConn(ctx, cn, err, false)
+	return err
+}
+
+// ClientSetName assigns  a namee to the PubSub connection using  CLIENT SETNAME,
+// The name is visible in CLIENT LIST output and is useful for debugging
+// and identifying connections in a redis instance.
+func (c *PubSub) ClientSetName(ctx context.Context, name string) error {
+	cmd := NewStatusCmd(ctx, "client", "setname", name)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -552,16 +603,40 @@ func (c *PubSub) getContext() context.Context {
 // is blocked full for 1 minute the message is dropped.
 // Receive* APIs can not be used after channel is created.
 //
+// If the PubSub was created with a sticky error (e.g. Ring subscribe on empty
+// ring or shard lookup failure), or if Channel is called after
+// ChannelWithSubscriptions, a warning is logged and an already-closed channel is
+// returned.
+//
 // go-redis periodically sends ping messages to test connection health
 // and re-subscribes if ping can not received for 1 minute.
 func (c *PubSub) Channel(opts ...ChannelOption) <-chan *Message {
+	c.mu.Lock()
+	if c.stickyErr != nil && !c.closed {
+		err := c.stickyErr
+		c.mu.Unlock()
+		internal.Logger.Printf(context.Background(),
+			"redis: Channel returning closed channel due to sticky error: %s", err)
+		ch := make(chan *Message)
+		close(ch)
+		return ch
+	}
+	c.mu.Unlock()
+
 	c.chOnce.Do(func() {
 		c.msgCh = newChannel(c, opts...)
 		c.msgCh.initMsgChan()
 	})
 	if c.msgCh == nil {
-		err := fmt.Errorf("redis: Channel can't be called after ChannelWithSubscriptions")
-		panic(err)
+		// Already using ChannelWithSubscriptions — return a closed channel
+		// instead of panicking so callers can recover (issue #3761).
+		// Use Background: getContext reads c.cmd which the other channel's
+		// Receive loop may write concurrently (data race under -race).
+		internal.Logger.Printf(context.Background(),
+			"redis: Channel can't be called after ChannelWithSubscriptions")
+		ch := make(chan *Message)
+		close(ch)
+		return ch
 	}
 	return c.msgCh.msgCh
 }
@@ -578,28 +653,67 @@ func (c *PubSub) ChannelSize(size int) <-chan *Message {
 // *Subscription or *Message. Subscription messages can be used to detect
 // reconnections.
 //
+// If the PubSub was created with a sticky error (e.g. Ring subscribe on empty
+// ring or shard lookup failure), or if ChannelWithSubscriptions is called after
+// Channel or ChannelSize, a warning is logged and an already-closed channel is
+// returned.
+//
 // ChannelWithSubscriptions can not be used together with Channel or ChannelSize.
 func (c *PubSub) ChannelWithSubscriptions(opts ...ChannelOption) <-chan interface{} {
+	c.mu.Lock()
+	if c.stickyErr != nil && !c.closed {
+		err := c.stickyErr
+		c.mu.Unlock()
+		internal.Logger.Printf(context.Background(),
+			"redis: ChannelWithSubscriptions returning closed channel due to sticky error: %s", err)
+		ch := make(chan interface{})
+		close(ch)
+		return ch
+	}
+	c.mu.Unlock()
+
 	c.chOnce.Do(func() {
 		c.allCh = newChannel(c, opts...)
 		c.allCh.initAllChan()
 	})
 	if c.allCh == nil {
-		err := fmt.Errorf("redis: ChannelWithSubscriptions can't be called after Channel")
-		panic(err)
+		// Already using Channel — return a closed channel instead of panicking
+		// so callers can recover (issue #3761).
+		// Use Background: getContext reads c.cmd which the other channel's
+		// Receive loop may write concurrently (data race under -race).
+		internal.Logger.Printf(context.Background(),
+			"redis: ChannelWithSubscriptions can't be called after Channel")
+		ch := make(chan interface{})
+		close(ch)
+		return ch
 	}
 	return c.allCh.allCh
 }
 
+// pushProcessorFor returns the processor for pushes arriving on cn, or nil
+// when pushes are not processed on that connection: no RESP3, or no
+// processor. With processorFor set (MultiDB), the connection's owner decides
+// both, since its protocol and its processor may differ from the ones this
+// PubSub was created with.
+func (c *PubSub) pushProcessorFor(cn *pool.Conn) push.NotificationProcessor {
+	if c.processorFor != nil {
+		return c.processorFor(cn)
+	}
+	if c.opt.Protocol != 3 {
+		return nil
+	}
+	return c.pushProcessor
+}
+
 func (c *PubSub) processPendingPushNotificationWithReader(ctx context.Context, cn *pool.Conn, rd *proto.Reader) error {
-	// Only process push notifications for RESP3 connections with a processor
-	if c.opt.Protocol != 3 || c.pushProcessor == nil {
+	processor := c.pushProcessorFor(cn)
+	if processor == nil {
 		return nil
 	}
 
 	// Create handler context with client, connection pool, and connection information
 	handlerCtx := c.pushNotificationHandlerContext(cn)
-	return c.pushProcessor.ProcessPendingNotifications(ctx, handlerCtx, rd)
+	return processor.ProcessPendingNotifications(ctx, handlerCtx, rd)
 }
 
 func (c *PubSub) pushNotificationHandlerContext(cn *pool.Conn) push.NotificationHandlerContext {
@@ -644,6 +758,25 @@ func WithChannelSendTimeout(d time.Duration) ChannelOption {
 	}
 }
 
+// WithChannelPingTimeout specifies the timeout for the health-check ping.
+//
+// The default is 5 seconds.
+func WithChannelPingTimeout(d time.Duration) ChannelOption {
+	return func(c *channel) {
+		c.pingTimeout = d
+	}
+}
+
+// WithChannelReconnectTimeout specifies the timeout for reconnecting after
+// a failed health-check ping.
+//
+// The default is 10 seconds.
+func WithChannelReconnectTimeout(d time.Duration) ChannelOption {
+	return func(c *channel) {
+		c.reconnectTimeout = d
+	}
+}
+
 type channel struct {
 	pubSub *PubSub
 
@@ -651,18 +784,22 @@ type channel struct {
 	allCh chan interface{}
 	ping  chan struct{}
 
-	chanSize        int
-	chanSendTimeout time.Duration
-	checkInterval   time.Duration
+	chanSize         int
+	chanSendTimeout  time.Duration
+	checkInterval    time.Duration
+	pingTimeout      time.Duration
+	reconnectTimeout time.Duration
 }
 
 func newChannel(pubSub *PubSub, opts ...ChannelOption) *channel {
 	c := &channel{
 		pubSub: pubSub,
 
-		chanSize:        100,
-		chanSendTimeout: time.Minute,
-		checkInterval:   3 * time.Second,
+		chanSize:         100,
+		chanSendTimeout:  time.Minute,
+		checkInterval:    3 * time.Second,
+		pingTimeout:      5 * time.Second,
+		reconnectTimeout: 10 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -674,7 +811,6 @@ func newChannel(pubSub *PubSub, opts ...ChannelOption) *channel {
 }
 
 func (c *channel) initHealthCheck() {
-	ctx := context.TODO()
 	c.ping = make(chan struct{}, 1)
 
 	go func() {
@@ -685,13 +821,20 @@ func (c *channel) initHealthCheck() {
 			timer.Reset(c.checkInterval)
 			select {
 			case <-c.ping:
-				if !timer.Stop() {
-					<-timer.C
+				select {
+				case <-timer.C:
+				default:
 				}
 			case <-timer.C:
-				if pingErr := c.pubSub.Ping(ctx); pingErr != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), c.pingTimeout)
+				pingErr := c.pubSub.Ping(ctx)
+				cancel()
+
+				if pingErr != nil {
 					c.pubSub.mu.Lock()
-					c.pubSub.reconnect(ctx, pingErr)
+					reconnectCtx, reconnectCancel := context.WithTimeout(context.Background(), c.reconnectTimeout)
+					c.pubSub.reconnect(reconnectCtx, pingErr)
+					reconnectCancel()
 					c.pubSub.mu.Unlock()
 				}
 			case <-c.pubSub.exit:
@@ -748,7 +891,8 @@ func (c *channel) initMsgChan() {
 				case <-timer.C:
 					internal.Logger.Printf(
 						ctx, "redis: %v channel is full for %s (message is dropped)",
-						c, c.chanSendTimeout)
+						c, c.chanSendTimeout,
+					)
 				}
 			default:
 				internal.Logger.Printf(ctx, "redis: unknown message type: %T", msg)
@@ -802,7 +946,8 @@ func (c *channel) initAllChan() {
 				case <-timer.C:
 					internal.Logger.Printf(
 						ctx, "redis: %v channel is full for %s (message is dropped)",
-						c, c.chanSendTimeout)
+						c, c.chanSendTimeout,
+					)
 				}
 			default:
 				internal.Logger.Printf(ctx, "redis: unknown message type: %T", msg)

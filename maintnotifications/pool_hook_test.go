@@ -55,7 +55,7 @@ func (mp *mockPool) NewConn(ctx context.Context) (*pool.Conn, error) {
 	return nil, errors.New("not implemented")
 }
 
-func (mp *mockPool) CloseConn(conn *pool.Conn) error {
+func (mp *mockPool) CloseConn(ctx context.Context, conn *pool.Conn, reason string, fromState string) error {
 	return nil
 }
 
@@ -833,10 +833,13 @@ func TestConnectionHook(t *testing.T) {
 			t.Error("Connection should be pooled after failed handoff attempt")
 		}
 
-		// Wait for handoff to be attempted and fail
-		time.Sleep(100 * time.Millisecond)
-
-		// Verify that the connection was removed from the pool
+		// Wait for the handoff to be attempted, retried (MaxHandoffRetries:3
+		// with backoff), and finally fail: a fixed sleep loses that race on
+		// loaded runners, so poll until the removal lands.
+		deadline := time.Now().Add(5 * time.Second)
+		for !mockPool.WasRemoved(conn.GetID()) && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
 		if !mockPool.WasRemoved(conn.GetID()) {
 			t.Errorf("conn[%d] should have been removed from pool after handoff failure", conn.GetID())
 		}
@@ -873,7 +876,6 @@ func TestConnectionHook(t *testing.T) {
 
 		ctx := context.Background()
 		shouldPool, shouldRemove, err := processor.OnPut(ctx, conn)
-
 		if err != nil {
 			t.Fatalf("OnPut failed: %v", err)
 		}
@@ -964,7 +966,12 @@ func TestConnectionHook(t *testing.T) {
 		}
 
 		// Set a dialer that will check the context timeout
-		var timeoutVerified int32 // Use atomic for thread safety
+		var timeoutVerified atomic.Int32
+		// Atomic, like timeoutVerified above: the init func below runs on the
+		// handoff worker goroutine while the assertions run on the test
+		// goroutine, so a plain string would be a data race — and it would fire
+		// exactly on the failing path this diagnostic exists to capture.
+		var timeoutNotSetError atomic.Pointer[string]
 		conn.SetInitConnFunc(func(ctx context.Context, cn *pool.Conn) error {
 			// Check that the context has the expected timeout
 			deadline, ok := ctx.Deadline()
@@ -977,10 +984,12 @@ func TestConnectionHook(t *testing.T) {
 			expectedDeadline := time.Now().Add(customTimeout)
 			timeDiff := deadline.Sub(expectedDeadline)
 			if timeDiff < -500*time.Millisecond || timeDiff > 500*time.Millisecond {
-				t.Errorf("Context deadline not as expected. Expected around %v, got %v (diff: %v)",
+				msg := fmt.Sprintf("Context deadline not as expected. Expected around %v, got %v (diff: %v)",
 					expectedDeadline, deadline, timeDiff)
+				timeoutNotSetError.Store(&msg)
+				t.Error(msg)
 			} else {
-				atomic.StoreInt32(&timeoutVerified, 1)
+				timeoutVerified.Store(1)
 			}
 
 			return nil // Successful handoff
@@ -1000,10 +1009,117 @@ func TestConnectionHook(t *testing.T) {
 		// Wait for handoff to complete
 		time.Sleep(500 * time.Millisecond)
 
-		if atomic.LoadInt32(&timeoutVerified) == 0 {
+		if timeoutVerified.Load() == 0 {
 			t.Error("HandoffTimeout was not properly applied to context")
+			// Distinguish the two failures that look identical otherwise: the
+			// init func ran and saw a wrong deadline, or it never ran inside the
+			// fixed wait above. Printing an unset message reads like the former
+			// with no numbers, while on a loaded machine the latter is the more
+			// likely flake.
+			if msg := timeoutNotSetError.Load(); msg != nil {
+				t.Error(*msg)
+			} else {
+				t.Error("the init func never ran: the handoff did not reach it within the wait above")
+			}
 		}
 
 		t.Logf("HandoffTimeout configuration test completed successfully")
+	})
+}
+
+// TestPoolHookNeverReturnsConnectionMarkedForHandoff verifies the core
+// guarantee that the pool hook never hands a connection back to a caller while
+// it is marked for (or undergoing) handoff, and that OnPut pools — never
+// removes — such a connection (the handoff worker owns it once queued).
+//
+// Both OnGet guard layers are exercised:
+//   - ShouldHandoff(): connection marked for handoff but not yet queued
+//   - !IsUsable():     connection queued / handoff in progress
+func TestPoolHookNeverReturnsConnectionMarkedForHandoff(t *testing.T) {
+	baseDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return &mockNetConn{addr: addr}, nil
+	}
+	ctx := context.Background()
+
+	t.Run("OnGet refuses a connection marked or queued for handoff", func(t *testing.T) {
+		processor := NewPoolHook(baseDialer, "tcp", nil, nil)
+		defer processor.Shutdown(ctx)
+
+		conn := createMockPoolConnection()
+
+		// Healthy, usable connection: accepted.
+		if accept, err := processor.OnGet(ctx, conn, false); !accept || err != nil {
+			t.Fatalf("OnGet should accept a healthy connection: accept=%v err=%v", accept, err)
+		}
+
+		// Marked for handoff (ShouldHandoff()==true, still usable): refused via
+		// the ShouldHandoff guard.
+		if err := conn.MarkForHandoff("new-endpoint:6379", 1); err != nil {
+			t.Fatalf("MarkForHandoff: %v", err)
+		}
+		if !conn.ShouldHandoff() {
+			t.Fatal("connection should be marked for handoff")
+		}
+		if accept, err := processor.OnGet(ctx, conn, false); accept || err != ErrConnectionMarkedForHandoffWithState {
+			t.Fatalf("OnGet must refuse a connection marked for handoff: accept=%v err=%v", accept, err)
+		}
+
+		// Queued for handoff: MarkQueuedForHandoff clears ShouldHandoff and makes
+		// the connection UNUSABLE, so it is now refused via the usable guard.
+		if err := conn.MarkQueuedForHandoff(); err != nil {
+			t.Fatalf("MarkQueuedForHandoff: %v", err)
+		}
+		if conn.ShouldHandoff() {
+			t.Fatal("queued connection should have ShouldHandoff()==false")
+		}
+		if conn.IsUsable() {
+			t.Fatal("queued connection should be unusable")
+		}
+		if accept, err := processor.OnGet(ctx, conn, false); accept || err != ErrConnectionMarkedForHandoff {
+			t.Fatalf("OnGet must refuse a connection queued for handoff: accept=%v err=%v", accept, err)
+		}
+	})
+
+	t.Run("OnPut pools (never removes) a connection being handed off", func(t *testing.T) {
+		config := &Config{
+			Mode:              ModeAuto,
+			EndpointType:      EndpointTypeAuto,
+			MaxWorkers:        1,
+			HandoffQueueSize:  10,
+			MaxHandoffRetries: 3,
+		}
+		processor := NewPoolHook(baseDialer, "tcp", config, nil)
+		defer processor.Shutdown(ctx)
+
+		conn := createMockPoolConnection()
+		conn.SetInitConnFunc(func(ctx context.Context, cn *pool.Conn) error { return nil })
+		if err := conn.MarkForHandoff("new-endpoint:6379", 1); err != nil {
+			t.Fatalf("MarkForHandoff: %v", err)
+		}
+
+		// Returning a marked connection queues the async handoff. The worker now
+		// owns it, so OnPut must pool it, never remove it.
+		shouldPool, shouldRemove, err := processor.OnPut(ctx, conn)
+		if err != nil {
+			t.Fatalf("OnPut should not error: %v", err)
+		}
+		if !shouldPool || shouldRemove {
+			t.Fatalf("a connection being handed off must be pooled, not removed (shouldPool=%v, shouldRemove=%v)", shouldPool, shouldRemove)
+		}
+
+		// Once the handoff completes the connection is healthy and acceptable again.
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if conn.IsUsable() && !processor.IsHandoffPending(conn) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if !conn.IsUsable() || processor.IsHandoffPending(conn) {
+			t.Fatalf("handoff did not complete (IsUsable=%v, pending=%v)", conn.IsUsable(), processor.IsHandoffPending(conn))
+		}
+		if accept, err := processor.OnGet(ctx, conn, false); !accept || err != nil {
+			t.Fatalf("OnGet should accept the connection after handoff completes: accept=%v err=%v", accept, err)
+		}
 	})
 }

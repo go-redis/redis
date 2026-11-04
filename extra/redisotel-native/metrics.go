@@ -25,9 +25,12 @@ const (
 	libraryName = "go-redis"
 )
 
+// libraryVersionAttr is built once: every recorded metric carries it.
+var libraryVersionAttr = attribute.String(AttrRedisClientLibrary, libraryName+":"+redis.Version())
+
 // getLibraryVersionAttr returns the redis.client.library attribute
 func getLibraryVersionAttr() attribute.KeyValue {
-	return attribute.String(AttrRedisClientLibrary, fmt.Sprintf("%s:%s", libraryName, redis.Version()))
+	return libraryVersionAttr
 }
 
 // addServerPortIfNonDefault adds server.port attribute if port is not the default (6379)
@@ -38,43 +41,45 @@ func addServerPortIfNonDefault(attrs []attribute.KeyValue, serverPort string) []
 	return attrs
 }
 
-// poolInfo stores information about a registered main connection pool
-type poolInfo struct {
-	name string
-	pool redis.Pooler
-}
-
-// pubsubPoolInfo stores information about a registered PubSub pool
-type pubsubPoolInfo struct {
-	name string
-	pool redis.PubSubPooler
-}
-
 // metricsRecorder implements the otel.Recorder interface
 type metricsRecorder struct {
 	operationDuration        metric.Float64Histogram
-	connectionCountGauge     metric.Int64ObservableGauge
+	connectionCount          metric.Int64UpDownCounter // OTel semconv: UpDownCounter for connection.count
 	connectionCreateTime     metric.Float64Histogram
 	connectionRelaxedTimeout metric.Int64UpDownCounter
 	connectionHandoff        metric.Int64Counter
 	clientErrors             metric.Int64Counter
 	maintenanceNotifications metric.Int64Counter
 
-	connectionWaitTime         metric.Float64Histogram
-	connectionClosed           metric.Int64Counter
-	connectionPendingReqsGauge metric.Int64ObservableGauge
+	connectionWaitTime    metric.Float64Histogram
+	connectionClosed      metric.Int64Counter
+	connectionPendingReqs metric.Int64UpDownCounter // OTel semconv: UpDownCounter for pending_requests
 
 	pubsubMessages metric.Int64Counter
 
 	streamLag metric.Float64Histogram
 
+	// MultiDB (Active-Active failover); see metrics_multidb.go
+	multiDBFailovers             metric.Int64Counter
+	multiDBFailoverDuration      metric.Float64Histogram
+	multiDBActiveDatabaseChanges metric.Int64Counter
+	multiDBCircuitStateChanges   metric.Int64Counter
+	multiDBHealthChecks          metric.Int64Counter
+	multiDBHealthCheckDuration   metric.Float64Histogram
+
 	// Configuration
 	cfg *config
 
-	// Pool registry for tracking multiple pools
-	poolsMu     sync.RWMutex
-	pools       []poolInfo
-	pubsubPools []pubsubPoolInfo
+	// opAttrs caches success-path operation attribute sets (opAttrKey ->
+	// attribute.Set). Hits only Load; misses go through storeOpAttrs, which
+	// holds opAttrsMu, so opAttrsLen is exactly the number of entries.
+	opAttrs    sync.Map
+	opAttrsMu  sync.Mutex
+	opAttrsLen int
+
+	// opq records success-path operation durations off the caller's goroutine
+	// (op_queue.go); nil records them inline.
+	opq *opQueue
 }
 
 // RecordOperationDuration records db.client.operation.duration metric
@@ -99,48 +104,127 @@ func (r *metricsRecorder) RecordOperationDuration(
 	// Convert duration to seconds (OTel convention for duration metrics)
 	durationSeconds := duration.Seconds()
 
-	serverAddr, serverPort := extractServerInfo(cn)
+	var addr net.Addr
+	if cn != nil {
+		addr = cn.RemoteAddr()
+	}
+
+	failed := err != nil && !r.skipNilReply(err)
+	if !failed {
+		// The success-path attributes depend only on the key, so the set is built
+		// once per key instead of once per command. That matters on full duplex,
+		// where every command is recorded on the one reader goroutine.
+		key := opAttrKey{op: cmd.FullName(), attempts: attempts, db: dbIndex}
+		switch addr.(type) {
+		case nil:
+		case *net.TCPAddr, *net.UnixAddr:
+			// A connection returns the same address value every time, so the
+			// pointer is the key and String() is paid once per key, not per command.
+			key.addr = addr
+		default:
+			key.remote = addr.String() // may not be comparable: key by its text
+		}
+		set, ok := r.opAttrs.Load(key)
+		if !ok {
+			set = r.storeOpAttrs(key, addr)
+		}
+		if r.opq != nil {
+			r.opq.record(ctx, durationSeconds, set.(attribute.Set))
+			return
+		}
+		r.operationDuration.Record(ctx, durationSeconds, metric.WithAttributeSet(set.(attribute.Set)))
+		return
+	}
+
+	attrs := operationAttrs(cmd.FullName(), attempts, addrString(addr), dbIndex)
+	attrs = append(attrs, attribute.String(AttrErrorType, classifyError(err)))
+	attrs = append(attrs, attribute.String(AttrRedisClientErrorsCategory, getErrorCategory(err)))
+	if statusCode := extractRedisErrorPrefix(err); statusCode != "" {
+		attrs = append(attrs, attribute.String(AttrDBResponseStatusCode, statusCode))
+	}
+
+	// Record the histogram
+	r.operationDuration.Record(ctx, durationSeconds, metric.WithAttributes(attrs...))
+}
+
+// maxOpAttrSets bounds the success-path attribute-set cache: past it the
+// cache is cleared, so many commands x endpoints x attempts x dbs cannot grow it without limit.
+const maxOpAttrSets = 4096
+
+// opAttrKey is everything the success-path operation attributes are built from.
+// The connection's remote address is addr (a *net.TCPAddr or *net.UnixAddr) or
+// else remote, its String(); never the connection, so the cache keeps no closed
+// connection reachable.
+type opAttrKey struct {
+	op       string
+	addr     net.Addr
+	remote   string
+	attempts int
+	db       int
+}
+
+// storeOpAttrs builds and caches the set for key, clearing the cache first
+// when it is full.
+func (r *metricsRecorder) storeOpAttrs(key opAttrKey, addr net.Addr) any {
+	r.opAttrsMu.Lock()
+	defer r.opAttrsMu.Unlock()
+	if set, ok := r.opAttrs.Load(key); ok {
+		return set
+	}
+	if r.opAttrsLen >= maxOpAttrSets {
+		r.opAttrs.Clear()
+		r.opAttrsLen = 0
+	}
+	set := attribute.NewSet(operationAttrs(key.op, key.attempts, addrString(addr), key.db)...)
+	r.opAttrs.Store(key, set)
+	r.opAttrsLen++
+	return set
+}
+
+func addrString(a net.Addr) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
+}
+
+// operationAttrs is db.client.operation.duration's attributes without the
+// error ones; remote is the connection's RemoteAddr().String(), or "".
+func operationAttrs(op string, attempts int, remote string, dbIndex int) []attribute.KeyValue {
+	var serverAddr, serverPort string
+	if remote != "" {
+		serverAddr, serverPort = parseAddr(remote)
+	}
 
 	// Build attributes
-	attrs := []attribute.KeyValue{
+	attrs := make([]attribute.KeyValue, 0, 12)
+	attrs = append(
+		attrs,
 		// Required attributes
-		attribute.String(AttrDBOperationName, cmd.FullName()),
+		attribute.String(AttrDBOperationName, op),
 		getLibraryVersionAttr(),
-		attribute.Int(AttrRedisClientOperationRetryAttempts, attempts-1), // attempts-1 = retry count
+		attribute.Int(AttrRedisClientOperationRetryAttempts, max(attempts-1, 0)),
 
 		// Recommended attributes
 		attribute.String(AttrDBSystemName, DBSystemRedis),
 		attribute.String(AttrServerAddress, serverAddr),
 		attribute.String(AttrDBNamespace, strconv.Itoa(dbIndex)),
-	}
+	)
 
 	// Add server.port if not default
 	attrs = addServerPortIfNonDefault(attrs, serverPort)
 
 	// Add network.peer.address and network.peer.port from connection
-	if cn != nil {
-		remoteAddr := cn.RemoteAddr()
-		if remoteAddr != nil {
-			peerAddr, peerPort := splitHostPort(remoteAddr.String())
-			if peerAddr != "" {
-				attrs = append(attrs, attribute.String(AttrNetworkPeerAddress, peerAddr))
-			}
-			if peerPort != "" {
-				attrs = append(attrs, attribute.String(AttrNetworkPeerPort, peerPort))
-			}
+	if remote != "" {
+		peerAddr, peerPort := splitHostPort(remote)
+		if peerAddr != "" {
+			attrs = append(attrs, attribute.String(AttrNetworkPeerAddress, peerAddr))
+		}
+		if peerPort != "" {
+			attrs = append(attrs, attribute.String(AttrNetworkPeerPort, peerPort))
 		}
 	}
-
-	if err != nil {
-		attrs = append(attrs, attribute.String(AttrErrorType, classifyError(err)))
-		attrs = append(attrs, attribute.String(AttrRedisClientErrorsCategory, getErrorCategory(err)))
-		if statusCode := extractRedisErrorPrefix(err); statusCode != "" {
-			attrs = append(attrs, attribute.String(AttrDBResponseStatusCode, statusCode))
-		}
-	}
-
-	// Record the histogram
-	r.operationDuration.Record(ctx, durationSeconds, metric.WithAttributes(attrs...))
+	return attrs
 }
 
 // RecordPipelineOperationDuration records db.client.operation.duration metric for pipelines/transactions.
@@ -169,8 +253,8 @@ func (r *metricsRecorder) RecordPipelineOperationDuration(
 	attrs := []attribute.KeyValue{
 		attribute.String(AttrDBOperationName, operationName),
 		getLibraryVersionAttr(),
-		attribute.Int(AttrRedisClientOperationRetryAttempts, attempts-1), // attempts-1 = retry count
-		attribute.Int(AttrDBOperationBatchSize, cmdCount),                // number of commands in pipeline
+		attribute.Int(AttrRedisClientOperationRetryAttempts, max(attempts-1, 0)),
+		attribute.Int(AttrDBOperationBatchSize, cmdCount), // number of commands in pipeline
 		attribute.String(AttrDBSystemName, DBSystemRedis),
 		attribute.String(AttrServerAddress, serverAddr),
 		attribute.String(AttrDBNamespace, strconv.Itoa(dbIndex)),
@@ -194,7 +278,7 @@ func (r *metricsRecorder) RecordPipelineOperationDuration(
 	}
 
 	// Add error attributes if pipeline failed
-	if err != nil {
+	if err != nil && !r.skipNilReply(err) {
 		attrs = append(attrs, attribute.String(AttrErrorType, classifyError(err)))
 		attrs = append(attrs, attribute.String(AttrRedisClientErrorsCategory, getErrorCategory(err)))
 		if statusCode := extractRedisErrorPrefix(err); statusCode != "" {
@@ -206,11 +290,25 @@ func (r *metricsRecorder) RecordPipelineOperationDuration(
 	r.operationDuration.Record(ctx, durationSeconds, metric.WithAttributes(attrs...))
 }
 
+// skipNilReply reports whether err is redis.Nil and Nil replies are not
+// recorded as errors. A Nil reply is a successful command with no value.
+func (r *metricsRecorder) skipNilReply(err error) bool {
+	return !r.recordNilErrors() && errors.Is(err, redis.Nil)
+}
+
+func (r *metricsRecorder) recordNilErrors() bool {
+	return r.cfg != nil && r.cfg.recordNilErrors
+}
+
 // classifyError returns the error.type attribute value
 // Format: <category>:<subcategory>:<error_name>
 func classifyError(err error) string {
 	if err == nil {
 		return ""
+	}
+
+	if errors.Is(err, redis.Nil) {
+		return redis.ErrorTypeNil
 	}
 
 	// Timeout errors
@@ -327,6 +425,10 @@ func extractRedisErrorPrefix(err error) string {
 		return ""
 	}
 
+	if errors.Is(err, redis.Nil) {
+		return redis.ErrorTypeNil
+	}
+
 	errStr := err.Error()
 
 	// Redis errors typically start with an uppercase prefix
@@ -382,6 +484,10 @@ func getErrorCategory(err error) string {
 		return ""
 	}
 
+	if errors.Is(err, redis.Nil) {
+		return redis.ErrorTypeNil
+	}
+
 	errStr := err.Error()
 
 	// For actual errors, also check error types
@@ -402,6 +508,10 @@ func getErrorCategory(err error) string {
 func getErrorCategoryFromString(errStr string) string {
 	if errStr == "" {
 		return ""
+	}
+
+	if errStr == redis.ErrorTypeNil {
+		return redis.ErrorTypeNil
 	}
 
 	errLower := strings.ToLower(errStr)
@@ -607,6 +717,9 @@ func (r *metricsRecorder) RecordError(
 	retryAttempts int,
 ) {
 	if r.clientErrors == nil {
+		return
+	}
+	if errorType == redis.ErrorTypeNil && !r.recordNilErrors() {
 		return
 	}
 
@@ -849,62 +962,86 @@ func (r *metricsRecorder) RecordStreamLag(
 	r.streamLag.Record(ctx, lag.Seconds(), metric.WithAttributes(attrs...))
 }
 
-// RegisterPool implements the OTelPoolRegistrar interface.
-// The pools are used by async gauge callbacks to pull statistics.
-func (r *metricsRecorder) RegisterPool(poolName string, pool redis.Pooler) {
-	r.poolsMu.Lock()
-	defer r.poolsMu.Unlock()
+// RecordConnectionCount records a change in connection count (UpDownCounter).
+// Per OTel semantic conventions, db.client.connection.count is an UpDownCounter.
+// delta: +1 when connection added, -1 when connection removed
+// state: connection state (e.g., "idle", "used")
+// isPubSub: true if this is a PubSub connection
+func (r *metricsRecorder) RecordConnectionCount(
+	ctx context.Context,
+	delta int,
+	cn redis.ConnInfo,
+	state string,
+	isPubSub bool,
+) {
+	if r.connectionCount == nil {
+		return
+	}
 
-	// Add pool to registry
-	r.pools = append(r.pools, poolInfo{
-		name: poolName,
-		pool: pool,
-	})
-}
+	// Build attributes
+	attrs := []attribute.KeyValue{
+		attribute.String(AttrDBSystemName, DBSystemRedis),
+		getLibraryVersionAttr(),
+		attribute.String(AttrDBClientConnectionState, state),
+		attribute.Bool(AttrRedisClientConnectionPubSub, isPubSub),
+	}
 
-// UnregisterPool implements the OTelPoolRegistrar interface.
-// This ensures async gauge callbacks don't try to access closed pools.
-func (r *metricsRecorder) UnregisterPool(pool redis.Pooler) {
-	r.poolsMu.Lock()
-	defer r.poolsMu.Unlock()
+	// Use pool name from connection (set when connection was created)
+	if cn != nil {
+		poolName := cn.PoolName()
+		if poolName != "" {
+			attrs = append(attrs, attribute.String(AttrDBClientConnectionPoolName, poolName))
 
-	// Find and remove the pool from registry
-	for i, p := range r.pools {
-		if p.pool == pool {
-			// Remove by swapping with last element and truncating
-			r.pools[i] = r.pools[len(r.pools)-1]
-			r.pools = r.pools[:len(r.pools)-1]
-			return
+			// Extract server info from pool name
+			serverAddr, serverPort, _ := parsePoolName(poolName)
+			if serverAddr != "" {
+				attrs = append(attrs, attribute.String(AttrServerAddress, serverAddr))
+			}
+			attrs = addServerPortIfNonDefault(attrs, serverPort)
 		}
 	}
+
+	// Record the counter (delta can be +1 or -1)
+	r.connectionCount.Add(ctx, int64(delta), metric.WithAttributes(attrs...))
 }
 
-// RegisterPubSubPool implements the OTelPoolRegistrar interface.
-// The pools are used by async gauge callbacks to pull statistics.
-func (r *metricsRecorder) RegisterPubSubPool(poolName string, pool redis.PubSubPooler) {
-	r.poolsMu.Lock()
-	defer r.poolsMu.Unlock()
-
-	// Add PubSub pool to registry
-	r.pubsubPools = append(r.pubsubPools, pubsubPoolInfo{
-		name: poolName,
-		pool: pool,
-	})
-}
-
-// UnregisterPubSubPool implements the OTelPoolRegistrar interface.
-// This ensures async gauge callbacks don't try to access closed pools.
-func (r *metricsRecorder) UnregisterPubSubPool(pool redis.PubSubPooler) {
-	r.poolsMu.Lock()
-	defer r.poolsMu.Unlock()
-
-	// Find and remove the pool from registry
-	for i, p := range r.pubsubPools {
-		if p.pool == pool {
-			// Remove by swapping with last element and truncating
-			r.pubsubPools[i] = r.pubsubPools[len(r.pubsubPools)-1]
-			r.pubsubPools = r.pubsubPools[:len(r.pubsubPools)-1]
-			return
-		}
+// RecordPendingRequests records a change in pending requests (UpDownCounter).
+// Per OTel semantic conventions, db.client.connection.pending_requests is an UpDownCounter.
+// delta: +1 when request starts waiting, -1 when request stops waiting
+// poolName is passed explicitly because we may not have a connection yet when request starts
+func (r *metricsRecorder) RecordPendingRequests(
+	ctx context.Context,
+	delta int,
+	cn redis.ConnInfo,
+	poolName string,
+) {
+	if r.connectionPendingReqs == nil {
+		return
 	}
+
+	// Build attributes
+	attrs := []attribute.KeyValue{
+		attribute.String(AttrDBSystemName, DBSystemRedis),
+		getLibraryVersionAttr(),
+	}
+
+	// Use explicit pool name (preferred) or fall back to connection's pool name
+	effectivePoolName := poolName
+	if effectivePoolName == "" && cn != nil {
+		effectivePoolName = cn.PoolName()
+	}
+
+	if effectivePoolName != "" {
+		attrs = append(attrs, attribute.String(AttrDBClientConnectionPoolName, effectivePoolName))
+
+		// Extract server info from pool name
+		serverAddr, serverPort, _ := parsePoolName(effectivePoolName)
+		if serverAddr != "" {
+			attrs = append(attrs, attribute.String(AttrServerAddress, serverAddr))
+		}
+		attrs = addServerPortIfNonDefault(attrs, serverPort)
+	}
+
+	// Record the counter (delta can be +1 or -1)
+	r.connectionPendingReqs.Add(ctx, int64(delta), metric.WithAttributes(attrs...))
 }

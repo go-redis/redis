@@ -22,11 +22,21 @@ var ErrPoolExhausted = pool.ErrPoolExhausted
 // ErrPoolTimeout timed out waiting to get a connection from the connection pool.
 var ErrPoolTimeout = pool.ErrPoolTimeout
 
+// ErrClusterTopologyUnhealthy indicates that a node required by an operation
+// is reported as unavailable by the cluster topology. Use errors.Is to match
+// this error, which may include details about the node or slot.
+var ErrClusterTopologyUnhealthy = errors.New("redis: cluster topology contains a node that is not online")
+
 // ErrCrossSlot is returned when keys are used in the same Redis command and
 // the keys are not in the same hash slot. This error is returned by Redis
 // Cluster and will be returned by the client when TxPipeline or TxPipelined
 // is used on a ClusterClient with keys in different slots.
 var ErrCrossSlot = proto.RedisError("CROSSSLOT Keys in request don't hash to the same slot")
+
+// ErrNoScript is returned when EVALSHA is requested for a script digest that
+// is not available in the script cache. Note that this error text is reproduced
+// literally from that used by Redis.
+var ErrNoScript = proto.RedisError("NOSCRIPT No matching script. Please use EVAL.")
 
 // HasErrorPrefix checks if the err is a Redis error and the message contains a prefix.
 func HasErrorPrefix(err error, prefix string) bool {
@@ -86,6 +96,14 @@ func shouldRetry(err error, retryTimeout bool) bool {
 		return true
 	}
 
+	// Dial errors mean TCP connection was never established — safe to retry even
+	// when wrapped inside context.DeadlineExceeded (from DialTimeout context).
+	// Must be checked before the context error check below.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+
 	// Check for context errors (works with wrapped errors)
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
@@ -139,6 +157,9 @@ func shouldRetry(err error, retryTimeout bool) bool {
 	if strings.HasPrefix(s, "READONLY ") {
 		return true
 	}
+	if strings.Contains(s, "-READONLY You can't write against a read only replica") {
+		return true
+	}
 	if strings.HasPrefix(s, "CLUSTERDOWN ") {
 		return true
 	}
@@ -152,6 +173,9 @@ func shouldRetry(err error, retryTimeout bool) bool {
 		return true
 	}
 
+	// Other server errors are not retried. This includes the logical
+	// -SEARCH_TIMEOUT (search-on-timeout fail): retrying would just repeat the
+	// same expensive query.
 	return false
 }
 
@@ -209,6 +233,19 @@ func isBadConn(err error, allowTimeout bool, addr string) bool {
 }
 
 func isMovedError(err error) (moved bool, ask bool, addr string) {
+	// Unwrap serving-endpoint / redirect-from-node wrappers so typed and
+	// string MOVED/ASK checks still see the Redis error (#4233).
+	for {
+		switch e := err.(type) {
+		case *errWithServingEndpoint:
+			err = e.err
+		case *redirectFromNodeError:
+			err = e.err
+		default:
+			goto movedCheck
+		}
+	}
+movedCheck:
 	// Check for typed MovedError
 	if movedErr, ok := proto.IsMovedError(err); ok {
 		addr = movedErr.Addr()
@@ -254,10 +291,24 @@ func isReadOnlyError(err error) bool {
 }
 
 func isMovedSameConnAddr(err error, addr string) bool {
-	if movedErr, ok := proto.IsMovedError(err); ok {
-		return strings.HasSuffix(movedErr.Addr(), addr)
+	movedErr, ok := proto.IsMovedError(err)
+	if !ok {
+		return false
 	}
-	return false
+
+	movedHost, movedPort, err := net.SplitHostPort(internal.GetAddr(movedErr.Addr()))
+	if err != nil {
+		return false
+	}
+
+	connHost, connPort, err := net.SplitHostPort(internal.GetAddr(addr))
+	if err != nil || movedPort != connPort {
+		return false
+	}
+	// A MOVED without a host (cluster-preferred-endpoint-type
+	// unknown-endpoint) points at the host of the connection that sent it, so
+	// only the port has to match.
+	return movedHost == "" || strings.EqualFold(movedHost, connHost)
 }
 
 //------------------------------------------------------------------------------

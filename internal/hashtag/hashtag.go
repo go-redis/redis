@@ -1,9 +1,8 @@
 package hashtag
 
 import (
+	"math/rand"
 	"strings"
-
-	"github.com/redis/go-redis/v9/internal/rand"
 )
 
 const slotNumber = 16384
@@ -11,7 +10,7 @@ const slotNumber = 16384
 // CRC16 implementation according to CCITT standards.
 // Copyright 2001-2010 Georges Menie (www.menie.org)
 // Copyright 2013 The Go Authors. All rights reserved.
-// http://redis.io/topics/cluster-spec#appendix-a-crc16-reference-implementation-in-ansi-c
+// https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec#appendix-a-crc16-reference-implementation-in-ansi-c.
 var crc16tab = [256]uint16{
 	0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
 	0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef,
@@ -80,6 +79,27 @@ func Slot(key string) int {
 	}
 	key = Key(key)
 	return int(crc16sum(key)) % slotNumber
+}
+
+// PatternSlot returns the only slot that keys matching the glob pattern can be
+// in, or -1 if they can be in any slot. It follows patternHashSlot in Redis:
+// a wildcard ('*', '?', '[') or an escape ('\') before the end of the hash tag
+// gives -1. A pattern with no wildcard matches one key, so it hashes as a key.
+func PatternSlot(pattern string) int {
+	s := -1 // index of the first '{'
+	for i := 0; i < len(pattern); i++ {
+		switch c := pattern[i]; {
+		case c == '*' || c == '?' || c == '[' || c == '\\':
+			return -1
+		case s == -1 && c == '{':
+			s = i
+		case s >= 0 && c == '}' && i == s+1:
+			s = -2 // empty tag: the whole key is hashed
+		case s >= 0 && c == '}':
+			return int(crc16sum(pattern[s+1:i])) % slotNumber
+		}
+	}
+	return int(crc16sum(pattern)) % slotNumber
 }
 
 func crc16sum(key string) (crc uint16) {

@@ -1,16 +1,16 @@
 package redisotel
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
-	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/semconv/v1.38.0/dbconv"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // Metric name constants
@@ -36,6 +36,14 @@ const (
 
 	// Stream metrics
 	MetricStreamLag = "redis.client.stream.lag"
+
+	// MultiDB (Active-Active failover) metrics
+	MetricMultiDBFailovers             = "redis.client.multidb.failovers"
+	MetricMultiDBFailoverDuration      = "redis.client.multidb.failover.duration"
+	MetricMultiDBActiveDatabaseChanges = "redis.client.multidb.active_database.changes"
+	MetricMultiDBCircuitStateChanges   = "redis.client.multidb.circuit_breaker.state_changes"
+	MetricMultiDBHealthChecks          = "redis.client.multidb.health_checks"
+	MetricMultiDBHealthCheckDuration   = "redis.client.multidb.health_check.duration"
 
 	// Special pool names
 	PoolNameMain   = "main"
@@ -65,7 +73,8 @@ func GetObservabilityInstance() *ObservabilityInstance {
 }
 
 // Init initializes OpenTelemetry observability globally for all Redis clients.
-// This should be called once at application startup, BEFORE creating any Redis clients.
+// It is usually called once at application startup. Clients created before Init
+// are covered too: their existing connections are counted when Init runs.
 // After initialization, all Redis clients will automatically collect and export
 // metrics without needing any additional configuration.
 func (o *ObservabilityInstance) Init(cfg *Config) error {
@@ -128,6 +137,9 @@ func (o *ObservabilityInstance) shutdownLocked() error {
 	}
 
 	redis.SetOTelRecorder(nil)
+	if o.recorder != nil && o.recorder.opq != nil {
+		o.recorder.opq.stop() // record what is queued
+	}
 
 	// Note: We don't shutdown the MeterProvider since it's owned by the application
 	// The application should call provider.Shutdown() when appropriate
@@ -159,6 +171,9 @@ func (o *ObservabilityInstance) configToInternal(cfg *Config) config {
 	if cfg.MetricGroups&MetricGroupFlagStream != 0 {
 		enabledGroups[MetricGroupStream] = true
 	}
+	if cfg.MetricGroups&MetricGroupFlagMultiDB != 0 {
+		enabledGroups[MetricGroupMultiDB] = true
+	}
 
 	return config{
 		meterProvider:                   cfg.MeterProvider,
@@ -168,6 +183,7 @@ func (o *ObservabilityInstance) configToInternal(cfg *Config) config {
 		excludeCommands:                 cfg.ExcludeCommands,
 		hidePubSubChannelNames:          cfg.HidePubSubChannelNames,
 		hideStreamNames:                 cfg.HideStreamNames,
+		recordNilErrors:                 cfg.RecordNilErrors,
 		histAggregation:                 cfg.HistogramAggregation,
 		bucketsOperationDuration:        cfg.BucketsOperationDuration,
 		bucketsStreamProcessingDuration: cfg.BucketsStreamLag,
@@ -183,56 +199,46 @@ func (o *ObservabilityInstance) createRecorder(meter metric.Meter, cfg config) (
 	var operationDuration metric.Float64Histogram
 	if cfg.isMetricGroupEnabled(MetricGroupCommand) {
 		var operationDurationOpts []metric.Float64HistogramOption
-		operationDurationOpts = append(operationDurationOpts,
-			metric.WithDescription("Duration of database client operations"),
-			metric.WithUnit("s"),
-		)
 		if cfg.histAggregation == HistogramAggregationExplicitBucket {
 			operationDurationOpts = append(operationDurationOpts,
 				metric.WithExplicitBucketBoundaries(cfg.bucketsOperationDuration...),
 			)
 		}
-		operationDuration, err = meter.Float64Histogram(
-			MetricOperationDuration,
-			operationDurationOpts...,
-		)
+		var operationDurationConv dbconv.ClientOperationDuration
+		operationDurationConv, err = dbconv.NewClientOperationDuration(meter, operationDurationOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create operation duration histogram: %w", err)
 		}
+		operationDuration = operationDurationConv.Inst()
 	}
 
-	var connectionCountGauge metric.Int64ObservableGauge
+	var connectionCount metric.Int64UpDownCounter // OTel semconv: UpDownCounter
 	var connectionCreateTime metric.Float64Histogram
 	var connectionRelaxedTimeout metric.Int64UpDownCounter
 	var connectionHandoff metric.Int64Counter
 
 	if cfg.isMetricGroupEnabled(MetricGroupConnectionBasic) {
-		connectionCountGauge, err = meter.Int64ObservableGauge(
-			MetricConnectionCount,
-			metric.WithDescription("The number of connections that are currently in state described by the state attribute"),
-			metric.WithUnit("{connection}"),
+		connectionCount, err = meter.Int64UpDownCounter(
+			dbconv.ClientConnectionCount{}.Name(),
+			metric.WithDescription(dbconv.ClientConnectionCount{}.Description()),
+			metric.WithUnit(dbconv.ClientConnectionCount{}.Unit()),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create connection count metric: %w", err)
 		}
 
 		var connectionCreateTimeOpts []metric.Float64HistogramOption
-		connectionCreateTimeOpts = append(connectionCreateTimeOpts,
-			metric.WithDescription("The time it took to create a new connection"),
-			metric.WithUnit("s"),
-		)
 		if cfg.histAggregation == HistogramAggregationExplicitBucket {
 			connectionCreateTimeOpts = append(connectionCreateTimeOpts,
 				metric.WithExplicitBucketBoundaries(cfg.bucketsConnectionCreateTime...),
 			)
 		}
-		connectionCreateTime, err = meter.Float64Histogram(
-			MetricConnectionCreateTime,
-			connectionCreateTimeOpts...,
-		)
+		var connectionCreateTimeConv dbconv.ClientConnectionCreateTime
+		connectionCreateTimeConv, err = dbconv.NewClientConnectionCreateTime(meter, connectionCreateTimeOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create connection create time histogram: %w", err)
 		}
+		connectionCreateTime = connectionCreateTimeConv.Inst()
 
 		connectionRelaxedTimeout, err = meter.Int64UpDownCounter(
 			MetricConnectionRelaxedTimeout,
@@ -277,26 +283,21 @@ func (o *ObservabilityInstance) createRecorder(meter metric.Meter, cfg config) (
 
 	var connectionWaitTime metric.Float64Histogram
 	var connectionClosed metric.Int64Counter
-	var connectionPendingReqsGauge metric.Int64ObservableGauge
+	var connectionPendingReqs metric.Int64UpDownCounter // OTel semconv: UpDownCounter
 
 	if cfg.isMetricGroupEnabled(MetricGroupConnectionAdvanced) {
 		var connectionWaitTimeOpts []metric.Float64HistogramOption
-		connectionWaitTimeOpts = append(connectionWaitTimeOpts,
-			metric.WithDescription("The time it took to obtain a connection from the pool"),
-			metric.WithUnit("s"),
-		)
 		if cfg.histAggregation == HistogramAggregationExplicitBucket {
 			connectionWaitTimeOpts = append(connectionWaitTimeOpts,
 				metric.WithExplicitBucketBoundaries(cfg.bucketsConnectionWaitTime...),
 			)
 		}
-		connectionWaitTime, err = meter.Float64Histogram(
-			MetricConnectionWaitTime,
-			connectionWaitTimeOpts...,
-		)
+		var connectionWaitTimeConv dbconv.ClientConnectionWaitTime
+		connectionWaitTimeConv, err = dbconv.NewClientConnectionWaitTime(meter, connectionWaitTimeOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create connection wait time histogram: %w", err)
 		}
+		connectionWaitTime = connectionWaitTimeConv.Inst()
 
 		connectionClosed, err = meter.Int64Counter(
 			MetricConnectionClosed,
@@ -307,10 +308,10 @@ func (o *ObservabilityInstance) createRecorder(meter metric.Meter, cfg config) (
 			return nil, fmt.Errorf("failed to create connection closed metric: %w", err)
 		}
 
-		connectionPendingReqsGauge, err = meter.Int64ObservableGauge(
-			MetricConnectionPendingReqs,
-			metric.WithDescription("The number of pending requests waiting for a connection"),
-			metric.WithUnit("{request}"),
+		connectionPendingReqs, err = meter.Int64UpDownCounter(
+			dbconv.ClientConnectionPendingRequests{}.Name(),
+			metric.WithDescription(dbconv.ClientConnectionPendingRequests{}.Description()),
+			metric.WithUnit(dbconv.ClientConnectionPendingRequests{}.Unit()),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create connection pending requests metric: %w", err)
@@ -352,194 +353,123 @@ func (o *ObservabilityInstance) createRecorder(meter metric.Meter, cfg config) (
 		}
 	}
 
-	// Create recorder
-	recorder := &metricsRecorder{
-		operationDuration:          operationDuration,
-		connectionCountGauge:       connectionCountGauge,
-		connectionCreateTime:       connectionCreateTime,
-		connectionRelaxedTimeout:   connectionRelaxedTimeout,
-		connectionHandoff:          connectionHandoff,
-		clientErrors:               clientErrors,
-		maintenanceNotifications:   maintenanceNotifications,
-		connectionWaitTime:         connectionWaitTime,
-		connectionClosed:           connectionClosed,
-		connectionPendingReqsGauge: connectionPendingReqsGauge,
-		pubsubMessages:             pubsubMessages,
-		streamLag:                  streamLag,
-		cfg:                        &cfg,
-		pools:                      make([]poolInfo, 0),
+	// MultiDB (Active-Active failover). The durations share the operation
+	// duration buckets: a failover or a health check spans the same range
+	// (sub-millisecond to seconds) as a command.
+	var multiDBFailovers, multiDBActiveDatabaseChanges, multiDBCircuitStateChanges, multiDBHealthChecks metric.Int64Counter
+	var multiDBFailoverDuration, multiDBHealthCheckDuration metric.Float64Histogram
+	if cfg.isMetricGroupEnabled(MetricGroupMultiDB) {
+		var durationOpts []metric.Float64HistogramOption
+		if cfg.histAggregation == HistogramAggregationExplicitBucket {
+			durationOpts = append(durationOpts,
+				metric.WithExplicitBucketBoundaries(cfg.bucketsOperationDuration...),
+			)
+		}
+		multiDBFailovers, err = meter.Int64Counter(
+			MetricMultiDBFailovers,
+			metric.WithDescription("Number of MultiDB failovers from one member database to another"),
+			metric.WithUnit("{failover}"),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create multidb failovers metric: %w", err)
+		}
+		multiDBFailoverDuration, err = meter.Float64Histogram(
+			MetricMultiDBFailoverDuration,
+			append(durationOpts,
+				metric.WithDescription("Wall time of a MultiDB failover"),
+				metric.WithUnit("s"),
+			)...,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create multidb failover duration histogram: %w", err)
+		}
+		multiDBActiveDatabaseChanges, err = meter.Int64Counter(
+			MetricMultiDBActiveDatabaseChanges,
+			metric.WithDescription("Number of MultiDB active database changes (failover, fallback or manual selection)"),
+			metric.WithUnit("{change}"),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create multidb active database changes metric: %w", err)
+		}
+		multiDBCircuitStateChanges, err = meter.Int64Counter(
+			MetricMultiDBCircuitStateChanges,
+			metric.WithDescription("Number of MultiDB member circuit breaker state transitions"),
+			metric.WithUnit("{transition}"),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create multidb circuit breaker state changes metric: %w", err)
+		}
+		multiDBHealthChecks, err = meter.Int64Counter(
+			MetricMultiDBHealthChecks,
+			metric.WithDescription("Number of MultiDB member health checks, by outcome"),
+			metric.WithUnit("{check}"),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create multidb health checks metric: %w", err)
+		}
+		multiDBHealthCheckDuration, err = meter.Float64Histogram(
+			MetricMultiDBHealthCheckDuration,
+			append(durationOpts,
+				metric.WithDescription("Wall time of a MultiDB member health check"),
+				metric.WithUnit("s"),
+			)...,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create multidb health check duration histogram: %w", err)
+		}
 	}
 
-	// Register async callbacks for ObservableGauges
-	// These callbacks will pull stats from registered pools
-	if err := o.registerAsyncCallbacks(meter, recorder); err != nil {
-		return nil, fmt.Errorf("failed to register async callbacks: %w", err)
+	// The queue starts a goroutine: create it last, after every instrument
+	// above succeeded, so a failed Init leaves nothing running. It is only an
+	// optimization: a provider that rejects its gauge or callback gets inline
+	// recording (opq == nil), not a failed Init.
+	var opq *opQueue
+	if operationDuration != nil {
+		opq, _ = newOpQueue(meter, operationDuration)
+	}
+
+	// Create recorder
+	recorder := &metricsRecorder{
+		opq:                      opq,
+		operationDuration:        operationDuration,
+		connectionCount:          connectionCount,
+		connectionCreateTime:     connectionCreateTime,
+		connectionRelaxedTimeout: connectionRelaxedTimeout,
+		connectionHandoff:        connectionHandoff,
+		clientErrors:             clientErrors,
+		maintenanceNotifications: maintenanceNotifications,
+		connectionWaitTime:       connectionWaitTime,
+		connectionClosed:         connectionClosed,
+		connectionPendingReqs:    connectionPendingReqs,
+		pubsubMessages:           pubsubMessages,
+		streamLag:                streamLag,
+
+		multiDBFailovers:             multiDBFailovers,
+		multiDBFailoverDuration:      multiDBFailoverDuration,
+		multiDBActiveDatabaseChanges: multiDBActiveDatabaseChanges,
+		multiDBCircuitStateChanges:   multiDBCircuitStateChanges,
+		multiDBHealthChecks:          multiDBHealthChecks,
+		multiDBHealthCheckDuration:   multiDBHealthCheckDuration,
+
+		cfg: &cfg,
 	}
 
 	return recorder, nil
 }
 
-// parsePoolName extracts server address, port, and database index from a pool name.
-// Pool name format: "host:port/db" or "host/db" or "host:port" or "host"
-// Returns: (serverAddr, serverPort, dbIndex)
+// parsePoolName extracts the server endpoint from an addr_uniqueID pool name,
+// optionally suffixed with _pubsub or _pipeline.
 func parsePoolName(poolName string) (string, string, string) {
 	// Handle special pool names
 	if poolName == PoolNameMain || poolName == PoolNamePubSub {
 		return "", "", ""
 	}
 
-	parts := strings.Split(poolName, "/")
-	addrPart := parts[0]
-	dbIndex := ""
-	if len(parts) > 1 {
-		dbIndex = parts[1]
+	poolName = strings.TrimSuffix(poolName, "_pubsub")
+	poolName = strings.TrimSuffix(poolName, "_pipeline")
+	if i := strings.LastIndexByte(poolName, '_'); i >= 0 {
+		poolName = poolName[:i]
 	}
-	host, port := parseAddr(addrPart)
-	return host, port, dbIndex
-}
-
-func (o *ObservabilityInstance) registerAsyncCallbacks(meter metric.Meter, recorder *metricsRecorder) error {
-	// Register connection count gauge callback
-	if recorder.connectionCountGauge != nil {
-		_, err := meter.RegisterCallback(
-			func(ctx context.Context, observer metric.Observer) error {
-				recorder.poolsMu.RLock()
-				pools := recorder.pools
-				pubsubPools := recorder.pubsubPools
-				recorder.poolsMu.RUnlock()
-
-				// Iterate over all registered main pools
-				for _, poolInfo := range pools {
-					stats := poolInfo.pool.PoolStats()
-					if stats == nil {
-						continue
-					}
-
-					// Extract server info from pool name
-					serverAddr, serverPort, _ := parsePoolName(poolInfo.name)
-
-					// Build base attributes
-					baseAttrs := []attribute.KeyValue{
-						attribute.String(AttrDBSystemName, DBSystemRedis),
-						getLibraryVersionAttr(),
-					}
-					if serverAddr != "" {
-						baseAttrs = append(baseAttrs, attribute.String(AttrServerAddress, serverAddr))
-					}
-					if serverPort != "" && serverPort != "6379" {
-						baseAttrs = append(baseAttrs, attribute.String(AttrServerPort, serverPort))
-					}
-
-					// Add pool name
-					baseAttrs = append(baseAttrs, attribute.String(AttrDBClientConnectionPoolName, poolInfo.name))
-
-					// Observe idle connections
-					idleAttrs := append([]attribute.KeyValue{}, baseAttrs...)
-					idleAttrs = append(idleAttrs,
-						attribute.String(AttrDBClientConnectionState, ConnectionStateIdle),
-						attribute.Bool(AttrRedisClientConnectionPubSub, false),
-					)
-					observer.ObserveInt64(recorder.connectionCountGauge, int64(stats.IdleConns),
-						metric.WithAttributes(idleAttrs...))
-
-					// Observe used connections
-					usedConns := stats.TotalConns - stats.IdleConns
-					usedAttrs := append([]attribute.KeyValue{}, baseAttrs...)
-					usedAttrs = append(usedAttrs,
-						attribute.String(AttrDBClientConnectionState, ConnectionStateUsed),
-						attribute.Bool(AttrRedisClientConnectionPubSub, false),
-					)
-					observer.ObserveInt64(recorder.connectionCountGauge, int64(usedConns),
-						metric.WithAttributes(usedAttrs...))
-				}
-
-				for _, pubsubPoolInfo := range pubsubPools {
-					stats := pubsubPoolInfo.pool.Stats()
-					if stats == nil {
-						continue
-					}
-
-					// Build base attributes
-					baseAttrs := []attribute.KeyValue{
-						attribute.String(AttrDBSystemName, DBSystemRedis),
-						getLibraryVersionAttr(),
-						attribute.String(AttrDBClientConnectionPoolName, pubsubPoolInfo.name),
-					}
-
-					// PubSub pools report Active connections (not idle/used split
-					// We'll report Active as "used" and 0 as "idle"
-					idleAttrs := append([]attribute.KeyValue{}, baseAttrs...)
-					idleAttrs = append(idleAttrs,
-						attribute.String(AttrDBClientConnectionState, ConnectionStateIdle),
-						attribute.Bool(AttrRedisClientConnectionPubSub, true),
-					)
-					observer.ObserveInt64(recorder.connectionCountGauge, 0,
-						metric.WithAttributes(idleAttrs...))
-
-					usedAttrs := append([]attribute.KeyValue{}, baseAttrs...)
-					usedAttrs = append(usedAttrs,
-						attribute.String(AttrDBClientConnectionState, ConnectionStateUsed),
-						attribute.Bool(AttrRedisClientConnectionPubSub, true),
-					)
-					observer.ObserveInt64(recorder.connectionCountGauge, int64(stats.Active),
-						metric.WithAttributes(usedAttrs...))
-				}
-
-				return nil
-			},
-			recorder.connectionCountGauge,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to register connection count callback: %w", err)
-		}
-	}
-
-	// Register pending requests gauge callback
-	if recorder.connectionPendingReqsGauge != nil {
-		_, err := meter.RegisterCallback(
-			func(ctx context.Context, observer metric.Observer) error {
-				recorder.poolsMu.RLock()
-				pools := recorder.pools
-				recorder.poolsMu.RUnlock()
-
-				// Iterate over all registered pools
-				for _, poolInfo := range pools {
-					stats := poolInfo.pool.PoolStats()
-					if stats == nil {
-						continue
-					}
-
-					// Extract server info from pool name
-					serverAddr, serverPort, _ := parsePoolName(poolInfo.name)
-
-					// Build base attributes
-					baseAttrs := []attribute.KeyValue{
-						attribute.String(AttrDBSystemName, DBSystemRedis),
-						getLibraryVersionAttr(),
-					}
-					if serverAddr != "" {
-						baseAttrs = append(baseAttrs, attribute.String(AttrServerAddress, serverAddr))
-					}
-					if serverPort != "" && serverPort != "6379" {
-						baseAttrs = append(baseAttrs, attribute.String(AttrServerPort, serverPort))
-					}
-
-					// Add pool name
-					baseAttrs = append(baseAttrs, attribute.String(AttrDBClientConnectionPoolName, poolInfo.name))
-
-					// Observe pending requests count
-					observer.ObserveInt64(recorder.connectionPendingReqsGauge, int64(stats.PendingRequests),
-						metric.WithAttributes(baseAttrs...))
-				}
-
-				return nil
-			},
-			recorder.connectionPendingReqsGauge,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to register pending requests callback: %w", err)
-		}
-	}
-
-	return nil
+	host, port := parseAddr(poolName)
+	return host, port, ""
 }

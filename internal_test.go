@@ -2,13 +2,17 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9/auth"
 	"github.com/redis/go-redis/v9/internal/pool"
 	"github.com/redis/go-redis/v9/internal/proto"
 
@@ -17,6 +21,28 @@ import (
 )
 
 var ctx = context.TODO()
+
+type capturingLogger struct {
+	mu   sync.Mutex
+	logs []string
+}
+
+func (l *capturingLogger) Printf(_ context.Context, format string, v ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logs = append(l.logs, fmt.Sprintf(format, v...))
+}
+
+func (l *capturingLogger) contains(substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, msg := range l.logs {
+		if strings.Contains(msg, substr) {
+			return true
+		}
+	}
+	return false
+}
 
 var _ = Describe("newClusterState", func() {
 	var state *clusterState
@@ -74,7 +100,7 @@ var _ = Describe("newClusterState", func() {
 			Expect(slotAddr(state.slots[0])).To(Equal("10.10.10.10:7001"))
 			Expect(slotAddr(state.slots[1])).To(Equal("10.10.10.10:7002"))
 			Expect(slotAddr(state.slots[2])).To(Equal("1.2.3.4:1234"))
-			Expect(slotAddr(state.slots[3])).To(Equal(":1234"))
+			Expect(slotAddr(state.slots[3])).To(Equal("10.10.10.10:1234"))
 		})
 	})
 
@@ -344,6 +370,150 @@ func TestNodeAddress(t *testing.T) {
 	})
 }
 
+// TestNewClusterState_PortZero verifies that nodes reported by CLUSTER SLOTS
+// with a port of 0 — the topology produced by TLS-only Redis clusters started
+// with `--port 0 --tls-port 6379` — get their dial address normalized so they
+// do not surface to the dial path as ":0".
+//
+// Regression test for https://github.com/redis/go-redis/issues/3726
+// PubSub in v9.18.0 fails in TLS-only clusters because newClusterState stores
+// the verbatim ":0" port into clusterNode.Client.opt.Addr and the PubSub path
+// dials that address directly with no MOVED/seed fallback, producing
+// `dial tcp <ip>:0: connection refused`.
+//
+// The fix is expected to use the origin endpoint's port as a fallback whenever
+// CLUSTER SLOTS reports port 0 — the origin is by definition reachable, since
+// that is the address we used to obtain the slot map in the first place.
+func TestNewClusterState_PortZero(t *testing.T) {
+	t.Run("non-loopback origin replaces :0 port with origin port", func(t *testing.T) {
+		opt := &ClusterOptions{}
+		opt.init()
+		nodes := newClusterNodes(opt)
+		defer nodes.Close()
+
+		// Simulates a TLS-only cluster: CLUSTER SLOTS reports port 0 because
+		// the server is configured with `--port 0 --tls-port 6379`.
+		slots := []ClusterSlot{{
+			Start: 0,
+			End:   5460,
+			Nodes: []ClusterNode{{Addr: "172.30.0.10:0"}},
+		}, {
+			Start: 5461,
+			End:   10922,
+			Nodes: []ClusterNode{{Addr: "172.30.0.11:0"}},
+		}}
+
+		// Origin is the TLS configuration endpoint that returned this slot map.
+		state, err := newClusterState(nodes, slots, "172.30.0.10:6379")
+		if err != nil {
+			t.Fatalf("newClusterState failed: %v", err)
+		}
+
+		for i, want := range []string{"172.30.0.10:6379", "172.30.0.11:6379"} {
+			got := state.slots[i].nodes[0].Client.Options().Addr
+			if _, port, _ := net.SplitHostPort(got); port == "0" {
+				t.Fatalf("slot %d Addr = %q: port 0 reached the dial path "+
+					"(see #3726: PubSub dials this verbatim and fails with "+
+					"`connection refused`)", i, got)
+			}
+			if got != want {
+				t.Errorf("slot %d Addr = %q, want %q (origin port should be "+
+					"used as fallback for :0 nodes)", i, got, want)
+			}
+
+			// NodeAddress documents the raw server-reported endpoint
+			// (see options.go: "the exact endpoint string returned by
+			// CLUSTER SLOTS before any resolution or transformation").
+			// The port-0 fix is a transformation, so NodeAddress keeps
+			// the original ":0" value used by maintenance-notification
+			// matching. If the design changes this, update this assertion.
+			wantNodeAddr := []string{"172.30.0.10:0", "172.30.0.11:0"}[i]
+			if got := state.slots[i].nodes[0].Client.NodeAddress(); got != wantNodeAddr {
+				t.Errorf("slot %d NodeAddress = %q, want %q (raw server value)",
+					i, got, wantNodeAddr)
+			}
+		}
+	})
+
+	t.Run("non-zero ports are unchanged", func(t *testing.T) {
+		// Guards against the fix over-rewriting ports for normal clusters.
+		opt := &ClusterOptions{}
+		opt.init()
+		nodes := newClusterNodes(opt)
+		defer nodes.Close()
+
+		slots := []ClusterSlot{{
+			Nodes: []ClusterNode{{Addr: "172.30.0.10:6380"}},
+		}}
+
+		state, err := newClusterState(nodes, slots, "172.30.0.10:6379")
+		if err != nil {
+			t.Fatalf("newClusterState failed: %v", err)
+		}
+
+		if got := state.slots[0].nodes[0].Client.Options().Addr; got != "172.30.0.10:6380" {
+			t.Errorf("Addr = %q, want %q (non-zero ports must be preserved)",
+				got, "172.30.0.10:6380")
+		}
+	})
+
+	t.Run("loopback :0 follows loopback substitution and uses origin port", func(t *testing.T) {
+		// Combines the two transformations newClusterState already does
+		// (loopback substitution + the new port-0 fallback) and asserts
+		// the order is sane: replace the loopback host with the origin
+		// host, then replace the :0 port with the origin port.
+		opt := &ClusterOptions{}
+		opt.init()
+		nodes := newClusterNodes(opt)
+		defer nodes.Close()
+
+		slots := []ClusterSlot{{
+			Nodes: []ClusterNode{{Addr: "127.0.0.1:0"}},
+		}}
+
+		state, err := newClusterState(nodes, slots, "172.30.0.10:6379")
+		if err != nil {
+			t.Fatalf("newClusterState failed: %v", err)
+		}
+
+		if got := state.slots[0].nodes[0].Client.Options().Addr; got != "172.30.0.10:6379" {
+			t.Errorf("Addr = %q, want %q (loopback host + :0 port should both "+
+				"be replaced from the origin)", got, "172.30.0.10:6379")
+		}
+	})
+}
+
+// With `cluster-preferred-endpoint-type unknown-endpoint` the server sends a
+// null host in CLUSTER SLOTS, and the client is expected to reuse the host it
+// connected to.
+func TestNewClusterState_NullHost(t *testing.T) {
+	for _, null := range []string{"_\r\n", "$-1\r\n"} {
+		cmd := NewClusterSlotsCmd(context.Background())
+		reply := "*1\r\n*3\r\n:0\r\n:5460\r\n*2\r\n" + null + ":6380\r\n"
+		if err := cmd.readReply(proto.NewReader(strings.NewReader(reply))); err != nil {
+			t.Fatalf("reply %q: readReply() = %v", null, err)
+		}
+
+		opt := &ClusterOptions{}
+		opt.init()
+		nodes := newClusterNodes(opt)
+		defer nodes.Close()
+
+		state, err := newClusterState(nodes, cmd.Val(), "172.30.0.10:6379")
+		if err != nil {
+			t.Fatalf("newClusterState failed: %v", err)
+		}
+
+		client := state.slots[0].nodes[0].Client
+		if got := client.Options().Addr; got != "172.30.0.10:6380" {
+			t.Errorf("reply %q: Addr = %q, want %q", null, got, "172.30.0.10:6380")
+		}
+		if got := client.NodeAddress(); got != ":6380" {
+			t.Errorf("reply %q: NodeAddress = %q, want %q", null, got, ":6380")
+		}
+	}
+}
+
 type fixedHash string
 
 func (h fixedHash) Get(string) string {
@@ -435,6 +605,201 @@ func BenchmarkRingShardingRebalanceLocked(b *testing.B) {
 	}
 }
 
+// CSC command-processing and metadata benchmarks.
+// Keep results observable without allocating a new command in each iteration.
+var (
+	cscBenchmarkString string
+	cscBenchmarkBool   bool
+	cscBenchmarkError  error
+	cscBenchmarkMeta   cscCommandMeta
+	cscBenchmarkView   *commandMetadataView
+	cscBenchmarkCount  int
+)
+
+func BenchmarkCSCCommandError(b *testing.B) {
+	var active atomic.Bool
+	active.Store(true)
+	c := &baseClient{opt: &Options{Protocol: 3}, cscActive: &active}
+	for _, tc := range []struct {
+		name string
+		arg  interface{}
+	}{
+		{"lowercase", "get"},
+		{"uppercase", "GET"},
+		{"bytes", []byte("GET")},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			cmd := NewCmd(context.Background(), tc.arg, "key")
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				cscBenchmarkError = c.cscCommandError(cmd)
+			}
+		})
+	}
+}
+
+func BenchmarkCSCEligibility(b *testing.B) {
+	view := (&baseClient{}).metadataView()
+	for _, args := range [][]interface{}{
+		{"get", "key"},
+		{"hget", "key", "field"},
+		{"xinfo", "consumers", "key", "group"},
+	} {
+		b.Run(args[0].(string), func(b *testing.B) {
+			cmd := NewCmd(context.Background(), args...)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				cscBenchmarkMeta, cscBenchmarkBool = cscEligibleMeta(view, cmd)
+			}
+		})
+	}
+}
+
+func BenchmarkBuildCacheKey(b *testing.B) {
+	cmd := NewStringCmd(context.Background(), "get", "key")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkString, cscBenchmarkBool = buildCacheKeyReference(cmd)
+	}
+}
+
+func BenchmarkCSCEntryKey(b *testing.B) {
+	cmd := NewStringCmd(context.Background(), "get", "key")
+	prefix := cscNamespacePrefix(0, "")
+	fingerprint := (&baseClient{}).metadataView().cscFingerprint
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkString, cscBenchmarkBool = cscRenderEntryKey(prefix, fingerprint, cmd)
+	}
+}
+
+func BenchmarkCommandArgsRepeatable(b *testing.B) {
+	for _, size := range []int{2, 10} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			args := make([]interface{}, size)
+			for i := range args {
+				args[i] = "key"
+			}
+			cmd := NewCmd(context.Background(), args...)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				cscBenchmarkBool = commandArgsRepeatable(cmd)
+			}
+		})
+	}
+}
+
+func BenchmarkCSCKeynumLayout(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		arg  interface{}
+	}{
+		{"int", 2},
+		{"string", "2"},
+		{"bytes", []byte("2")},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			cmd := NewCmd(context.Background(), "zunion", tc.arg, "key1", "key2")
+			meta, ok := cscEligibleMeta((&baseClient{}).metadataView(), cmd)
+			if !ok {
+				b.Fatal("ZUNION must be eligible")
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, cscBenchmarkCount = cscRedisKeyLayout(meta, cmd)
+			}
+		})
+	}
+}
+
+func BenchmarkCSCCanExtractRedisKeys(b *testing.B) {
+	cmd := NewCmd(context.Background(), "mget", []byte("key"), 42)
+	meta, ok := cscEligibleMeta((&baseClient{}).metadataView(), cmd)
+	if !ok {
+		b.Fatal("MGET must be eligible")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkBool = cscCanExtractRedisKeys(meta, cmd)
+	}
+}
+
+type cscBenchmarkMissPool struct{ pool.Pooler }
+
+func (cscBenchmarkMissPool) Get(context.Context) (*pool.Conn, error) {
+	return nil, pool.ErrClosed
+}
+
+func BenchmarkCSCProcessCachedHit(b *testing.B)  { benchmarkCSCProcessCached(b, true) }
+func BenchmarkCSCProcessCachedMiss(b *testing.B) { benchmarkCSCProcessCached(b, false) }
+
+func benchmarkCSCProcessCached(b *testing.B, hit bool) {
+	ctx := context.Background()
+	cache := NewLocalCache(CacheConfig{MaxEntries: 16})
+	c := &baseClient{
+		opt:           &Options{Protocol: 3},
+		csc:           cache,
+		cscKeyPrefix:  cscNamespacePrefix(0, ""),
+		connPool:      cscBenchmarkMissPool{},
+		staticCmdMeta: defaultCommandMetadataView(),
+	}
+	cmd := NewStringCmd(ctx, "get", "key")
+	view := c.metadataView()
+	meta, ok := cscEligibleMeta(view, cmd)
+	if !ok {
+		b.Fatal("GET must be eligible")
+	}
+	if hit {
+		rawKey, _ := buildCacheKeyReference(cmd)
+		key := cscEntryKey(c.cscKeyPrefix, view.cscFingerprint, rawKey)
+		if !cache.set(key, []string{cscNamespacedKey(c.cscKeyPrefix, "key")}, []byte("$5\r\nvalue\r\n")) {
+			b.Fatal("failed to seed cache")
+		}
+	}
+	// Misses stop at pool acquisition and cancel their reservation. This
+	// measures the cache lifecycle without a Redis server, dial, or unbounded
+	// fixture growth; it does not measure a successful network fetch.
+	var wantErr error
+	if !hit {
+		wantErr = pool.ErrClosed
+	}
+	if err := c.processCached(ctx, cmd, nil, view, meta, 0); err != wantErr {
+		b.Fatalf("processCached: got %v, want %v", err, wantErr)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkError = c.processCached(ctx, cmd, nil, view, meta, 0)
+	}
+	b.StopTimer()
+	if !hit && cache.Len() != 0 {
+		b.Fatal("miss reservation leaked")
+	}
+}
+
+func BenchmarkBuildDefaultView(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkView = buildCommandMetadataView(nil, nil)
+	}
+}
+
+func BenchmarkTableFingerprint(b *testing.B) {
+	table := (&baseClient{}).metadataView().cscTable
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cscBenchmarkString = cscTableFingerprint(table)
+	}
+}
+
 type testCounter struct {
 	mu sync.Mutex
 	t  *testing.T
@@ -460,6 +825,10 @@ func (ct *testCounter) expect(values map[string]int) {
 	}
 }
 
+// testOnCloseHookID is the id used by the ring-shard cleanup tests when
+// registering a close hook against the internal onCloseHooks registry.
+const testOnCloseHookID = "test-close-counter"
+
 func TestRingShardsCleanup(t *testing.T) {
 	const (
 		ringShard1Name = "ringShardOne"
@@ -479,7 +848,7 @@ func TestRingShardsCleanup(t *testing.T) {
 			},
 			NewClient: func(opt *Options) *Client {
 				c := NewClient(opt)
-				c.baseClient.onClose = c.baseClient.wrappedOnClose(func() error {
+				c.baseClient.onClose.register(testOnCloseHookID, func() error {
 					closeCounter.increment(opt.Addr)
 					return nil
 				})
@@ -515,7 +884,7 @@ func TestRingShardsCleanup(t *testing.T) {
 
 		var (
 			ring        *Ring
-			shouldClose int32
+			shouldClose atomic.Int32
 		)
 
 		ring = NewRing(&RingOptions{
@@ -523,12 +892,12 @@ func TestRingShardsCleanup(t *testing.T) {
 				ringShard1Name: ringShard1Addr,
 			},
 			NewClient: func(opt *Options) *Client {
-				if atomic.LoadInt32(&shouldClose) != 0 {
+				if shouldClose.Load() != 0 {
 					ring.Close()
 				}
 				createCounter.increment(opt.Addr)
 				c := NewClient(opt)
-				c.baseClient.onClose = c.baseClient.wrappedOnClose(func() error {
+				c.baseClient.onClose.register(testOnCloseHookID, func() error {
 					closeCounter.increment(opt.Addr)
 					return nil
 				})
@@ -538,7 +907,7 @@ func TestRingShardsCleanup(t *testing.T) {
 		createCounter.expect(map[string]int{ringShard1Addr: 1})
 		closeCounter.expect(map[string]int{})
 
-		atomic.StoreInt32(&shouldClose, 1)
+		shouldClose.Store(1)
 
 		ring.SetAddrs(map[string]string{
 			ringShard2Name: ringShard2Addr,
@@ -566,7 +935,10 @@ func (e timeoutErr) Error() string {
 	return "i/o timeout"
 }
 
-var _ = Describe("withConn", func() {
+// NonRedisEnterprise: exercises connection-pool replacement internals against a
+// local Redis and requires a localhost server; not meaningful against a remote
+// Enterprise cluster.
+var _ = Describe("withConn", Label("NonRedisEnterprise"), func() {
 	var client *Client
 
 	BeforeEach(func() {
@@ -652,7 +1024,8 @@ var _ = Describe("ClusterClient", func() {
 })
 
 var _ = Describe("isLoopback", func() {
-	DescribeTable("should correctly identify loopback addresses",
+	DescribeTable(
+		"should correctly identify loopback addresses",
 		func(host string, expected bool) {
 			result := isLoopback(host)
 			Expect(result).To(Equal(expected))
@@ -685,3 +1058,605 @@ var _ = Describe("isLoopback", func() {
 		Entry("partial docker internal", "docker.internal", false),
 	)
 })
+
+// TestOnCloseHooks_RunInReverseRegistrationOrder verifies that hooks are invoked in
+// REVERSE registration order (LIFO): a hook registered later is a consumer of state an
+// earlier registration provides, so it must run first. Concretely, an autopipeliner
+// drain (registered lazily) must run before the Sentinel failover teardown (registered
+// at construction) so the drain can still resolve the master address. See onCloseHooks.run.
+func TestOnCloseHooks_RunInReverseRegistrationOrder(t *testing.T) {
+	h := &onCloseHooks{}
+	var calls []string
+
+	h.register("a", func() error { calls = append(calls, "a"); return nil })
+	h.register("b", func() error { calls = append(calls, "b"); return nil })
+	h.register("c", func() error { calls = append(calls, "c"); return nil })
+
+	if err := h.run(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"c", "b", "a"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("run order = %v, want %v (LIFO)", calls, want)
+	}
+}
+
+// TestOnCloseHooks_RegisterSameIDReplaces is the regression test for issue
+// #3772. Registering the same id repeatedly must replace the existing
+// callback rather than chain onto it, so the registry stays bounded even
+// under storm-like re-registration (the exact scenario that previously leaked
+// when initConn re-wrapped c.onClose on every connection init).
+func TestOnCloseHooks_RegisterSameIDReplaces(t *testing.T) {
+	h := &onCloseHooks{}
+	const id = "same-id"
+	const iterations = 10_000
+
+	var lastSeen atomic.Int32
+	for i := 0; i < iterations; i++ {
+		i := int32(i)
+		h.register(id, func() error { lastSeen.Store(i); return nil })
+	}
+
+	if got := len(h.order); got != 1 {
+		t.Fatalf("order length after %d re-registrations = %d, want 1", iterations, got)
+	}
+	if got := len(h.hooks); got != 1 {
+		t.Fatalf("hooks map size after %d re-registrations = %d, want 1", iterations, got)
+	}
+
+	if err := h.run(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := lastSeen.Load(); got != iterations-1 {
+		t.Fatalf("last-registered callback not invoked: lastSeen = %d, want %d", got, iterations-1)
+	}
+}
+
+// TestOnCloseHooks_RegisterAfterRunIsRejected pins the contract the cluster FD
+// router's per-node evict hook relies on: once run has taken its snapshot the
+// owner is closing, and a callback registered from then on would never fire —
+// so register must report false and store nothing, instead of silently
+// accepting a hook that leaks whatever it was meant to clean up (cursor bugbot
+// on #4002: a node client closing between a child's publication and its evict
+// hook's registration left the child in the router map for good).
+func TestOnCloseHooks_RegisterAfterRunIsRejected(t *testing.T) {
+	h := &onCloseHooks{}
+	var early, late atomic.Int32
+
+	if !h.register("early", func() error { early.Add(1); return nil }) {
+		t.Fatal("register before run must report true")
+	}
+	if err := h.run(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := early.Load(); got != 1 {
+		t.Fatalf("early hook invoked %d times, want 1", got)
+	}
+
+	if h.register("late", func() error { late.Add(1); return nil }) {
+		t.Fatal("register after run must report false: the owner is closing and the hook would never fire")
+	}
+	if _, stored := h.hooks["late"]; stored {
+		t.Fatal("a rejected registration must not be stored")
+	}
+	// A second run (Close is idempotent at the owner level) must not surface it.
+	if err := h.run(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := late.Load(); got != 0 {
+		t.Fatalf("late hook invoked %d times, want 0", got)
+	}
+}
+
+// TestOnCloseHooks_DistinctIDsCoexist guarantees the dedup behavior does not
+// discard hooks from other callers: registering new ids must never drop
+// previously registered ids.
+func TestOnCloseHooks_DistinctIDsCoexist(t *testing.T) {
+	h := &onCloseHooks{}
+	var aCount, bCount atomic.Int32
+
+	h.register("a", func() error { aCount.Add(1); return nil })
+	h.register("b", func() error { bCount.Add(1); return nil })
+	// Re-registering "a" must not drop "b".
+	h.register("a", func() error { aCount.Add(1); return nil })
+
+	if err := h.run(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if a, b := aCount.Load(), bCount.Load(); a != 1 || b != 1 {
+		t.Fatalf("call counts a=%d b=%d, want a=1 b=1", a, b)
+	}
+}
+
+// TestOnCloseHooks_Unregister verifies that unregister removes a hook and
+// that running after unregister does not invoke it.
+func TestOnCloseHooks_Unregister(t *testing.T) {
+	h := &onCloseHooks{}
+	var aCalled, bCalled bool
+
+	h.register("a", func() error { aCalled = true; return nil })
+	h.register("b", func() error { bCalled = true; return nil })
+	h.unregister("a")
+	h.unregister("missing") // no-op must not panic
+
+	if err := h.run(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if aCalled {
+		t.Fatal("unregistered hook was invoked")
+	}
+	if !bCalled {
+		t.Fatal("remaining hook was not invoked")
+	}
+	if got := len(h.order); got != 1 {
+		t.Fatalf("order length = %d, want 1", got)
+	}
+}
+
+// TestOnCloseHooks_AllRunOnError confirms every hook is invoked even if an
+// earlier one returns an error, and that the first error in INVOCATION order (LIFO) is
+// returned. "b" runs before "a" under LIFO, so its error is the first non-nil one.
+func TestOnCloseHooks_AllRunOnError(t *testing.T) {
+	h := &onCloseHooks{}
+	var called [3]bool
+	errFirst := fmt.Errorf("first")
+	errSecond := fmt.Errorf("second")
+
+	h.register("a", func() error { called[0] = true; return errFirst })
+	h.register("b", func() error { called[1] = true; return errSecond })
+	h.register("c", func() error { called[2] = true; return nil })
+
+	// Invocation order is c, b, a (LIFO); the first non-nil error encountered is errSecond.
+	err := h.run()
+	if err != errSecond {
+		t.Fatalf("run() err = %v, want %v", err, errSecond)
+	}
+	for i, c := range called {
+		if !c {
+			t.Fatalf("hook %d was not invoked", i)
+		}
+	}
+}
+
+// TestOnCloseHooks_NilReceiver ensures run() on a nil registry is a safe
+// no-op. baseClient embedded in Conn/Tx does initialize the registry, but
+// defensive nil-safety lets future constructors add the field without
+// breaking Close().
+func TestOnCloseHooks_NilReceiver(t *testing.T) {
+	var h *onCloseHooks
+	if err := h.run(); err != nil {
+		t.Fatalf("run() on nil = %v, want nil", err)
+	}
+}
+
+// TestOnCloseHooks_ConcurrentRegisterSameID hammers the registry with many
+// goroutines re-registering under the same id. The registry must remain
+// bounded and the surviving callback must still be invoked exactly once.
+func TestOnCloseHooks_ConcurrentRegisterSameID(t *testing.T) {
+	h := &onCloseHooks{}
+	const id = "hot"
+	const goroutines = 64
+	const perG = 1_000
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				h.register(id, func() error { return nil })
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := len(h.order); got != 1 {
+		t.Fatalf("order length after concurrent storm = %d, want 1", got)
+	}
+}
+
+// entraidLikeProvider mimics the exact semantics of
+// github.com/redis/go-redis-entraid's StreamingCredentialsProvider relevant
+// to issue #3772: it deduplicates subscriptions by listener pointer
+// identity, and every call to Subscribe returns a FRESH UnsubscribeFunc
+// closure that removes the listener by pointer match from the shared
+// listeners slice. Two unsubs obtained for the same listener are therefore
+// equivalent: the first one called removes the entry, any subsequent call
+// is a safe no-op.
+type entraidLikeProvider struct {
+	mu         sync.Mutex
+	listeners  []auth.CredentialsListener
+	subscribeN atomic.Int32
+	unsubCalls atomic.Int32
+}
+
+func (p *entraidLikeProvider) Subscribe(listener auth.CredentialsListener) (auth.Credentials, auth.UnsubscribeFunc, error) {
+	p.subscribeN.Add(1)
+
+	p.mu.Lock()
+	already := false
+	for _, l := range p.listeners {
+		if l == listener {
+			already = true
+			break
+		}
+	}
+	if !already {
+		p.listeners = append(p.listeners, listener)
+	}
+	p.mu.Unlock()
+
+	unsub := func() error {
+		p.unsubCalls.Add(1)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for i, l := range p.listeners {
+			if l == listener {
+				p.listeners = append(p.listeners[:i], p.listeners[i+1:]...)
+				return nil
+			}
+		}
+		return nil
+	}
+	return auth.NewBasicCredentials("u", "p"), unsub, nil
+}
+
+func (p *entraidLikeProvider) listenerCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.listeners)
+}
+
+// stubCredentialsListener is a minimal auth.CredentialsListener used only
+// for pointer-identity in the entraid-mimicking test.
+type stubCredentialsListener struct{}
+
+func (*stubCredentialsListener) OnNext(auth.Credentials) {}
+func (*stubCredentialsListener) OnError(error)           {}
+
+// TestInitConn_EntraidLike_NoLeakAcrossReinits is the targeted regression
+// test for issue #3772 against the real-world StreamingCredentialsProvider
+// behavior implemented by go-redis-entraid. It simulates N re-initializations
+// on the same logical connection (i.e. the same CredentialsListener pointer,
+// which is what streaming.Manager.Listener returns from its per-connId cache),
+// replacing cn.SetOnClose with each new unsubscribe closure.
+//
+// Invariants the fix must uphold:
+//  1. Subscribe dedups: the provider's listener list stays at size 1.
+//  2. Calling only the MOST RECENT unsub fully removes the listener.
+//  3. All prior (orphaned) unsubs are safe no-ops after that.
+//  4. No registration remains on the provider after close.
+func TestInitConn_EntraidLike_NoLeakAcrossReinits(t *testing.T) {
+	const reinits = 1000
+
+	provider := &entraidLikeProvider{}
+	listener := &stubCredentialsListener{}
+
+	var latestUnsub auth.UnsubscribeFunc
+	orphaned := make([]auth.UnsubscribeFunc, 0, reinits-1)
+
+	for i := 0; i < reinits; i++ {
+		_, unsub, err := provider.Subscribe(listener)
+		if err != nil {
+			t.Fatalf("Subscribe #%d: %v", i, err)
+		}
+		if latestUnsub != nil {
+			// Mirror the pool.Conn.SetOnClose behavior: the previous unsub
+			// is dropped on the floor, only the latest one is retained.
+			orphaned = append(orphaned, latestUnsub)
+		}
+		latestUnsub = unsub
+	}
+
+	if got := provider.listenerCount(); got != 1 {
+		t.Fatalf("after %d Subscribes with same listener, listener count = %d, want 1", reinits, got)
+	}
+	if got := provider.subscribeN.Load(); got != int32(reinits) {
+		t.Fatalf("Subscribe call count = %d, want %d", got, reinits)
+	}
+
+	// Only the latest unsub is invoked, matching the post-fix cn.onClose.
+	if err := latestUnsub(); err != nil {
+		t.Fatalf("latest unsub returned error: %v", err)
+	}
+	if got := provider.listenerCount(); got != 0 {
+		t.Fatalf("listener count after latest unsub = %d, want 0", got)
+	}
+
+	// Every orphaned unsub must be a safe no-op (contract in auth.UnsubscribeFunc).
+	for i, u := range orphaned {
+		if err := u(); err != nil {
+			t.Fatalf("orphaned unsub #%d returned error: %v", i, err)
+		}
+	}
+	if got := provider.listenerCount(); got != 0 {
+		t.Fatalf("listener count after orphaned unsubs = %d, want 0", got)
+	}
+}
+
+// TestPubSubConn_PassesPersistedChannelsToNewConn is a regression test for
+// https://github.com/redis/go-redis/issues/3806.
+//
+// ClusterClient.pubSub() installs a newConn closure that picks the target
+// node by hash slot of channels[0]. Before the fix, PubSub.conn() only
+// passed c.channels (regular SUBSCRIBE) into that closure — sharded
+// SSubscribe channels stored in c.schannels were silently dropped.
+//
+// For an SSubscribe-only PubSub (the common ClusterClient.SSubscribe case)
+// the channel list was empty on reconnect, so the closure fell through to
+// nodes.Random(). The reconnected SSUBSCRIBE went to the wrong shard, the
+// MOVED reply was never read, and the PubSub looked healthy while receiving
+// no messages.
+//
+// This test exercises PubSub.conn() with a stub newConn that records the
+// channel list it receives. The cluster routing layer is not under test
+// here — the regression is whether the channel list reaches the closure.
+func TestPubSubConn_PassesPersistedChannelsToNewConn(t *testing.T) {
+	const (
+		regularCh = "regular-ch"
+		shardCh   = "{shardA}-ch1"
+		freshCh   = "fresh-ch"
+	)
+
+	tests := []struct {
+		name        string
+		channels    map[string]struct{}
+		schannels   map[string]struct{}
+		newChannels []string
+		wantIn      []string // strings that MUST be present in the captured slice
+	}{
+		{
+			name:     "subscribe-only reconnect: existing channels forwarded",
+			channels: map[string]struct{}{regularCh: {}},
+			wantIn:   []string{regularCh},
+		},
+		{
+			// The bug from #3806: SSubscribe-only reconnect dropped
+			// c.schannels and reached newConn with an empty list.
+			name:      "ssubscribe-only reconnect: schannels forwarded (#3806)",
+			schannels: map[string]struct{}{shardCh: {}},
+			wantIn:    []string{shardCh},
+		},
+		{
+			name:        "initial ssubscribe: newChannels forwarded",
+			newChannels: []string{shardCh},
+			wantIn:      []string{shardCh},
+		},
+		{
+			name:      "mixed subscribe + ssubscribe: both kinds forwarded",
+			channels:  map[string]struct{}{regularCh: {}},
+			schannels: map[string]struct{}{shardCh: {}},
+			wantIn:    []string{regularCh, shardCh},
+		},
+		{
+			name:        "newChannels appended after persisted ones",
+			schannels:   map[string]struct{}{shardCh: {}},
+			newChannels: []string{freshCh},
+			wantIn:      []string{shardCh, freshCh},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var captured []string
+			stubErr := errors.New("stub: newConn does not create a real conn")
+
+			ps := &PubSub{
+				opt:       &Options{Addr: "stub:6379"},
+				channels:  tt.channels,
+				schannels: tt.schannels,
+				newConn: func(_ context.Context, _ string, channels []string) (*pool.Conn, error) {
+					captured = append([]string(nil), channels...)
+					return nil, stubErr
+				},
+				closeConn: func(*pool.Conn) error { return nil },
+			}
+
+			ps.mu.Lock()
+			_, err := ps.conn(context.Background(), tt.newChannels)
+			ps.mu.Unlock()
+			if !errors.Is(err, stubErr) {
+				t.Fatalf("conn err = %v, want stub", err)
+			}
+
+			for _, want := range tt.wantIn {
+				found := false
+				for _, got := range captured {
+					if got == want {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("missing %q in channels passed to newConn (got %v); see #3806",
+						want, captured)
+				}
+			}
+		})
+	}
+}
+
+// These benchmarks measure cluster routing without a Redis server. A custom
+// topology prevents discovery I/O, and each iteration creates fresh commands.
+func newClusterRoutingBenchmarkClient(b *testing.B) (*ClusterClient, []string) {
+	b.Helper()
+	slots := []ClusterSlot{
+		{Start: 0, End: 5460, Nodes: []ClusterNode{{Addr: "127.0.0.1:1"}, {Addr: "127.0.0.1:4"}}},
+		{Start: 5461, End: 10922, Nodes: []ClusterNode{{Addr: "127.0.0.1:2"}, {Addr: "127.0.0.1:5"}}},
+		{Start: 10923, End: 16383, Nodes: []ClusterNode{{Addr: "127.0.0.1:3"}, {Addr: "127.0.0.1:6"}}},
+	}
+	c := NewClusterClient(&ClusterOptions{
+		ClusterSlots: func(context.Context) ([]ClusterSlot, error) { return slots, nil },
+	})
+	b.Cleanup(func() { _ = c.Close() })
+	if _, err := c.state.Get(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	keys := make([]string, 1024)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("routing:key:%d", i)
+	}
+	return c, keys
+}
+
+func BenchmarkClusterRoutingGet(b *testing.B) {
+	c, keys := newClusterRoutingBenchmarkClient(b)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cmd := NewStringCmd(ctx, "get", keys[i%len(keys)])
+		decision := c.commandRoutingDecision(ctx, cmd)
+		if decision.policyErr != nil {
+			b.Fatal(decision.policyErr)
+		}
+		slot := c.cmdSlotWithDecision(cmd, &decision, -1)
+		if _, err := c.cmdNodeWithDecision(ctx, slot, &decision); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkClusterRoutingProcessGet(b *testing.B) {
+	c, keys := newClusterRoutingBenchmarkClient(b)
+	ctx := context.Background()
+	state, err := c.state.Get(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, node := range state.Masters {
+		node.Client.AddHook(clusterRoutingShortCircuitHook{})
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cmd := NewStringCmd(ctx, "get", keys[i%len(keys)])
+		if err := c.process(ctx, cmd); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkClusterRoutingPipeline100(b *testing.B) {
+	c, keys := newClusterRoutingBenchmarkClient(b)
+	ctx := context.Background()
+	cmds := make([]Cmder, 100)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := range cmds {
+			cmds[j] = NewStringCmd(ctx, "get", keys[(i*len(cmds)+j)%len(keys)])
+		}
+		if err := c.mapCmdsByNode(ctx, newCmdsMap(), cmds); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkClusterRoutingAutoPipelineAdmission(b *testing.B) {
+	c, keys := newClusterRoutingBenchmarkClient(b)
+	ap, err := c.AutoPipelineWithOptions(&AutoPipelineOptions{
+		MaxBatchSize: 512, MaxConcurrentBatches: 200, Unordered: true,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = ap.Close() })
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cmd := NewStringCmd(ctx, "get", keys[i%len(keys)])
+		if divert, err := ap.routeCommand(ctx, cmd); divert || err != nil {
+			b.Fatalf("GET routing: divert=%v, err=%v", divert, err)
+		}
+		_ = ap.shardFn(cmd)
+		cmd.setClusterRoutingDecision(nil)
+	}
+}
+
+func BenchmarkRoutingKeyPlan(b *testing.B) {
+	for _, n := range []int{2, 16, 100} {
+		b.Run(fmt.Sprintf("Range%d", n), func(b *testing.B) {
+			args := make([]interface{}, n+1)
+			args[0] = "mget"
+			for i := 1; i < len(args); i++ {
+				args[i] = fmt.Sprintf("{k}%d", i)
+			}
+			cmd := NewCmd(context.Background(), args...)
+			meta := defaultCommandMetadataView().routingTable["mget"]
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				plan, ok := routingResolveKeyPlan(meta, cmd)
+				if !ok || len(plan.positions) != n {
+					b.Fatal(plan, ok)
+				}
+			}
+		})
+	}
+	b.Run("Overlapping", func(b *testing.B) {
+		meta := deriveRoutingCommandMeta("overlap", &CommandInfo{KeySpecs: []KeySpec{
+			{Flags: []string{"RO", "access"}, BeginSearch: "index", Index: 1, FindKeys: "range", LastKey: 1, KeyStep: 1},
+			{Flags: []string{"RO", "access"}, BeginSearch: "index", Index: 2, FindKeys: "range", LastKey: 1, KeyStep: 1},
+		}})
+		cmd := NewCmd(context.Background(), "overlap", "a", "b", "c")
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			plan, ok := routingResolveKeyPlan(meta, cmd)
+			if !ok || len(plan.positions) != 3 {
+				b.Fatal(plan, ok)
+			}
+		}
+	})
+}
+
+func BenchmarkClusterRoutingAutoPipelineMap100(b *testing.B) {
+	c, keys := newClusterRoutingBenchmarkClient(b)
+	ap, err := c.AutoPipelineWithOptions(&AutoPipelineOptions{MaxBatchSize: 512, MaxConcurrentBatches: 200, Unordered: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = ap.Close() })
+	ctx := context.Background()
+	cmds := make([]Cmder, 100)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := range cmds {
+			cmd := NewStringCmd(ctx, "get", keys[(i*len(cmds)+j)%len(keys)])
+			if divert, err := ap.routeCommand(ctx, cmd); divert || err != nil {
+				b.Fatalf("GET routing: divert=%v, err=%v", divert, err)
+			}
+			_ = ap.shardFn(cmd)
+			cmds[j] = cmd
+		}
+		if err := c.mapCmdsByNode(ctx, newCmdsMap(), cmds); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRoutingFirstKey(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		key  interface{}
+	}{
+		{"String", "0123456789abcdef"}, {"Bytes", []byte("0123456789abcdef")}, {"Int", 1234567890},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			c := &ClusterClient{}
+			view := defaultCommandMetadataView()
+			cmd := NewCmd(context.Background(), "get", tc.key)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				d := c.routingDecisionInView(context.Background(), cmd, view, nil)
+				if d.policyErr != nil {
+					b.Fatal(d.policyErr)
+				}
+			}
+		})
+	}
+}

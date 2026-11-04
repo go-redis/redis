@@ -106,3 +106,78 @@ func (c *ModuleLoadexConfig) ToArgs() []interface{} {
 func ShouldRetry(err error, retryTimeout bool) bool {
 	return shouldRetry(err, retryTimeout)
 }
+
+// SentinelFailoverHasSentinel returns true if the sentinelFailover
+// still holds a live sentinel connection. Used in tests to verify
+// that replicaAddrs does not tear down the sentinel for master-only
+// (zero-replica) setups.
+func (c *sentinelFailover) HasSentinel() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sentinel != nil
+}
+
+// NewTestSentinelFailover creates a sentinelFailover with minimal
+// options for unit testing. The caller must set c.sentinel manually.
+func NewTestSentinelFailover(opt *FailoverOptions, sentinelAddrs []string) *sentinelFailover {
+	return &sentinelFailover{
+		opt:           opt,
+		sentinelAddrs: sentinelAddrs,
+	}
+}
+
+// ReplicaAddrs is exported for testing.
+func (c *sentinelFailover) ReplicaAddrs(ctx context.Context) ([]string, error) {
+	return c.replicaAddrs(ctx, false)
+}
+
+// TestBreakerRecordFailure records one failure on the given member's circuit
+// breaker. Exported for testing breaker-gate interactions.
+func (c *MultiDBClient) TestBreakerRecordFailure(id int) {
+	c.core.dbByID(id).cb.RecordFailure()
+}
+
+// TestBreakerReserveHalfOpen runs the given member's breaker admission check,
+// reserving one half-open probe slot when the breaker is half-open. Exported
+// for testing breaker-gate interactions.
+func (c *MultiDBClient) TestBreakerReserveHalfOpen(id int) bool {
+	return c.core.dbByID(id).cb.IsAllowed()
+}
+
+// TestProbeRacingRemoval reproduces the background health-check loop racing a
+// concurrent RemoveDatabase: the member is snapshotted (as the loop does),
+// removed, and then probed through the stale snapshot.
+func (c *MultiDBClient) TestProbeRacingRemoval(id int) {
+	db := c.core.dbByID(id)
+	if err := c.core.removeDatabase(context.Background(), id); err != nil {
+		panic(err)
+	}
+	db.probe(context.Background(), c.core.opts.HealthCheckTimeout)
+}
+
+// TestRunHealthChecksOnce runs one synchronous background health-check pass.
+func (c *MultiDBClient) TestRunHealthChecksOnce() {
+	c.core.runHealthChecksOnce(context.Background())
+}
+
+// TestTryFallback runs one synchronous auto-fallback pass.
+func (c *MultiDBClient) TestTryFallback() {
+	c.core.tryFallbackToPrimary(context.Background())
+}
+
+// TestTryFailover runs one synchronous automatic-failover pass from the given
+// database id, as the command hot path and background loop do.
+func (c *MultiDBClient) TestTryFailover(from int) error {
+	return c.core.tryFailover(context.Background(), from)
+}
+
+// TestStaleRecordAfterRemoval simulates a probe that passed its removed-check
+// just before the member was removed: the breaker outcome lands after the
+// removal completed.
+func (c *MultiDBClient) TestStaleRecordAfterRemoval(id int) {
+	db := c.core.dbByID(id)
+	if err := c.core.removeDatabase(context.Background(), id); err != nil {
+		panic(err)
+	}
+	db.cb.RecordFailure()
+}

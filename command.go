@@ -3,13 +3,20 @@ package redis
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"math"
+	"math/big"
 	"net"
+	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9/internal"
@@ -108,6 +115,7 @@ const (
 	CmdTypeXPending
 	CmdTypeXPendingExt
 	CmdTypeXAutoClaim
+	CmdTypeXAutoClaimWithDeleted
 	CmdTypeXAutoClaimJustID
 	CmdTypeXInfoConsumers
 	CmdTypeXInfoGroups
@@ -153,13 +161,25 @@ const (
 	CmdTypeFTSearch
 	CmdTypeTSTimestampValue
 	CmdTypeTSTimestampValueSlice
+	CmdTypeTSNRangePivotRowSlice
 	CmdTypeHotKeys
+	CmdTypeIncrEXInt
+	CmdTypeIncrEXFloat
+	CmdTypeUint
+	CmdTypeUintSlice
+	CmdTypeAREntrySlice
 )
 
 type (
 	CmdTypeXAutoClaimValue struct {
 		messages []XMessage
 		start    string
+	}
+
+	CmdTypeXAutoClaimWithDeletedValue struct {
+		messages   []XMessage
+		start      string
+		deletedIDs []string
 	}
 
 	CmdTypeXAutoClaimJustIDValue struct {
@@ -184,6 +204,9 @@ type (
 )
 
 type Cmder interface {
+	cacheState() *cscCommandState
+	cacheView() *commandMetadataView
+	setCacheView(*commandMetadataView)
 	// command name.
 	// e.g. "set k v ex 10" -> "set", "cluster info" -> "cluster".
 	Name() string
@@ -195,6 +218,7 @@ type Cmder interface {
 	// all args of the command.
 	// e.g. "set k v ex 10" -> "[set k v ex 10]".
 	Args() []interface{}
+	setArgs([]interface{})
 
 	// format request and response string.
 	// e.g. "set k v ex 10" -> "set k v ex 10: OK", "get k" -> "get k: v".
@@ -209,11 +233,43 @@ type Cmder interface {
 	stepCount() int8
 	SetStepCount(int8)
 
+	// cachedSlot/setCachedSlot memoize the cluster slot so it is computed once
+	// (in the autopipeline shard router) and reused at pipeline-flush routing.
+	cachedSlot() (int, bool)
+	setCachedSlot(int)
+	resetCachedSlot()
+	clusterRoutingDecision() *clusterRoutingDecision
+	setClusterRoutingDecision(*clusterRoutingDecision)
+	takeClusterRoutingDecision() *clusterRoutingDecision
+
 	readTimeout() *time.Duration
 	readReply(rd *proto.Reader) error
 	readRawReply(rd *proto.Reader) error
+	// isRawReply stays visible when a command is embedded in a custom wrapper.
+	isRawReply() bool
 	SetErr(error)
 	Err() error
+
+	// setReady marks a command as asynchronously pending (autopipeline async
+	// faces); await blocks the public accessors until it has executed; rawErr
+	// reads the error without awaiting (internal execution path).
+	setReady(*apBatch)
+	await()
+	rawErr() error
+
+	// NoRetry returns true if the command should not be retried on failure.
+	// Commands that write directly to an io.Writer should return true since
+	// partial writes cannot be undone on retry.
+	NoRetry() bool
+	// setNoRetry sets the flag NoRetry reports. Part of the interface (not
+	// only of baseCmd) so a decorator that embeds a Cmder promotes it: the
+	// MultiDB transaction path marks every command of a transaction, and a
+	// decorated command must not slip through unmarked.
+	setNoRetry(bool)
+	// base returns the command's embedded baseCmd: the identity of the
+	// command that executes, stable across decorators, and usable as a map
+	// key where the Cmder value itself may not be comparable.
+	base() *baseCmd
 
 	// GetCmdType returns the command type for fast value extraction
 	GetCmdType() CmdType
@@ -221,7 +277,8 @@ type Cmder interface {
 
 func setCmdsErr(cmds []Cmder, e error) {
 	for _, cmd := range cmds {
-		if cmd.Err() == nil {
+		// rawErr: this runs on the execution path; never await here.
+		if cmd.rawErr() == nil {
 			cmd.SetErr(e)
 		}
 	}
@@ -229,11 +286,24 @@ func setCmdsErr(cmds []Cmder, e error) {
 
 func cmdsFirstErr(cmds []Cmder) error {
 	for _, cmd := range cmds {
-		if err := cmd.Err(); err != nil {
+		// rawErr: this runs on the execution path; never await here.
+		if err := cmd.rawErr(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// cmdsContainNoRetry returns true if any command in the slice has NoRetry() == true.
+// If a pipeline contains a non-retryable command (e.g., RawWriteToCmd), the entire
+// pipeline must not be retried to prevent data corruption from partial writes.
+func cmdsContainNoRetry(cmds []Cmder) bool {
+	for _, cmd := range cmds {
+		if cmd.NoRetry() {
+			return true
+		}
+	}
+	return false
 }
 
 func writeCmds(wr *proto.Writer, cmds []Cmder) error {
@@ -249,10 +319,51 @@ func writeCmd(wr *proto.Writer, cmd Cmder) error {
 	return wr.WriteArgs(cmd.Args())
 }
 
-// cmdFirstKeyPos returns the position of the first key in the command's arguments.
-// If the command does not have a key, it returns 0.
-// TODO: Use the data in CommandInfo to determine the first key position.
-func cmdFirstKeyPos(cmd Cmder) int {
+// cmdArgAfterToken returns the position after the first argument, from
+// position from on, that equals token (case-insensitive), or 0 when there is
+// none or nothing follows it.
+func cmdArgAfterToken(cmd Cmder, from int, token string) int {
+	n := len(cmd.Args())
+	for i := from; i < n-1; i++ {
+		if strings.EqualFold(cmd.stringArg(i), token) {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// migrateKeysPos returns the position of the first key of a MIGRATE KEYS
+// clause, walking the options so an operand (an AUTH password that reads
+// "keys") is not taken for the clause. The position is 0 when there is no
+// key; valid is false when an option token has no reproducible wire encoding.
+func migrateKeysPos(cmd Cmder) (pos int, valid bool) {
+	n := len(cmd.Args())
+	for i := 6; i < n; {
+		token, ok := routingArgText(cmd, i)
+		if !ok {
+			return 0, false
+		}
+		switch strings.ToLower(token) {
+		case "keys":
+			if i+1 < n {
+				return i + 1, true
+			}
+			return 0, true
+		case "auth":
+			i += 2 // AUTH password
+		case "auth2":
+			i += 3 // AUTH2 username password
+		default:
+			i++ // COPY, REPLACE
+		}
+	}
+	return 0, true
+}
+
+// cmdFirstKeyPosWithInfo returns the first key position (0 if none, -1 if
+// MIGRATE options cannot be inspected safely). It uses CommandInfo when supplied
+// and otherwise falls back to the legacy command table and runtime arguments.
+func cmdFirstKeyPosWithInfo(cmd Cmder, info *CommandInfo) int {
 	if pos := cmd.firstKeyPos(); pos != 0 {
 		return int(pos)
 	}
@@ -264,21 +375,91 @@ func cmdFirstKeyPos(cmd Cmder) int {
 		return 0
 	}
 
+	// Module commands registered keyless in the static policy table (e.g.
+	// ft.aliaslist) route as keyless even while the command-info cache is
+	// cold, so the first calls of a process don't hash a non-key argument
+	// (such as an index name) into a slot.
+	if defaultPolicyKeyless(name) {
+		return 0
+	}
+
 	switch name {
-	case "eval", "evalsha", "eval_ro", "evalsha_ro":
+	// FCALL has the EVAL layout: name, function, numkeys, keys... The typed
+	// FCall sets its key position itself; this covers raw Do/Process calls.
+	case "eval", "evalsha", "eval_ro", "evalsha_ro", "fcall", "fcall_ro":
 		if cmd.stringArg(2) != "0" {
 			return 3
 		}
 
 		return 0
-	case "publish":
-		return 1
 	case "memory":
 		// https://github.com/redis/redis/issues/7493
 		if cmd.stringArg(1) == "usage" {
 			return 2
 		}
+	case "msetex":
+		// MSetEX's constructor already sets this via SetFirstKeyPos; this
+		// fallback only covers raw Do("msetex", ...) calls, which aren't
+		// guaranteed to route correctly and aren't the recommended usage.
+		return 2
+
+	// Raw forms of the commands below. The typed constructors set the key
+	// position; a raw Do / NewCmd does not, and args[1] is not a key.
+	case "xread":
+		// XREAD [COUNT n] [BLOCK ms] STREAMS key... id...
+		return cmdArgAfterToken(cmd, 1, "streams")
+	case "xreadgroup":
+		// XREADGROUP GROUP group consumer [...] STREAMS key... id...; the
+		// scan starts after the group and consumer names.
+		return cmdArgAfterToken(cmd, 4, "streams")
+	case "object", "xinfo", "xgroup":
+		// OBJECT|XINFO|XGROUP subcommand key; HELP has no key.
+		if len(cmd.Args()) > 2 {
+			return 2
+		}
+		return 0
+	case "himport":
+		// HIMPORT SET key fieldset ...; PREPARE takes a fieldset name, not a key.
+		if strings.EqualFold(cmd.stringArg(1), "set") {
+			return 2
+		}
+		return 0
+	case "bitop":
+		// BITOP op destkey key...
+		return 2
+	case "lmpop", "zmpop", "sintercard", "zintercard", "zunion", "zinter", "zdiff",
+		"sdiffcard", "sunioncard", "ts.nrange", "ts.nrevrange":
+		// numkeys key...
+		return 2
+	case "blmpop", "bzmpop":
+		// timeout numkeys key...
+		return 3
+	case "migrate":
+		// MIGRATE host port key|"" db timeout [...] [KEYS key...]
+		if cmd.stringArg(3) != "" {
+			return 3
+		}
+		pos, valid := migrateKeysPos(cmd)
+		if !valid {
+			return -1
+		}
+		return pos
+	case "bless":
+		// BLESS SCAN is keyless (cursor-based, server-wide); BLESS SET/GET/CLEAR
+		// take the key at position 2. The typed methods set this via
+		// SetFirstKeyPos; this fallback covers raw Do("bless", ...) calls so a
+		// Ring/Cluster doesn't send them to a random shard.
+		if internal.ToLower(cmd.stringArg(1)) == "scan" {
+			return 0
+		}
+		return 2
 	}
+
+	// Use CommandInfo cache when warm (in-memory only, no extra round-trips).
+	if info != nil {
+		return int(info.FirstKeyPos)
+	}
+
 	return 1
 }
 
@@ -292,7 +473,7 @@ func cmdString(cmd Cmder, val interface{}) string {
 		b = internal.AppendArg(b, arg)
 	}
 
-	if err := cmd.Err(); err != nil {
+	if err := cmd.rawErr(); err != nil {
 		b = append(b, ": "...)
 		b = append(b, err.Error()...)
 	} else if val != nil {
@@ -309,14 +490,129 @@ type baseCmd struct {
 	ctx          context.Context
 	args         []interface{}
 	err          error
-	keyPos       int8
-	_stepCount   int8
 	rawVal       interface{}
 	_readTimeout *time.Duration
-	cmdType      CmdType
+
+	// noRetry marks the command as never-retryable (see NoRetry). It is set
+	// before the command is handed to an execution path, never concurrently.
+	noRetry bool
+
+	// ready, when non-nil, is the batch whose done channel closes once the
+	// command has executed. It is set only by the deferred (async)
+	// autopipeliner, which hands the command back to the caller before it
+	// runs. The public result accessors (Err/Val/Result/String) call await
+	// so they transparently block until execution; internal execution-path
+	// reads use rawErr to avoid awaiting the very batch they are producing
+	// (formatting included: cmdString reads rawErr and receives the value
+	// snapshot from its caller, so String methods await BEFORE reading their
+	// val field — otherwise formatting an in-flight async command would race
+	// with reply processing). ready stays
+	// nil for ordinary synchronous commands, whose accessors never block.
+	ready atomic.Pointer[apBatch]
+
+	// routing pins admission metadata until cluster dispatch completes. Keeping
+	// it on the command avoids retaining commands in a client-wide lookup table.
+	routing atomic.Pointer[clusterRoutingDecision]
+	// The pinned CSC view is independent of the consumed routing decision.
+	cscView *commandMetadataView
+
+	// slotCache memoizes the cluster slot once computed, so the cluster
+	// autopipeline shard router and the pipeline flush router don't each
+	// recompute it. 0 = not computed; it stores slot+1 so a real slot of 0 is
+	// distinguishable from unset. A plain field is safe by construction: it
+	// is written during admission or explicit pipeline resolution, before the
+	// command is dispatched to any worker. Workers only read it until the
+	// command completes. A shared routing template carries no slot of its own.
+	slotCache uint16
+
+	keyPos     int8
+	_stepCount int8
+	cmdType    CmdType
+	csc        cscCommandState
+}
+
+func (cmd *baseCmd) clusterRoutingDecision() *clusterRoutingDecision {
+	return cmd.routing.Load()
+}
+
+func (cmd *baseCmd) setClusterRoutingDecision(decision *clusterRoutingDecision) {
+	if decision == nil && cmd.routing.Load() == nil {
+		return // nothing to clear: a load instead of an atomic exchange
+	}
+	cmd.routing.Store(decision)
+}
+
+func (cmd *baseCmd) takeClusterRoutingDecision() *clusterRoutingDecision {
+	return cmd.routing.Swap(nil)
+}
+
+// setReady publishes the batch gating this command's result accessors. The
+// field is atomic, NOT lock-ordered with the enqueue: a dispatch-side hook
+// racing this store simply reads nil and takes the non-blocking path — the
+// correct "not executed yet" view — while the setting goroutine always sees
+// its own store before it awaits.
+func (cmd *baseCmd) setReady(b *apBatch) { cmd.ready.Store(b) }
+
+// await blocks until an asynchronously-submitted command has executed. It is a
+// single nil-pointer load for synchronous commands, so the common path stays
+// allocation- and contention-free.
+func (cmd *baseCmd) await() {
+	b := cmd.ready.Load()
+	if b == nil {
+		return
+	}
+	select {
+	case <-b.done:
+		return
+	default:
+	}
+	if b.isExecutorGoroutine() {
+		// A hook on one of the batch's own executor goroutines (the
+		// dispatcher, or a cluster per-node executor) is reading this
+		// command's result BEFORE next() has executed it. Blocking would
+		// self-deadlock (the batch completes only after that goroutine
+		// returns); return the not-yet-executed state instead — the same
+		// view a plain pipeline hook has before next().
+		return
+	}
+	<-b.done
+}
+
+// rawErr returns the command error WITHOUT awaiting. The internal
+// execution/serialization path (setCmdsErr, cmdsFirstErr, and the cmdString
+// formatter — public String methods await before calling it) uses it so that
+// reading errors while a batch is being executed does not deadlock on the
+// batch's own completion signal.
+func (cmd *baseCmd) rawErr() error { return cmd.err }
+
+// readyBatch exposes the deferred-face batch gating this command (nil for
+// synchronous commands) to the cluster fan-out, which registers its per-node
+// goroutines as executors of every batch they carry.
+func (cmd *baseCmd) readyBatch() *apBatch { return cmd.ready.Load() }
+
+// resultReady reports whether the command's result can be read WITHOUT
+// blocking: either it never rode the deferred autopipeline face (no gating
+// batch) or that batch has already completed. Post-execution bookkeeping in
+// the command wrappers — the OTel metric emissions — consults it so that
+// enabling telemetry cannot turn a deferred submission into a blocking call.
+func (cmd *baseCmd) resultReady() bool {
+	b := cmd.ready.Load()
+	if b == nil {
+		return true
+	}
+	select {
+	case <-b.done:
+		return true
+	default:
+		return false
+	}
 }
 
 var _ Cmder = (*Cmd)(nil)
+
+func (cmd *baseCmd) cacheState() *cscCommandState           { return &cmd.csc }
+func (cmd *baseCmd) cacheView() *commandMetadataView        { return cmd.cscView }
+func (cmd *baseCmd) setCacheView(view *commandMetadataView) { cmd.cscView = view }
 
 func (cmd *baseCmd) Name() string {
 	if len(cmd.args) == 0 {
@@ -353,6 +649,11 @@ func (cmd *baseCmd) stringArg(pos int) string {
 	switch v := arg.(type) {
 	case string:
 		return v
+	case *string:
+		if v == nil {
+			return ""
+		}
+		return *v
 	case []byte:
 		return string(v)
 	default:
@@ -365,8 +666,31 @@ func (cmd *baseCmd) firstKeyPos() int8 {
 	return cmd.keyPos
 }
 
+// SetFirstKeyPos sets the key position used when server metadata for a command
+// is unavailable. Resolved metadata remains authoritative when present.
 func (cmd *baseCmd) SetFirstKeyPos(keyPos int8) {
 	cmd.keyPos = keyPos
+}
+
+// cachedSlot returns the cached cluster slot and whether one was set.
+func (cmd *baseCmd) cachedSlot() (int, bool) {
+	if cmd.slotCache == 0 {
+		return 0, false
+	}
+	return int(cmd.slotCache - 1), true
+}
+
+// setCachedSlot stores the computed cluster slot (0..16383) for reuse.
+func (cmd *baseCmd) setCachedSlot(slot int) {
+	if slot >= 0 && slot < 16384 {
+		cmd.slotCache = uint16(slot + 1)
+	}
+}
+
+// resetCachedSlot drops the cached slot, so a reused command gets one from its
+// new admission.
+func (cmd *baseCmd) resetCachedSlot() {
+	cmd.slotCache = 0
 }
 
 func (cmd *baseCmd) stepCount() int8 {
@@ -382,6 +706,7 @@ func (cmd *baseCmd) SetErr(e error) {
 }
 
 func (cmd *baseCmd) Err() error {
+	cmd.await()
 	return cmd.err
 }
 
@@ -398,11 +723,50 @@ func (cmd *baseCmd) readRawReply(rd *proto.Reader) (err error) {
 	return err
 }
 
+func (cmd *baseCmd) isRawReply() bool { return false }
+
+// NoRetry returns true if the command should not be retried on failure.
+// By default, commands can be retried. Commands that write directly to an
+// io.Writer (like RawWriteToCmd) should override this to return true since
+// partial writes cannot be undone on retry.
+func (cmd *baseCmd) NoRetry() bool {
+	if cmd.noRetry {
+		return true
+	}
+	// A READ advances server-side cursor state. Retrying after a lost reply
+	// would silently skip the results that were already consumed.
+	return len(cmd.args) > 1 && strings.EqualFold(cmd.stringArg(0), "ft.cursor") &&
+		strings.EqualFold(cmd.stringArg(1), "read")
+}
+
+// setNoRetry marks the command as never-retryable, e.g. the synthetic MULTI
+// of a MultiDB transaction whose batch must not be replayed by the member
+// client's retry loop.
+func (cmd *baseCmd) setNoRetry(v bool) {
+	cmd.noRetry = v
+}
+
+// base returns the command's identity (see Cmder.base).
+func (cmd *baseCmd) base() *baseCmd {
+	return cmd
+}
+
 func (cmd *baseCmd) GetCmdType() CmdType {
 	return cmd.cmdType
 }
 
+func (cmd *baseCmd) setArgs(args []interface{}) {
+	cmd.args = args
+	cmd.slotCache = 0
+}
+
 func (cmd *baseCmd) cloneBaseCmd() baseCmd {
+	state := cmd.csc
+	state.depth = 0
+	state.set(cscNoLookup, false)
+	if state.has(cscForceBypass) {
+		state.setMark(cacheBypassed)
+	}
 	var readTimeout *time.Duration
 	if cmd._readTimeout != nil {
 		timeout := *cmd._readTimeout
@@ -414,6 +778,8 @@ func (cmd *baseCmd) cloneBaseCmd() baseCmd {
 	copy(args, cmd.args)
 
 	return baseCmd{
+		csc:          state,
+		cscView:      cmd.cscView,
 		ctx:          cmd.ctx,
 		args:         args,
 		err:          cmd.err,
@@ -422,6 +788,7 @@ func (cmd *baseCmd) cloneBaseCmd() baseCmd {
 		rawVal:       cmd.rawVal,
 		_readTimeout: readTimeout,
 		cmdType:      cmd.cmdType,
+		noRetry:      cmd.noRetry,
 	}
 }
 
@@ -444,6 +811,7 @@ func NewCmd(ctx context.Context, args ...interface{}) *Cmd {
 }
 
 func (cmd *Cmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -452,14 +820,17 @@ func (cmd *Cmd) SetVal(val interface{}) {
 }
 
 func (cmd *Cmd) Val() interface{} {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *Cmd) Result() (interface{}, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *Cmd) Text() (string, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return "", cmd.err
 	}
@@ -470,21 +841,65 @@ func toString(val interface{}) (string, error) {
 	switch val := val.(type) {
 	case string:
 		return val, nil
+	case float64:
+		return formatDouble(val), nil
+	case *big.Int:
+		return val.String(), nil
 	default:
 		err := fmt.Errorf("redis: unexpected type=%T for String", val)
 		return "", err
 	}
 }
 
+// formatDouble writes f the way Redis writes a double on RESP2 (d2string and
+// fpconv_dtoa), so that 1e100 is "1e+100" and not 101 digits. The digits come
+// from Go's shortest round-trip form, while Redis uses Grisu2, which sometimes
+// prints different last digits. Both strings parse to the same float64, so
+// Float64 always matches RESP2. Text can differ in the last digits, and so can
+// Int, Int64 and Uint64 for integral values above 2^62: RESP2 returns
+// 8430098825600961000 where this returns 8430098825600960000. A double does
+// not hold integers that large exactly, so both are approximations.
+func formatDouble(f float64) string {
+	if f == 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+		return internal.FormatFloat(f)
+	}
+	if f == math.Trunc(f) && math.Abs(f) <= 1<<62 {
+		return strconv.FormatInt(int64(f), 10)
+	}
+	mant, exp, _ := strings.Cut(strconv.FormatFloat(f, 'e', -1, 64), "e")
+	e, _ := strconv.Atoi(exp)
+	n := len(strings.Trim(strings.Replace(mant, ".", "", 1), "-"))
+	k := e - n + 1
+	absE := max(e, -e)
+	// Same switch to exponent form as emit_digits in fpconv_dtoa.c.
+	if (k >= 0 && absE < n+7) || (k < 0 && (k > -7 || absE < 4)) {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	if e >= 0 {
+		return mant + "e+" + strconv.Itoa(e)
+	}
+	return mant + "e" + strconv.Itoa(e)
+}
+
 func (cmd *Cmd) Int() (int, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return 0, cmd.err
 	}
 	switch val := cmd.val.(type) {
 	case int64:
-		return int(val), nil
+		if n := int(val); int64(n) == val {
+			return n, nil
+		}
+		// int is 32 bits on 386 and arm: give the range error Atoi gives
+		// for the same number in a bulk string, not a truncated value.
+		return strconv.Atoi(strconv.FormatInt(val, 10))
 	case string:
 		return strconv.Atoi(val)
+	case float64:
+		return strconv.Atoi(formatDouble(val))
+	case *big.Int:
+		return strconv.Atoi(val.String())
 	default:
 		err := fmt.Errorf("redis: unexpected type=%T for Int", val)
 		return 0, err
@@ -492,6 +907,7 @@ func (cmd *Cmd) Int() (int, error) {
 }
 
 func (cmd *Cmd) Int64() (int64, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return 0, cmd.err
 	}
@@ -504,6 +920,10 @@ func toInt64(val interface{}) (int64, error) {
 		return val, nil
 	case string:
 		return strconv.ParseInt(val, 10, 64)
+	case float64:
+		return toInt64(formatDouble(val))
+	case *big.Int:
+		return toInt64(val.String())
 	default:
 		err := fmt.Errorf("redis: unexpected type=%T for Int64", val)
 		return 0, err
@@ -511,6 +931,7 @@ func toInt64(val interface{}) (int64, error) {
 }
 
 func (cmd *Cmd) Uint64() (uint64, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return 0, cmd.err
 	}
@@ -523,6 +944,10 @@ func toUint64(val interface{}) (uint64, error) {
 		return uint64(val), nil
 	case string:
 		return strconv.ParseUint(val, 10, 64)
+	case float64:
+		return toUint64(formatDouble(val))
+	case *big.Int:
+		return toUint64(val.String())
 	default:
 		err := fmt.Errorf("redis: unexpected type=%T for Uint64", val)
 		return 0, err
@@ -530,6 +955,7 @@ func toUint64(val interface{}) (uint64, error) {
 }
 
 func (cmd *Cmd) Float32() (float32, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return 0, cmd.err
 	}
@@ -538,6 +964,17 @@ func (cmd *Cmd) Float32() (float32, error) {
 
 func toFloat32(val interface{}) (float32, error) {
 	switch val := val.(type) {
+	case float64:
+		// Return the range error that ParseFloat returns for a RESP2 bulk
+		// string when a RESP3 double does not fit in a float32.
+		if f := float32(val); math.IsInf(float64(f), 0) && !math.IsInf(val, 0) {
+			return 0, &strconv.NumError{
+				Func: "ParseFloat",
+				Num:  strconv.FormatFloat(val, 'g', -1, 64),
+				Err:  strconv.ErrRange,
+			}
+		}
+		return float32(val), nil
 	case int64:
 		return float32(val), nil
 	case string:
@@ -546,6 +983,8 @@ func toFloat32(val interface{}) (float32, error) {
 			return 0, err
 		}
 		return float32(f), nil
+	case *big.Int:
+		return toFloat32(val.String())
 	default:
 		err := fmt.Errorf("redis: unexpected type=%T for Float32", val)
 		return 0, err
@@ -553,6 +992,7 @@ func toFloat32(val interface{}) (float32, error) {
 }
 
 func (cmd *Cmd) Float64() (float64, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return 0, cmd.err
 	}
@@ -561,10 +1001,14 @@ func (cmd *Cmd) Float64() (float64, error) {
 
 func toFloat64(val interface{}) (float64, error) {
 	switch val := val.(type) {
+	case float64:
+		return val, nil
 	case int64:
 		return float64(val), nil
 	case string:
 		return strconv.ParseFloat(val, 64)
+	case *big.Int:
+		return toFloat64(val.String())
 	default:
 		err := fmt.Errorf("redis: unexpected type=%T for Float64", val)
 		return 0, err
@@ -572,6 +1016,7 @@ func toFloat64(val interface{}) (float64, error) {
 }
 
 func (cmd *Cmd) Bool() (bool, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return false, cmd.err
 	}
@@ -586,6 +1031,10 @@ func toBool(val interface{}) (bool, error) {
 		return val != 0, nil
 	case string:
 		return strconv.ParseBool(val)
+	case float64:
+		return strconv.ParseBool(formatDouble(val))
+	case *big.Int:
+		return strconv.ParseBool(val.String())
 	default:
 		err := fmt.Errorf("redis: unexpected type=%T for Bool", val)
 		return false, err
@@ -593,6 +1042,7 @@ func toBool(val interface{}) (bool, error) {
 }
 
 func (cmd *Cmd) Slice() ([]interface{}, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return nil, cmd.err
 	}
@@ -720,6 +1170,246 @@ func (cmd *Cmd) Clone() Cmder {
 
 //------------------------------------------------------------------------------
 
+// RawCmd returns raw RESP protocol bytes without parsing.
+type RawCmd struct {
+	baseCmd
+	val []byte
+}
+
+var _ Cmder = (*RawCmd)(nil)
+
+func (cmd *RawCmd) isRawReply() bool { return true }
+
+func NewRawCmd(ctx context.Context, args ...interface{}) *RawCmd {
+	return &RawCmd{
+		baseCmd: baseCmd{
+			ctx:     ctx,
+			args:    args,
+			cmdType: CmdTypeGeneric,
+		},
+	}
+}
+
+func (cmd *RawCmd) SetVal(val []byte) {
+	cmd.val = val
+}
+
+func (cmd *RawCmd) Val() []byte {
+	cmd.await()
+	return cmd.val
+}
+
+func (cmd *RawCmd) Result() ([]byte, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *RawCmd) Bytes() ([]byte, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *RawCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *RawCmd) readReply(rd *proto.Reader) (err error) {
+	cmd.val, err = rd.ReadRawReply()
+	return err
+}
+
+func (cmd *RawCmd) Clone() Cmder {
+	var val []byte
+	if cmd.val != nil {
+		val = make([]byte, len(cmd.val))
+		copy(val, cmd.val)
+	}
+	return &RawCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		val:     val,
+	}
+}
+
+//------------------------------------------------------------------------------
+
+// RawWriteToCmd streams raw RESP protocol bytes directly to an io.Writer without intermediate allocations.
+type RawWriteToCmd struct {
+	baseCmd
+	w       io.Writer
+	written int64
+}
+
+var _ Cmder = (*RawWriteToCmd)(nil)
+
+func (cmd *RawWriteToCmd) isRawReply() bool { return true }
+
+func NewRawWriteToCmd(ctx context.Context, w io.Writer, args ...interface{}) *RawWriteToCmd {
+	return &RawWriteToCmd{
+		baseCmd: baseCmd{
+			ctx:     ctx,
+			args:    args,
+			cmdType: CmdTypeGeneric,
+		},
+		w: w,
+	}
+}
+
+func (cmd *RawWriteToCmd) SetVal(written int64) {
+	cmd.written = written
+}
+
+func (cmd *RawWriteToCmd) Val() int64 {
+	cmd.await()
+	return cmd.written
+}
+
+func (cmd *RawWriteToCmd) Result() (int64, error) {
+	cmd.await()
+	return cmd.written, cmd.err
+}
+
+func (cmd *RawWriteToCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.written)
+}
+
+func (cmd *RawWriteToCmd) readReply(rd *proto.Reader) (err error) {
+	cmd.written, err = rd.ReadRawReplyWriteTo(cmd.w)
+	return err
+}
+
+// NoRetry returns true because RawWriteToCmd writes directly to an io.Writer.
+// If a retry occurs, partial data from failed attempts would be appended to
+// the writer, causing data corruption. The caller must handle retries manually
+// if needed, using a fresh writer for each attempt.
+func (cmd *RawWriteToCmd) NoRetry() bool {
+	return true
+}
+
+func (cmd *RawWriteToCmd) Clone() Cmder {
+	return &RawWriteToCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		w:       cmd.w,
+		written: cmd.written,
+	}
+}
+
+//------------------------------------------------------------------------------
+
+// ZeroCopyStringCmd reads a bulk string response directly into a user-provided
+// buffer, avoiding intermediate allocations. The RESP header is parsed through
+// the buffered reader, then bulk data is read straight into the caller's buffer
+// via proto.Reader.ReadStringInto — for values larger than the bufio buffer,
+// this is effectively zero-copy from the socket to the user buffer.
+//
+// The buffer must be sized to fit the value; if it is too small an error is
+// returned and the payload plus trailing CRLF are drained from the reader so
+// the connection stays aligned for subsequent commands.
+type ZeroCopyStringCmd struct {
+	baseCmd
+	buf    []byte // user-provided buffer to read into
+	n      int    // number of bytes read into buf
+	cloned bool   // set by Clone(); causes readReply to drain + error
+}
+
+var _ Cmder = (*ZeroCopyStringCmd)(nil)
+
+func NewZeroCopyStringCmd(ctx context.Context, buf []byte, args ...interface{}) *ZeroCopyStringCmd {
+	return &ZeroCopyStringCmd{
+		baseCmd: baseCmd{
+			ctx:     ctx,
+			args:    args,
+			cmdType: CmdTypeString,
+		},
+		buf: buf,
+	}
+}
+
+func (cmd *ZeroCopyStringCmd) SetVal(n int) {
+	cmd.n = n
+}
+
+func (cmd *ZeroCopyStringCmd) Val() int {
+	cmd.await()
+	return cmd.n
+}
+
+// Result returns the number of bytes read and any error.
+func (cmd *ZeroCopyStringCmd) Result() (int, error) {
+	cmd.await()
+	return cmd.n, cmd.err
+}
+
+// Bytes returns the slice of the user-provided buffer containing the read data.
+func (cmd *ZeroCopyStringCmd) Bytes() []byte {
+	cmd.await()
+	return cmd.buf[:cmd.n]
+}
+
+func (cmd *ZeroCopyStringCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.n)
+}
+
+func (cmd *ZeroCopyStringCmd) readReply(rd *proto.Reader) error {
+	// Reset the byte count before reading so a previous successful run
+	// can't leak its data through Bytes() if this call errors out before
+	// updating cmd.n.
+	cmd.n = 0
+	if cmd.cloned {
+		// A cloned ZeroCopyStringCmd has no usable destination buffer
+		// (see Clone for the rationale). Drain the network reply so the
+		// connection stays aligned for the next command, then surface a
+		// clear error rather than silently producing a wrong result.
+		if err := rd.DiscardNext(); err != nil {
+			return err
+		}
+		return fmt.Errorf("redis: ZeroCopyStringCmd cannot be cloned (cmd writes into caller-owned memory)")
+	}
+	n, err := rd.ReadStringInto(cmd.buf)
+	if err != nil {
+		return err
+	}
+	cmd.n = n
+	return nil
+}
+
+// NoRetry returns true because the response is written directly into the
+// caller's buffer. A retry could leave partial data from a failed attempt in
+// the buffer, so the caller must handle retries explicitly if needed.
+func (cmd *ZeroCopyStringCmd) NoRetry() bool {
+	return true
+}
+
+// Clone returns a clone that is intentionally non-functional. Cloning a
+// ZeroCopyStringCmd has no well-defined semantics: the cmd writes into
+// caller-owned memory (the buf passed to GetToBuffer), and a clone can
+// neither safely share that buf (concurrent writes from sibling clones
+// would race, last-writer wins) nor allocate its own buf (the result
+// would be invisible to whoever asked for the original cmd's reply).
+//
+// The Cmder interface requires Clone, so we return a clone marked so
+// that its readReply drains the network reply (keeping the connection
+// aligned) and fails the cmd with a clear error. Whoever processes the
+// clone gets an explicit error instead of silently-wrong bytes.
+//
+// In practice this path is unreachable through normal client flows:
+// Clone is only called from cluster fan-out routing
+// (osscluster_router.go) for multi-shard commands like DBSIZE / KEYS /
+// FLUSHDB, and ZeroCopyStringCmd is only produced by GetToBuffer which
+// issues GET — a single-key command routed to one shard, never fanned
+// out. Combined with NoRetry() returning true, the retry path also will
+// not clone this cmd.
+func (cmd *ZeroCopyStringCmd) Clone() Cmder {
+	return &ZeroCopyStringCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		cloned:  true,
+	}
+}
+
+//------------------------------------------------------------------------------
+
 type SliceCmd struct {
 	baseCmd
 
@@ -743,20 +1433,24 @@ func (cmd *SliceCmd) SetVal(val []interface{}) {
 }
 
 func (cmd *SliceCmd) Val() []interface{} {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *SliceCmd) Result() ([]interface{}, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *SliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
 // Scan scans the results from the map into a destination struct. The map keys
 // are matched in the Redis struct fields by the `redis:"field"` tag.
 func (cmd *SliceCmd) Scan(dst interface{}) error {
+	cmd.await()
 	if cmd.err != nil {
 		return cmd.err
 	}
@@ -816,18 +1510,22 @@ func (cmd *StatusCmd) SetVal(val string) {
 }
 
 func (cmd *StatusCmd) Val() string {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *StatusCmd) Result() (string, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *StatusCmd) Bytes() ([]byte, error) {
+	cmd.await()
 	return util.StringToBytes(cmd.val), cmd.err
 }
 
 func (cmd *StatusCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -868,18 +1566,22 @@ func (cmd *IntCmd) SetVal(val int64) {
 }
 
 func (cmd *IntCmd) Val() int64 {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *IntCmd) Result() (int64, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *IntCmd) Uint64() (uint64, error) {
+	cmd.await()
 	return uint64(cmd.val), cmd.err
 }
 
 func (cmd *IntCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -890,6 +1592,55 @@ func (cmd *IntCmd) readReply(rd *proto.Reader) (err error) {
 
 func (cmd *IntCmd) Clone() Cmder {
 	return &IntCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		val:     cmd.val,
+	}
+}
+
+type UintCmd struct {
+	baseCmd
+
+	val uint64
+}
+
+var _ Cmder = (*UintCmd)(nil)
+
+func NewUintCmd(ctx context.Context, args ...any) *UintCmd {
+	return &UintCmd{
+		baseCmd: baseCmd{
+			ctx:     ctx,
+			args:    args,
+			cmdType: CmdTypeUint,
+		},
+	}
+}
+
+func (cmd *UintCmd) SetVal(val uint64) {
+	cmd.val = val
+}
+
+func (cmd *UintCmd) Val() uint64 {
+	cmd.await()
+	return cmd.val
+}
+
+func (cmd *UintCmd) Result() (uint64, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *UintCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *UintCmd) readReply(rd *proto.Reader) (err error) {
+	cmd.val, err = rd.ReadUint()
+	return err
+}
+
+func (cmd *UintCmd) Clone() Cmder {
+	return &UintCmd{
 		baseCmd: cmd.cloneBaseCmd(),
 		val:     cmd.val,
 	}
@@ -932,14 +1683,17 @@ func (cmd *DigestCmd) SetVal(val uint64) {
 }
 
 func (cmd *DigestCmd) Val() uint64 {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *DigestCmd) Result() (uint64, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *DigestCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -989,14 +1743,17 @@ func (cmd *IntSliceCmd) SetVal(val []int64) {
 }
 
 func (cmd *IntSliceCmd) Val() []int64 {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *IntSliceCmd) Result() ([]int64, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *IntSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1006,12 +1763,27 @@ func (cmd *IntSliceCmd) readReply(rd *proto.Reader) error {
 		return err
 	}
 	cmd.val = make([]int64, n)
+	var elemErr error
 	for i := 0; i < len(cmd.val); i++ {
-		if cmd.val[i], err = rd.ReadInt(); err != nil {
-			return err
+		switch num, err := rd.ReadInt(); {
+		case err == Nil:
+			cmd.val[i] = 0
+		case err != nil:
+			if !isRedisError(err) {
+				return err
+			}
+			// TS.MADD and CMS.INCRBY report a rejected item as an error
+			// element and still answer for the items after it. The element
+			// is a complete frame, so read on and return the first one once
+			// the whole array is consumed.
+			if elemErr == nil {
+				elemErr = err
+			}
+		default:
+			cmd.val[i] = num
 		}
 	}
-	return nil
+	return elemErr
 }
 
 func (cmd *IntSliceCmd) Clone() Cmder {
@@ -1021,6 +1793,80 @@ func (cmd *IntSliceCmd) Clone() Cmder {
 		copy(val, cmd.val)
 	}
 	return &IntSliceCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		val:     val,
+	}
+}
+
+type UintSliceCmd struct {
+	baseCmd
+
+	val []uint64
+}
+
+var _ Cmder = (*UintSliceCmd)(nil)
+
+func NewUintSliceCmd(ctx context.Context, args ...any) *UintSliceCmd {
+	return &UintSliceCmd{
+		baseCmd: baseCmd{
+			ctx:     ctx,
+			args:    args,
+			cmdType: CmdTypeUintSlice,
+		},
+	}
+}
+
+func (cmd *UintSliceCmd) SetVal(val []uint64) {
+	cmd.val = val
+}
+
+func (cmd *UintSliceCmd) Val() []uint64 {
+	cmd.await()
+	return cmd.val
+}
+
+func (cmd *UintSliceCmd) Result() ([]uint64, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *UintSliceCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *UintSliceCmd) readReply(rd *proto.Reader) error {
+	n, err := rd.ReadArrayLen()
+	if err != nil {
+		return err
+	}
+	cmd.val = make([]uint64, n)
+	var elemErr error
+	for i := range cmd.val {
+		switch num, err := rd.ReadUint(); {
+		case err == Nil:
+			cmd.val[i] = 0
+		case err != nil:
+			if !isRedisError(err) {
+				return err
+			}
+			if elemErr == nil {
+				elemErr = err
+			}
+		default:
+			cmd.val[i] = num
+		}
+	}
+	return elemErr
+}
+
+func (cmd *UintSliceCmd) Clone() Cmder {
+	var val []uint64
+	if cmd.val != nil {
+		val = make([]uint64, len(cmd.val))
+		copy(val, cmd.val)
+	}
+	return &UintSliceCmd{
 		baseCmd: cmd.cloneBaseCmd(),
 		val:     val,
 	}
@@ -1053,14 +1899,17 @@ func (cmd *DurationCmd) SetVal(val time.Duration) {
 }
 
 func (cmd *DurationCmd) Val() time.Duration {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *DurationCmd) Result() (time.Duration, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *DurationCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1113,14 +1962,17 @@ func (cmd *TimeCmd) SetVal(val time.Time) {
 }
 
 func (cmd *TimeCmd) Val() time.Time {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *TimeCmd) Result() (time.Time, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *TimeCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1172,14 +2024,17 @@ func (cmd *BoolCmd) SetVal(val bool) {
 }
 
 func (cmd *BoolCmd) Val() bool {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *BoolCmd) Result() (bool, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *BoolCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1227,18 +2082,22 @@ func (cmd *StringCmd) SetVal(val string) {
 }
 
 func (cmd *StringCmd) Val() string {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *StringCmd) Result() (string, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *StringCmd) Bytes() ([]byte, error) {
+	cmd.await()
 	return util.StringToBytes(cmd.val), cmd.err
 }
 
 func (cmd *StringCmd) Bool() (bool, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return false, cmd.err
 	}
@@ -1246,6 +2105,7 @@ func (cmd *StringCmd) Bool() (bool, error) {
 }
 
 func (cmd *StringCmd) Int() (int, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return 0, cmd.err
 	}
@@ -1253,6 +2113,7 @@ func (cmd *StringCmd) Int() (int, error) {
 }
 
 func (cmd *StringCmd) Int64() (int64, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return 0, cmd.err
 	}
@@ -1260,6 +2121,7 @@ func (cmd *StringCmd) Int64() (int64, error) {
 }
 
 func (cmd *StringCmd) Uint64() (uint64, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return 0, cmd.err
 	}
@@ -1267,6 +2129,7 @@ func (cmd *StringCmd) Uint64() (uint64, error) {
 }
 
 func (cmd *StringCmd) Float32() (float32, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return 0, cmd.err
 	}
@@ -1278,6 +2141,7 @@ func (cmd *StringCmd) Float32() (float32, error) {
 }
 
 func (cmd *StringCmd) Float64() (float64, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return 0, cmd.err
 	}
@@ -1285,6 +2149,7 @@ func (cmd *StringCmd) Float64() (float64, error) {
 }
 
 func (cmd *StringCmd) Time() (time.Time, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return time.Time{}, cmd.err
 	}
@@ -1292,13 +2157,15 @@ func (cmd *StringCmd) Time() (time.Time, error) {
 }
 
 func (cmd *StringCmd) Scan(val interface{}) error {
+	cmd.await()
 	if cmd.err != nil {
 		return cmd.err
 	}
-	return proto.Scan([]byte(cmd.val), val)
+	return proto.Scan(util.StringToBytes(cmd.val), val)
 }
 
 func (cmd *StringCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1339,14 +2206,17 @@ func (cmd *FloatCmd) SetVal(val float64) {
 }
 
 func (cmd *FloatCmd) Val() float64 {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *FloatCmd) Result() (float64, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *FloatCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1387,14 +2257,17 @@ func (cmd *FloatSliceCmd) SetVal(val []float64) {
 }
 
 func (cmd *FloatSliceCmd) Val() []float64 {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *FloatSliceCmd) Result() ([]float64, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *FloatSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1405,17 +2278,23 @@ func (cmd *FloatSliceCmd) readReply(rd *proto.Reader) error {
 	}
 
 	cmd.val = make([]float64, n)
+	var elemErr error
 	for i := 0; i < len(cmd.val); i++ {
 		switch num, err := rd.ReadFloat(); {
 		case err == Nil:
 			cmd.val[i] = 0
 		case err != nil:
-			return err
+			if !isRedisError(err) {
+				return err
+			}
+			if elemErr == nil {
+				elemErr = err
+			}
 		default:
 			cmd.val[i] = num
 		}
 	}
-	return nil
+	return elemErr
 }
 
 func (cmd *FloatSliceCmd) Clone() Cmder {
@@ -1455,18 +2334,22 @@ func (cmd *StringSliceCmd) SetVal(val []string) {
 }
 
 func (cmd *StringSliceCmd) Val() []string {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *StringSliceCmd) Result() ([]string, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *StringSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
 func (cmd *StringSliceCmd) ScanSlice(container interface{}) error {
+	cmd.await()
 	return proto.ScanSlice(cmd.val, container)
 }
 
@@ -1476,17 +2359,23 @@ func (cmd *StringSliceCmd) readReply(rd *proto.Reader) error {
 		return err
 	}
 	cmd.val = make([]string, n)
+	var elemErr error
 	for i := 0; i < len(cmd.val); i++ {
 		switch s, err := rd.ReadString(); {
 		case err == Nil:
 			cmd.val[i] = ""
 		case err != nil:
-			return err
+			if !isRedisError(err) {
+				return err
+			}
+			if elemErr == nil {
+				elemErr = err
+			}
 		default:
 			cmd.val[i] = s
 		}
 	}
-	return nil
+	return elemErr
 }
 
 func (cmd *StringSliceCmd) Clone() Cmder {
@@ -1496,6 +2385,90 @@ func (cmd *StringSliceCmd) Clone() Cmder {
 		copy(val, cmd.val)
 	}
 	return &StringSliceCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		val:     val,
+	}
+}
+
+//------------------------------------------------------------------------------
+
+// StringSliceSliceCmd returns a slice of string slices ([][]string).
+// This is used for commands like VLINKS that return an array of arrays.
+type StringSliceSliceCmd struct {
+	baseCmd
+
+	val [][]string
+}
+
+var _ Cmder = (*StringSliceSliceCmd)(nil)
+
+func NewStringSliceSliceCmd(ctx context.Context, args ...any) *StringSliceSliceCmd {
+	return &StringSliceSliceCmd{
+		baseCmd: baseCmd{
+			ctx:  ctx,
+			args: args,
+		},
+	}
+}
+
+func (cmd *StringSliceSliceCmd) SetVal(val [][]string) {
+	cmd.val = val
+}
+
+func (cmd *StringSliceSliceCmd) Val() [][]string {
+	cmd.await()
+	return cmd.val
+}
+
+func (cmd *StringSliceSliceCmd) Result() ([][]string, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *StringSliceSliceCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *StringSliceSliceCmd) readReply(rd *proto.Reader) error {
+	n, err := rd.ReadArrayLen()
+	if err != nil {
+		return err
+	}
+	cmd.val = make([][]string, n)
+	for i := range n {
+		// Read inner array
+		innerN, err := rd.ReadArrayLen()
+		if err != nil {
+			return err
+		}
+		cmd.val[i] = make([]string, innerN)
+		for j := range innerN {
+			switch s, err := rd.ReadString(); {
+			case err == Nil:
+				cmd.val[i][j] = ""
+			case err != nil:
+				return err
+			default:
+				cmd.val[i][j] = s
+			}
+		}
+	}
+	return nil
+}
+
+func (cmd *StringSliceSliceCmd) Clone() Cmder {
+	var val [][]string
+	if cmd.val != nil {
+		val = make([][]string, len(cmd.val))
+		for i, slice := range cmd.val {
+			if slice != nil {
+				val[i] = make([]string, len(slice))
+				copy(val[i], slice)
+			}
+		}
+	}
+	return &StringSliceSliceCmd{
 		baseCmd: cmd.cloneBaseCmd(),
 		val:     val,
 	}
@@ -1531,14 +2504,17 @@ func (cmd *KeyValueSliceCmd) SetVal(val []KeyValue) {
 }
 
 func (cmd *KeyValueSliceCmd) Val() []KeyValue {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *KeyValueSliceCmd) Result() ([]KeyValue, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *KeyValueSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1574,6 +2550,9 @@ func (cmd *KeyValueSliceCmd) readReply(rd *proto.Reader) error { // nolint:dupl
 	if array {
 		cmd.val = make([]KeyValue, n)
 	} else {
+		if n%2 != 0 {
+			return fmt.Errorf("redis: got %d elements in the key-value array, wanted a multiple of 2", n)
+		}
 		cmd.val = make([]KeyValue, n/2)
 	}
 
@@ -1633,14 +2612,17 @@ func (cmd *BoolSliceCmd) SetVal(val []bool) {
 }
 
 func (cmd *BoolSliceCmd) Val() []bool {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *BoolSliceCmd) Result() ([]bool, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *BoolSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1650,12 +2632,23 @@ func (cmd *BoolSliceCmd) readReply(rd *proto.Reader) error {
 		return err
 	}
 	cmd.val = make([]bool, n)
+	var elemErr error
 	for i := 0; i < len(cmd.val); i++ {
-		if cmd.val[i], err = rd.ReadBool(); err != nil {
-			return err
+		switch b, err := rd.ReadBool(); {
+		case err == Nil:
+			cmd.val[i] = false
+		case err != nil:
+			if !isRedisError(err) {
+				return err
+			}
+			if elemErr == nil {
+				elemErr = err
+			}
+		default:
+			cmd.val[i] = b
 		}
 	}
-	return nil
+	return elemErr
 }
 
 func (cmd *BoolSliceCmd) Clone() Cmder {
@@ -1691,6 +2684,7 @@ func NewMapStringStringCmd(ctx context.Context, args ...interface{}) *MapStringS
 }
 
 func (cmd *MapStringStringCmd) Val() map[string]string {
+	cmd.await()
 	return cmd.val
 }
 
@@ -1699,16 +2693,22 @@ func (cmd *MapStringStringCmd) SetVal(val map[string]string) {
 }
 
 func (cmd *MapStringStringCmd) Result() (map[string]string, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *MapStringStringCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
 // Scan scans the results from the map into a destination struct. The map keys
-// are matched in the Redis struct fields by the `redis:"field"` tag.
+// are matched in the Redis struct fields by the `redis:"field"` tag. If a field
+// fails to decode, Scan still sets every other field it can. One failing field
+// returns its error as is; several return them joined with errors.Join in key
+// order, so errors.Is and errors.As match any of them.
 func (cmd *MapStringStringCmd) Scan(dest interface{}) error {
+	cmd.await()
 	if cmd.err != nil {
 		return cmd.err
 	}
@@ -1718,13 +2718,28 @@ func (cmd *MapStringStringCmd) Scan(dest interface{}) error {
 		return err
 	}
 
+	// cmd.val is a map, so order the field errors by key to return the same
+	// error on every call.
+	var errKeys []string
+	var keyErrs map[string]error
 	for k, v := range cmd.val {
 		if err := strct.Scan(k, v); err != nil {
-			return err
+			if keyErrs == nil {
+				keyErrs = make(map[string]error)
+			}
+			keyErrs[k] = err
+			errKeys = append(errKeys, k)
 		}
 	}
-
-	return nil
+	if len(errKeys) == 0 {
+		return nil
+	}
+	slices.Sort(errKeys)
+	errs := make([]error, len(errKeys))
+	for i, k := range errKeys {
+		errs[i] = keyErrs[k]
+	}
+	return hscan.JoinErrors(errs)
 }
 
 func (cmd *MapStringStringCmd) readReply(rd *proto.Reader) error {
@@ -1789,14 +2804,17 @@ func (cmd *MapStringIntCmd) SetVal(val map[string]int64) {
 }
 
 func (cmd *MapStringIntCmd) Val() map[string]int64 {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *MapStringIntCmd) Result() (map[string]int64, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *MapStringIntCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1853,6 +2871,7 @@ func NewMapStringSliceInterfaceCmd(ctx context.Context, args ...interface{}) *Ma
 }
 
 func (cmd *MapStringSliceInterfaceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -1861,10 +2880,12 @@ func (cmd *MapStringSliceInterfaceCmd) SetVal(val map[string][]interface{}) {
 }
 
 func (cmd *MapStringSliceInterfaceCmd) Result() (map[string][]interface{}, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *MapStringSliceInterfaceCmd) Val() map[string][]interface{} {
+	cmd.await()
 	return cmd.val
 }
 
@@ -1913,6 +2934,9 @@ func (cmd *MapStringSliceInterfaceCmd) readReply(rd *proto.Reader) (err error) {
 			if err != nil {
 				return err
 			}
+			if itemLen < 1 {
+				return fmt.Errorf("redis: got %d elements in map-string-slice-interface entry, expected at least 1", itemLen)
+			}
 
 			key, err := rd.ReadString()
 			if err != nil {
@@ -1928,6 +2952,11 @@ func (cmd *MapStringSliceInterfaceCmd) readReply(rd *proto.Reader) (err error) {
 				cmd.val[key] = append(cmd.val[key], data)
 			}
 		}
+	default:
+		// Any other reply type leaves the peeked frame unread. Returning nil
+		// here would put the connection back in the pool with those bytes
+		// buffered, so the next command reads them as its own reply.
+		return fmt.Errorf("redis: can't parse map-string-slice-interface reply: unexpected type %c", readType)
 	}
 
 	return nil
@@ -1976,14 +3005,17 @@ func (cmd *StringStructMapCmd) SetVal(val map[string]struct{}) {
 }
 
 func (cmd *StringStructMapCmd) Val() map[string]struct{} {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *StringStructMapCmd) Result() (map[string]struct{}, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *StringStructMapCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -2051,14 +3083,17 @@ func (cmd *XMessageSliceCmd) SetVal(val []XMessage) {
 }
 
 func (cmd *XMessageSliceCmd) Val() []XMessage {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *XMessageSliceCmd) Result() ([]XMessage, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *XMessageSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -2076,10 +3111,7 @@ func (cmd *XMessageSliceCmd) Clone() Cmder {
 				ID: msg.ID,
 			}
 			if msg.Values != nil {
-				val[i].Values = make(map[string]interface{}, len(msg.Values))
-				for k, v := range msg.Values {
-					val[i].Values[k] = v
-				}
+				val[i].Values = maps.Clone(msg.Values)
 			}
 		}
 	}
@@ -2200,14 +3232,17 @@ func (cmd *XStreamSliceCmd) SetVal(val []XStream) {
 }
 
 func (cmd *XStreamSliceCmd) Val() []XStream {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *XStreamSliceCmd) Result() ([]XStream, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *XStreamSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -2304,14 +3339,17 @@ func (cmd *XPendingCmd) SetVal(val *XPending) {
 }
 
 func (cmd *XPendingCmd) Val() *XPending {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *XPendingCmd) Result() (*XPending, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *XPendingCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -2409,14 +3447,17 @@ func (cmd *XPendingExtCmd) SetVal(val []XPendingExt) {
 }
 
 func (cmd *XPendingExtCmd) Val() []XPendingExt {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *XPendingExtCmd) Result() ([]XPendingExt, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *XPendingExtCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -2493,14 +3534,17 @@ func (cmd *XAutoClaimCmd) SetVal(val []XMessage, start string) {
 }
 
 func (cmd *XAutoClaimCmd) Val() (messages []XMessage, start string) {
+	cmd.await()
 	return cmd.val, cmd.start
 }
 
 func (cmd *XAutoClaimCmd) Result() (messages []XMessage, start string, err error) {
+	cmd.await()
 	return cmd.val, cmd.start, cmd.err
 }
 
 func (cmd *XAutoClaimCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -2529,9 +3573,7 @@ func (cmd *XAutoClaimCmd) readReply(rd *proto.Reader) error {
 	}
 
 	if n >= 3 {
-		if err := rd.DiscardNext(); err != nil {
-			return err
-		}
+		return rd.DiscardNext()
 	}
 
 	return nil
@@ -2562,6 +3604,122 @@ func (cmd *XAutoClaimCmd) Clone() Cmder {
 
 //------------------------------------------------------------------------------
 
+type XAutoClaimWithDeletedCmd struct {
+	baseCmd
+
+	start      string
+	val        []XMessage
+	deletedIDs []string
+}
+
+var _ Cmder = (*XAutoClaimWithDeletedCmd)(nil)
+
+func NewXAutoClaimWithDeletedCmd(ctx context.Context, args ...interface{}) *XAutoClaimWithDeletedCmd {
+	return &XAutoClaimWithDeletedCmd{
+		baseCmd: baseCmd{
+			ctx:     ctx,
+			args:    args,
+			cmdType: CmdTypeXAutoClaimWithDeleted,
+		},
+	}
+}
+
+func (cmd *XAutoClaimWithDeletedCmd) SetVal(val []XMessage, start string, deletedIDs []string) {
+	cmd.val = val
+	cmd.start = start
+	cmd.deletedIDs = deletedIDs
+}
+
+func (cmd *XAutoClaimWithDeletedCmd) Val() (messages []XMessage, start string, deletedIDs []string) {
+	cmd.await()
+	return cmd.val, cmd.start, cmd.deletedIDs
+}
+
+func (cmd *XAutoClaimWithDeletedCmd) Result() (messages []XMessage, start string, deletedIDs []string, err error) {
+	cmd.await()
+	return cmd.val, cmd.start, cmd.deletedIDs, cmd.err
+}
+
+func (cmd *XAutoClaimWithDeletedCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *XAutoClaimWithDeletedCmd) readReply(rd *proto.Reader) error {
+	n, err := rd.ReadArrayLen()
+	if err != nil {
+		return err
+	}
+
+	switch n {
+	case 2, // Redis 6
+		3: // Redis 7:
+		// ok
+	default:
+		return fmt.Errorf("redis: got %d elements in XAutoClaim reply, wanted 2/3", n)
+	}
+
+	cmd.start, err = rd.ReadString()
+	if err != nil {
+		return err
+	}
+
+	cmd.val, err = readXMessageSlice(rd)
+	if err != nil {
+		return err
+	}
+
+	if n < 3 {
+		return nil
+	}
+
+	nn, err := rd.ReadArrayLen()
+	if err != nil {
+		return err
+	}
+
+	cmd.deletedIDs = make([]string, nn)
+	for i := 0; i < nn; i++ {
+		cmd.deletedIDs[i], err = rd.ReadString()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (cmd *XAutoClaimWithDeletedCmd) Clone() Cmder {
+	var val []XMessage
+	if cmd.val != nil {
+		val = make([]XMessage, len(cmd.val))
+		for i, msg := range cmd.val {
+			val[i] = XMessage{
+				ID: msg.ID,
+			}
+			if msg.Values != nil {
+				val[i].Values = make(map[string]interface{}, len(msg.Values))
+				for k, v := range msg.Values {
+					val[i].Values[k] = v
+				}
+			}
+		}
+	}
+	var deletedIDs []string
+	if cmd.deletedIDs != nil {
+		deletedIDs = make([]string, len(cmd.deletedIDs))
+		copy(deletedIDs, cmd.deletedIDs)
+	}
+	return &XAutoClaimWithDeletedCmd{
+		baseCmd:    cmd.cloneBaseCmd(),
+		start:      cmd.start,
+		val:        val,
+		deletedIDs: deletedIDs,
+	}
+}
+
+//------------------------------------------------------------------------------
+
 type XAutoClaimJustIDCmd struct {
 	baseCmd
 
@@ -2587,14 +3745,17 @@ func (cmd *XAutoClaimJustIDCmd) SetVal(val []string, start string) {
 }
 
 func (cmd *XAutoClaimJustIDCmd) Val() (ids []string, start string) {
+	cmd.await()
 	return cmd.val, cmd.start
 }
 
 func (cmd *XAutoClaimJustIDCmd) Result() (ids []string, start string, err error) {
+	cmd.await()
 	return cmd.val, cmd.start, cmd.err
 }
 
 func (cmd *XAutoClaimJustIDCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -2683,14 +3844,17 @@ func (cmd *XInfoConsumersCmd) SetVal(val []XInfoConsumer) {
 }
 
 func (cmd *XInfoConsumersCmd) Val() []XInfoConsumer {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *XInfoConsumersCmd) Result() ([]XInfoConsumer, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *XInfoConsumersCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -2728,7 +3892,10 @@ func (cmd *XInfoConsumersCmd) readReply(rd *proto.Reader) error {
 				inactive, err = rd.ReadInt()
 				cmd.val[i].Inactive = time.Duration(inactive) * time.Millisecond
 			default:
-				return fmt.Errorf("redis: unexpected content %s in XINFO CONSUMERS reply", key)
+				// skip unknown fields
+				if err = rd.DiscardNext(); err != nil {
+					return err
+				}
 			}
 			if err != nil {
 				return err
@@ -2786,14 +3953,17 @@ func (cmd *XInfoGroupsCmd) SetVal(val []XInfoGroup) {
 }
 
 func (cmd *XInfoGroupsCmd) Val() []XInfoGroup {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *XInfoGroupsCmd) Result() ([]XInfoGroup, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *XInfoGroupsCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -2857,7 +4027,10 @@ func (cmd *XInfoGroupsCmd) readReply(rd *proto.Reader) error {
 					group.Lag = -1
 				}
 			default:
-				return fmt.Errorf("redis: unexpected key %q in XINFO GROUPS reply", key)
+				// skip unknown fields
+				if err = rd.DiscardNext(); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -2921,14 +4094,17 @@ func (cmd *XInfoStreamCmd) SetVal(val *XInfoStream) {
 }
 
 func (cmd *XInfoStreamCmd) Val() *XInfoStream {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *XInfoStreamCmd) Result() (*XInfoStream, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *XInfoStreamCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -3026,7 +4202,10 @@ func (cmd *XInfoStreamCmd) readReply(rd *proto.Reader) error {
 				return err
 			}
 		default:
-			return fmt.Errorf("redis: unexpected key %q in XINFO STREAM reply", key)
+			// skip unknown fields
+			if err = rd.DiscardNext(); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -3100,8 +4279,9 @@ type XInfoStreamGroup struct {
 	Name            string
 	LastDeliveredID string
 	EntriesRead     int64
-	Lag             int64
+	Lag             int64 // -1 when the lag cannot be determined, as in XInfoGroup
 	PelCount        int64
+	NackedCount     uint64 // redis version 8.8, number of NACK'd messages in the group
 	Pending         []XInfoStreamGroupPending
 	Consumers       []XInfoStreamConsumer
 }
@@ -3144,14 +4324,17 @@ func (cmd *XInfoStreamFullCmd) SetVal(val *XInfoStreamFull) {
 }
 
 func (cmd *XInfoStreamFullCmd) Val() *XInfoStreamFull {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *XInfoStreamFullCmd) Result() (*XInfoStreamFull, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *XInfoStreamFullCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -3246,7 +4429,10 @@ func (cmd *XInfoStreamFullCmd) readReply(rd *proto.Reader) error {
 				return err
 			}
 		default:
-			return fmt.Errorf("redis: unexpected key %q in XINFO STREAM FULL reply", key)
+			// skip unknown fields
+			if err = rd.DiscardNext(); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -3291,12 +4477,20 @@ func readStreamGroups(rd *proto.Reader) ([]XInfoStreamGroup, error) {
 			case "lag":
 				// lag: the number of entries in the stream that are still waiting to be delivered
 				// to the group's consumers, or a NULL(Nil) when that number can't be determined.
+				// In that case, we return -1.
 				group.Lag, err = rd.ReadInt()
 				if err != nil && err != Nil {
 					return nil, err
+				} else if err == Nil {
+					group.Lag = -1
 				}
 			case "pel-count":
 				group.PelCount, err = rd.ReadInt()
+				if err != nil {
+					return nil, err
+				}
+			case "nacked-count":
+				group.NackedCount, err = rd.ReadUint()
 				if err != nil {
 					return nil, err
 				}
@@ -3311,7 +4505,10 @@ func readStreamGroups(rd *proto.Reader) ([]XInfoStreamGroup, error) {
 					return nil, err
 				}
 			default:
-				return nil, fmt.Errorf("redis: unexpected key %q in XINFO STREAM FULL reply", key)
+				// skip unknown fields
+				if err = rd.DiscardNext(); err != nil {
+					return nil, err
+				}
 			}
 		}
 
@@ -3436,8 +4633,10 @@ func readXInfoStreamConsumers(rd *proto.Reader) ([]XInfoStreamConsumer, error) {
 					c.Pending = append(c.Pending, p)
 				}
 			default:
-				return nil, fmt.Errorf("redis: unexpected content %s "+
-					"in XINFO STREAM FULL reply", cKey)
+				// skip unknown fields
+				if err = rd.DiscardNext(); err != nil {
+					return nil, err
+				}
 			}
 			if err != nil {
 				return nil, err
@@ -3513,14 +4712,17 @@ func (cmd *ZSliceCmd) SetVal(val []Z) {
 }
 
 func (cmd *ZSliceCmd) Val() []Z {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *ZSliceCmd) Result() ([]Z, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *ZSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -3545,6 +4747,9 @@ func (cmd *ZSliceCmd) readReply(rd *proto.Reader) error { // nolint:dupl
 	if array {
 		cmd.val = make([]Z, n)
 	} else {
+		if n%2 != 0 {
+			return fmt.Errorf("redis: got %d elements in the sorted set array, wanted a multiple of 2", n)
+		}
 		cmd.val = make([]Z, n/2)
 	}
 
@@ -3604,14 +4809,17 @@ func (cmd *ZWithKeyCmd) SetVal(val *ZWithKey) {
 }
 
 func (cmd *ZWithKeyCmd) Val() *ZWithKey {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *ZWithKeyCmd) Result() (*ZWithKey, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *ZWithKeyCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -3660,6 +4868,10 @@ type ScanCmd struct {
 	cursor uint64
 
 	process cmdable
+
+	// clusterScan is the walk over the masters of a cluster SCAN, kept on the
+	// command because ScanIterator re-sends the same command for every page.
+	clusterScan *clusterScanState
 }
 
 var _ Cmder = (*ScanCmd)(nil)
@@ -3680,15 +4892,23 @@ func (cmd *ScanCmd) SetVal(page []string, cursor uint64) {
 	cmd.cursor = cursor
 }
 
+// more reports whether the iterator has more pages to fetch.
+func (cmd *ScanCmd) more() bool {
+	return cmd.cursor != 0 || cmd.clusterScan.pending()
+}
+
 func (cmd *ScanCmd) Val() (keys []string, cursor uint64) {
+	cmd.await()
 	return cmd.page, cmd.cursor
 }
 
 func (cmd *ScanCmd) Result() (keys []string, cursor uint64, err error) {
+	cmd.await()
 	return cmd.page, cmd.cursor, cmd.err
 }
 
 func (cmd *ScanCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.page)
 }
 
@@ -3728,6 +4948,7 @@ func (cmd *ScanCmd) Clone() Cmder {
 		page:    page,
 		cursor:  cmd.cursor,
 		process: cmd.process,
+		// clusterScan is not copied: a clone is a new command, not the same walk.
 	}
 }
 
@@ -3775,14 +4996,17 @@ func (cmd *ClusterSlotsCmd) SetVal(val []ClusterSlot) {
 }
 
 func (cmd *ClusterSlotsCmd) Val() []ClusterSlot {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *ClusterSlotsCmd) Result() ([]ClusterSlot, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *ClusterSlotsCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -3825,7 +5049,9 @@ func (cmd *ClusterSlotsCmd) readReply(rd *proto.Reader) error {
 			}
 
 			ip, err := rd.ReadString()
-			if err != nil {
+			// A null host (cluster-preferred-endpoint-type unknown-endpoint)
+			// means "reuse the origin host"; newClusterState fills it in.
+			if err != nil && err != Nil {
 				return err
 			}
 
@@ -3932,29 +5158,31 @@ type GeoRadiusQuery struct {
 	Sort      string
 	Store     string
 	StoreDist string
-
-	// WithCoord+WithDist+WithGeoHash
-	withLen int
 }
 
 type GeoLocationCmd struct {
 	baseCmd
 
-	q         *GeoRadiusQuery
+	// q is a copy of the caller's query, taken when the command is built, so
+	// the reply is parsed with the flags that were sent even if the caller
+	// changes or reuses its query before the reply arrives (pipelines,
+	// autopipelining).
+	q         GeoRadiusQuery
 	locations []GeoLocation
 }
 
 var _ Cmder = (*GeoLocationCmd)(nil)
 
 func NewGeoLocationCmd(ctx context.Context, q *GeoRadiusQuery, args ...interface{}) *GeoLocationCmd {
-	return &GeoLocationCmd{
+	cmd := &GeoLocationCmd{
 		baseCmd: baseCmd{
 			ctx:     ctx,
-			args:    geoLocationArgs(q, args...),
 			cmdType: CmdTypeGeoLocation,
 		},
-		q: q,
+		q: *q,
 	}
+	cmd.args = geoLocationArgs(&cmd.q, args...)
+	return cmd
 }
 
 func geoLocationArgs(q *GeoRadiusQuery, args ...interface{}) []interface{} {
@@ -3966,15 +5194,12 @@ func geoLocationArgs(q *GeoRadiusQuery, args ...interface{}) []interface{} {
 	}
 	if q.WithCoord {
 		args = append(args, "withcoord")
-		q.withLen++
 	}
 	if q.WithDist {
 		args = append(args, "withdist")
-		q.withLen++
 	}
 	if q.WithGeoHash {
 		args = append(args, "withhash")
-		q.withLen++
 	}
 	if q.Count > 0 {
 		args = append(args, "count", q.Count)
@@ -3998,14 +5223,17 @@ func (cmd *GeoLocationCmd) SetVal(locations []GeoLocation) {
 }
 
 func (cmd *GeoLocationCmd) Val() []GeoLocation {
+	cmd.await()
 	return cmd.locations
 }
 
 func (cmd *GeoLocationCmd) Result() ([]GeoLocation, error) {
+	cmd.await()
 	return cmd.locations, cmd.err
 }
 
 func (cmd *GeoLocationCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.locations)
 }
 
@@ -4016,9 +5244,21 @@ func (cmd *GeoLocationCmd) readReply(rd *proto.Reader) error {
 	}
 	cmd.locations = make([]GeoLocation, n)
 
+	// Count the WITH flags of the query this command was built with.
+	withLen := 0
+	if cmd.q.WithCoord {
+		withLen++
+	}
+	if cmd.q.WithDist {
+		withLen++
+	}
+	if cmd.q.WithGeoHash {
+		withLen++
+	}
+
 	for i := 0; i < len(cmd.locations); i++ {
 		// only name
-		if cmd.q.withLen == 0 {
+		if withLen == 0 {
 			if cmd.locations[i].Name, err = rd.ReadString(); err != nil {
 				return err
 			}
@@ -4026,7 +5266,7 @@ func (cmd *GeoLocationCmd) readReply(rd *proto.Reader) error {
 		}
 
 		// +name
-		if err = rd.ReadFixedArrayLen(cmd.q.withLen + 1); err != nil {
+		if err = rd.ReadFixedArrayLen(withLen + 1); err != nil {
 			return err
 		}
 
@@ -4060,21 +5300,6 @@ func (cmd *GeoLocationCmd) readReply(rd *proto.Reader) error {
 }
 
 func (cmd *GeoLocationCmd) Clone() Cmder {
-	var q *GeoRadiusQuery
-	if cmd.q != nil {
-		q = &GeoRadiusQuery{
-			Radius:      cmd.q.Radius,
-			Unit:        cmd.q.Unit,
-			WithCoord:   cmd.q.WithCoord,
-			WithDist:    cmd.q.WithDist,
-			WithGeoHash: cmd.q.WithGeoHash,
-			Count:       cmd.q.Count,
-			Sort:        cmd.q.Sort,
-			Store:       cmd.q.Store,
-			StoreDist:   cmd.q.StoreDist,
-			withLen:     cmd.q.withLen,
-		}
-	}
 	var locations []GeoLocation
 	if cmd.locations != nil {
 		locations = make([]GeoLocation, len(cmd.locations))
@@ -4082,7 +5307,7 @@ func (cmd *GeoLocationCmd) Clone() Cmder {
 	}
 	return &GeoLocationCmd{
 		baseCmd:   cmd.cloneBaseCmd(),
-		q:         q,
+		q:         cmd.q,
 		locations: locations,
 	}
 }
@@ -4155,15 +5380,17 @@ func geoSearchArgs(q *GeoSearchQuery, args []interface{}) []interface{} {
 	}
 
 	if q.Radius > 0 {
-		if q.RadiusUnit == "" {
-			q.RadiusUnit = "km"
+		unit := q.RadiusUnit
+		if unit == "" {
+			unit = "km"
 		}
-		args = append(args, "byradius", q.Radius, q.RadiusUnit)
+		args = append(args, "byradius", q.Radius, unit)
 	} else {
-		if q.BoxUnit == "" {
-			q.BoxUnit = "km"
+		unit := q.BoxUnit
+		if unit == "" {
+			unit = "km"
 		}
-		args = append(args, "bybox", q.BoxWidth, q.BoxHeight, q.BoxUnit)
+		args = append(args, "bybox", q.BoxWidth, q.BoxHeight, unit)
 	}
 
 	if q.Sort != "" {
@@ -4183,7 +5410,8 @@ func geoSearchArgs(q *GeoSearchQuery, args []interface{}) []interface{} {
 type GeoSearchLocationCmd struct {
 	baseCmd
 
-	opt *GeoSearchLocationQuery
+	// opt is a copy of the caller's query; see GeoLocationCmd.q.
+	opt GeoSearchLocationQuery
 	val []GeoLocation
 }
 
@@ -4192,14 +5420,15 @@ var _ Cmder = (*GeoSearchLocationCmd)(nil)
 func NewGeoSearchLocationCmd(
 	ctx context.Context, opt *GeoSearchLocationQuery, args ...interface{},
 ) *GeoSearchLocationCmd {
-	return &GeoSearchLocationCmd{
+	cmd := &GeoSearchLocationCmd{
 		baseCmd: baseCmd{
 			ctx:     ctx,
-			args:    geoSearchLocationArgs(opt, args),
 			cmdType: CmdTypeGeoSearchLocation,
 		},
-		opt: opt,
+		opt: *opt,
 	}
+	cmd.args = geoSearchLocationArgs(&cmd.opt, args)
+	return cmd
 }
 
 func (cmd *GeoSearchLocationCmd) SetVal(val []GeoLocation) {
@@ -4207,14 +5436,17 @@ func (cmd *GeoSearchLocationCmd) SetVal(val []GeoLocation) {
 }
 
 func (cmd *GeoSearchLocationCmd) Val() []GeoLocation {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *GeoSearchLocationCmd) Result() ([]GeoLocation, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *GeoSearchLocationCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -4225,10 +5457,27 @@ func (cmd *GeoSearchLocationCmd) readReply(rd *proto.Reader) error {
 	}
 
 	cmd.val = make([]GeoLocation, n)
+	// Each element is an array of [name, ...] whose minimum length is set by
+	// the requested WITH flags. Entries shorter than that would make the
+	// parser read into the next reply; extra elements are drained below so a
+	// longer entry (e.g. from a newer server) can't leave frames on the wire.
+	withLen := 1
+	if cmd.opt.WithDist {
+		withLen++
+	}
+	if cmd.opt.WithHash {
+		withLen++
+	}
+	if cmd.opt.WithCoord {
+		withLen++
+	}
 	for i := 0; i < n; i++ {
-		_, err = rd.ReadArrayLen()
+		nn, err := rd.ReadArrayLen()
 		if err != nil {
 			return err
+		}
+		if nn < withLen {
+			return fmt.Errorf("redis: got %d elements in GEOSEARCH reply, expected at least %d", nn, withLen)
 		}
 
 		var loc GeoLocation
@@ -4262,6 +5511,11 @@ func (cmd *GeoSearchLocationCmd) readReply(rd *proto.Reader) error {
 				return err
 			}
 		}
+		for j := withLen; j < nn; j++ {
+			if err := rd.DiscardNext(); err != nil {
+				return err
+			}
+		}
 
 		cmd.val[i] = loc
 	}
@@ -4270,27 +5524,6 @@ func (cmd *GeoSearchLocationCmd) readReply(rd *proto.Reader) error {
 }
 
 func (cmd *GeoSearchLocationCmd) Clone() Cmder {
-	var opt *GeoSearchLocationQuery
-	if cmd.opt != nil {
-		opt = &GeoSearchLocationQuery{
-			GeoSearchQuery: GeoSearchQuery{
-				Member:     cmd.opt.Member,
-				Longitude:  cmd.opt.Longitude,
-				Latitude:   cmd.opt.Latitude,
-				Radius:     cmd.opt.Radius,
-				RadiusUnit: cmd.opt.RadiusUnit,
-				BoxWidth:   cmd.opt.BoxWidth,
-				BoxHeight:  cmd.opt.BoxHeight,
-				BoxUnit:    cmd.opt.BoxUnit,
-				Sort:       cmd.opt.Sort,
-				Count:      cmd.opt.Count,
-				CountAny:   cmd.opt.CountAny,
-			},
-			WithCoord: cmd.opt.WithCoord,
-			WithDist:  cmd.opt.WithDist,
-			WithHash:  cmd.opt.WithHash,
-		}
-	}
 	var val []GeoLocation
 	if cmd.val != nil {
 		val = make([]GeoLocation, len(cmd.val))
@@ -4298,7 +5531,7 @@ func (cmd *GeoSearchLocationCmd) Clone() Cmder {
 	}
 	return &GeoSearchLocationCmd{
 		baseCmd: cmd.cloneBaseCmd(),
-		opt:     opt,
+		opt:     cmd.opt,
 		val:     val,
 	}
 }
@@ -4332,14 +5565,17 @@ func (cmd *GeoPosCmd) SetVal(val []*GeoPos) {
 }
 
 func (cmd *GeoPosCmd) Val() []*GeoPos {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *GeoPosCmd) Result() ([]*GeoPos, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *GeoPosCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -4399,22 +5635,49 @@ func (cmd *GeoPosCmd) Clone() Cmder {
 
 //------------------------------------------------------------------------------
 
+// KeySpec is one COMMAND key specification. BeginSearch and FindKeys carry
+// the type names from the reply ("index"/"keyword"/"unknown",
+// "range"/"keynum"/"unknown"); position fields are relative per the COMMAND
+// docs.
+type KeySpec struct {
+	Flags []string // e.g. RO, RW, access, update, incomplete, not_key
+
+	BeginSearch string
+	Index       int
+	Keyword     string
+	StartFrom   int
+
+	FindKeys  string
+	LastKey   int
+	KeyStep   int
+	Limit     int
+	KeyNumIdx int
+	FirstKey  int
+}
+
 type CommandInfo struct {
-	Name          string
-	Arity         int8
-	Flags         []string
-	ACLFlags      []string
-	FirstKeyPos   int8
-	LastKeyPos    int8
-	StepCount     int8
-	ReadOnly      bool
+	Name        string
+	Arity       int8
+	Flags       []string
+	ACLFlags    []string
+	FirstKeyPos int8
+	LastKeyPos  int8
+	StepCount   int8
+	ReadOnly    bool
+	// Tips holds the raw command tips (e.g. "nondeterministic_output").
+	Tips          []string
+	KeySpecs      []KeySpec
 	CommandPolicy *routing.CommandPolicy
 }
 
 type CommandsInfoCmd struct {
 	baseCmd
 
+	// A nil value tombstones a malformed record without discarding siblings.
 	val map[string]*CommandInfo
+
+	// legacyRecords tracks Redis 5/6 layouts, which lack tips and key specs.
+	legacyRecords map[string]struct{}
 }
 
 var _ Cmder = (*CommandsInfoCmd)(nil)
@@ -4433,148 +5696,805 @@ func (cmd *CommandsInfoCmd) SetVal(val map[string]*CommandInfo) {
 	cmd.val = val
 }
 
+// Val omits records that the client could not parse.
 func (cmd *CommandsInfoCmd) Val() map[string]*CommandInfo {
+	cmd.await()
+	return withoutCommandInfoTombstones(cmd.val)
+}
+
+// Result omits records that the client could not parse.
+func (cmd *CommandsInfoCmd) Result() (map[string]*CommandInfo, error) {
+	cmd.await()
+	return withoutCommandInfoTombstones(cmd.val), cmd.err
+}
+
+// valWithTombstones returns the reply as parsed, including the nil entries.
+// The command-metadata builder needs them to block snapshot and correction
+// fallback for a name the server reported malformed or conflicting; the public
+// accessors hide them because ranging over the reply and dereferencing a value
+// is the natural way to read it.
+func (cmd *CommandsInfoCmd) valWithTombstones() map[string]*CommandInfo {
+	cmd.await()
 	return cmd.val
 }
 
-func (cmd *CommandsInfoCmd) Result() (map[string]*CommandInfo, error) {
-	return cmd.val, cmd.err
+func withoutCommandInfoTombstones(val map[string]*CommandInfo) map[string]*CommandInfo {
+	tombstones := 0
+	for _, info := range val {
+		if info == nil {
+			tombstones++
+		}
+	}
+	if tombstones == 0 {
+		return val
+	}
+
+	valid := make(map[string]*CommandInfo, len(val)-tombstones)
+	for name, info := range val {
+		if info != nil {
+			valid[name] = info
+		}
+	}
+	return valid
 }
 
 func (cmd *CommandsInfoCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
 func (cmd *CommandsInfoCmd) readReply(rd *proto.Reader) error {
-	const numArgRedis5 = 6
-	const numArgRedis6 = 7
-	const numArgRedis7 = 10 // Also matches redis 8
-
+	typ, _, err := peekCommandInfoReplyType(rd, 0)
+	if err != nil {
+		return err
+	}
+	if typ != proto.RespArray {
+		// Preserve server errors, notably ACL NOPERM, as typed Redis errors.
+		if typ == proto.RespError || typ == proto.RespBlobError || typ == proto.RespNil {
+			_, err := rd.ReadArrayLen()
+			return err
+		}
+		// Drain framed wrong types to keep the connection aligned.
+		if err := discardCommandInfoValue(rd, 0); err != nil {
+			return err
+		}
+		return fmt.Errorf("redis: COMMAND reply has type %q, wanted array", typ)
+	}
 	n, err := rd.ReadArrayLen()
 	if err != nil {
 		return err
 	}
-	cmd.val = make(map[string]*CommandInfo, n)
+	cmd.val = make(map[string]*CommandInfo, commandInfoPrealloc(n))
+	cmd.legacyRecords = make(map[string]struct{})
 
 	for i := 0; i < n; i++ {
-		nn, err := rd.ReadArrayLen()
-		if err != nil {
+		if err := readCommandInfoEntry(rd, cmd.val, cmd.legacyRecords); err != nil {
 			return err
 		}
-
-		switch nn {
-		case numArgRedis5, numArgRedis6, numArgRedis7:
-			// ok
-		default:
-			return fmt.Errorf("redis: got %d elements in COMMAND reply, wanted 6/7/10", nn)
-		}
-
-		cmdInfo := &CommandInfo{}
-		if cmdInfo.Name, err = rd.ReadString(); err != nil {
-			return err
-		}
-
-		arity, err := rd.ReadInt()
-		if err != nil {
-			return err
-		}
-		cmdInfo.Arity = int8(arity)
-
-		flagLen, err := rd.ReadArrayLen()
-		if err != nil {
-			return err
-		}
-		cmdInfo.Flags = make([]string, flagLen)
-		for f := 0; f < len(cmdInfo.Flags); f++ {
-			switch s, err := rd.ReadString(); {
-			case err == Nil:
-				cmdInfo.Flags[f] = ""
-			case err != nil:
-				return err
-			default:
-				if !cmdInfo.ReadOnly && s == "readonly" {
-					cmdInfo.ReadOnly = true
-				}
-				cmdInfo.Flags[f] = s
-			}
-		}
-
-		firstKeyPos, err := rd.ReadInt()
-		if err != nil {
-			return err
-		}
-		cmdInfo.FirstKeyPos = int8(firstKeyPos)
-
-		lastKeyPos, err := rd.ReadInt()
-		if err != nil {
-			return err
-		}
-		cmdInfo.LastKeyPos = int8(lastKeyPos)
-
-		stepCount, err := rd.ReadInt()
-		if err != nil {
-			return err
-		}
-		cmdInfo.StepCount = int8(stepCount)
-
-		if nn >= numArgRedis6 {
-			aclFlagLen, err := rd.ReadArrayLen()
-			if err != nil {
-				return err
-			}
-			cmdInfo.ACLFlags = make([]string, aclFlagLen)
-			for f := 0; f < len(cmdInfo.ACLFlags); f++ {
-				switch s, err := rd.ReadString(); {
-				case err == Nil:
-					cmdInfo.ACLFlags[f] = ""
-				case err != nil:
-					return err
-				default:
-					cmdInfo.ACLFlags[f] = s
-				}
-			}
-		}
-
-		if nn >= numArgRedis7 {
-			// The 8th argument is an array of tips.
-			tipsLen, err := rd.ReadArrayLen()
-			if err != nil {
-				return err
-			}
-
-			rawTips := make(map[string]string, tipsLen)
-			if cmdInfo.ReadOnly {
-				rawTips[routing.ReadOnlyCMD] = ""
-			}
-			for f := 0; f < tipsLen; f++ {
-				tip, err := rd.ReadString()
-				if err != nil {
-					return err
-				}
-
-				k, v, ok := strings.Cut(tip, ":")
-				if !ok {
-					// Handle tips that don't have a colon (like "nondeterministic_output")
-					rawTips[tip] = ""
-				} else {
-					// Handle normal key:value tips
-					rawTips[k] = v
-				}
-			}
-			cmdInfo.CommandPolicy = parseCommandPolicies(rawTips, cmdInfo.FirstKeyPos)
-
-			if err := rd.DiscardNext(); err != nil {
-				return err
-			}
-			if err := rd.DiscardNext(); err != nil {
-				return err
-			}
-		}
-
-		cmd.val[cmdInfo.Name] = cmdInfo
 	}
 
 	return nil
+}
+
+const (
+	numArgRedis5 = 6
+	numArgRedis6 = 7
+	numArgRedis7 = 10 // Also matches redis 8
+)
+
+// Redis command hierarchies are shallow; this generous limit makes malformed
+// server input fail closed before recursive parsing can exhaust the Go stack.
+const maxCommandInfoDepth = 16
+
+// Limit preallocation without changing how many wire values are consumed.
+const maxCommandInfoPrealloc = 1024
+
+func commandInfoPrealloc(n int) int {
+	return min(max(n, 0), maxCommandInfoPrealloc)
+}
+
+// peekCommandInfoReplyType unwraps RESP3 attributes within the parser's depth
+// limit.
+func peekCommandInfoReplyType(rd *proto.Reader, depth int) (byte, int, error) {
+	for {
+		if depth > maxCommandInfoDepth {
+			return 0, depth, fmt.Errorf(
+				"redis: COMMAND metadata exceeds maximum nesting depth %d",
+				maxCommandInfoDepth,
+			)
+		}
+		b, err := rd.Peek(1)
+		if err != nil {
+			return 0, depth, err
+		}
+		if b[0] != proto.RespAttr {
+			return b[0], depth, nil
+		}
+		n, err := rd.ReadAttributeLen()
+		if err == Nil {
+			// A null attribute (|-1) is not valid RESP3, but the header is
+			// already consumed and carries no pairs, so unwrap it like an empty
+			// attribute. Returning Nil here would make the scalar readers treat
+			// the wrapped value as consumed and leave it on the wire.
+			n = 0
+		} else if err != nil {
+			return 0, depth, err
+		}
+		for range n {
+			if err := discardCommandInfoValue(rd, depth+1); err != nil {
+				return 0, depth, err
+			}
+			if err := discardCommandInfoValue(rd, depth+1); err != nil {
+				return 0, depth, err
+			}
+		}
+		depth++
+	}
+}
+
+func fitsInt8(v int64) bool {
+	return v >= math.MinInt8 && v <= math.MaxInt8
+}
+
+// These readers drain wrong-shaped values and return ok=false. Errors mean
+// framing or I/O failed, so parsing cannot safely continue.
+func readCommandInfoString(rd *proto.Reader) (string, bool, error) {
+	value, ok, err := readCommandInfoStringOrNil(rd)
+	if err == Nil {
+		return "", false, nil
+	}
+	return value, ok, err
+}
+
+// readCommandInfoStringOrNil preserves Nil so optional collection tokens can
+// be skipped without accepting other wrong-shaped values.
+func readCommandInfoStringOrNil(rd *proto.Reader) (string, bool, error) {
+	typ, _, err := peekCommandInfoReplyType(rd, 0)
+	if err != nil {
+		return "", false, err
+	}
+	switch typ {
+	case proto.RespStatus, proto.RespString, proto.RespVerbatim, proto.RespNil:
+		s, err := rd.ReadString()
+		if errors.Is(err, proto.ErrInvalidVerbatimString) {
+			// The scalar was consumed, so sibling records remain aligned.
+			return "", false, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		return s, true, nil
+	default:
+		if err := discardCommandInfoValue(rd, 0); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
+	}
+}
+
+func readCommandInfoInt(rd *proto.Reader) (int64, bool, error) {
+	typ, _, err := peekCommandInfoReplyType(rd, 0)
+	if err != nil {
+		return 0, false, err
+	}
+	if typ != proto.RespInt {
+		if err := discardCommandInfoValue(rd, 0); err != nil {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+
+	// COMMAND integers must not use ReadInt's string/status coercion.
+	line, err := rd.ReadLine()
+	if err != nil {
+		return 0, false, err
+	}
+	v, err := util.ParseInt(line[1:], 10, 64)
+	if err != nil {
+		// The scalar was consumed, so sibling records remain aligned.
+		return 0, false, nil
+	}
+	return v, true, nil
+}
+
+func readCommandInfoArrayLen(rd *proto.Reader) (int, bool, error) {
+	typ, _, err := peekCommandInfoReplyType(rd, 0)
+	if err != nil {
+		return 0, false, err
+	}
+	switch typ {
+	case proto.RespArray:
+		n, err := rd.ReadArrayLen()
+		if err == Nil {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		return n, true, nil
+	default:
+		if err := discardCommandInfoValue(rd, 0); err != nil {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+}
+
+// readCommandInfoCollectionLen accepts RESP2 arrays and RESP3 sets for
+// unordered COMMAND collections.
+func readCommandInfoCollectionLen(rd *proto.Reader) (int, bool, error) {
+	typ, _, err := peekCommandInfoReplyType(rd, 0)
+	if err != nil {
+		return 0, false, err
+	}
+	switch typ {
+	case proto.RespArray, proto.RespSet:
+		n, err := rd.ReadArrayLen()
+		if err == Nil {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		return n, true, nil
+	default:
+		if err := discardCommandInfoValue(rd, 0); err != nil {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+}
+
+// readCommandInfoStrings skips null tokens and drains the entire collection
+// even if another item is malformed.
+func readCommandInfoStrings(rd *proto.Reader) ([]string, bool, error) {
+	n, valid, err := readCommandInfoCollectionLen(rd)
+	if err != nil || !valid {
+		return nil, false, err
+	}
+	values := make([]string, 0, commandInfoPrealloc(n))
+	for range n {
+		value, ok, err := readCommandInfoStringOrNil(rd)
+		if err == Nil {
+			continue
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			valid = false
+			continue
+		}
+		values = append(values, value)
+	}
+	return values, valid, nil
+}
+
+// readCommandInfoMapLen accepts RESP3 maps and RESP2 field/value arrays.
+func readCommandInfoMapLen(rd *proto.Reader) (int, bool, error) {
+	typ, _, err := peekCommandInfoReplyType(rd, 0)
+	if err != nil {
+		return 0, false, err
+	}
+	switch typ {
+	case proto.RespMap:
+		n, err := rd.ReadMapLen()
+		if err == Nil {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		return n, true, nil
+	case proto.RespArray:
+		n, err := rd.ReadArrayLen()
+		if err == Nil {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		if n%2 != 0 {
+			if err := discardCommandInfoValues(rd, n); err != nil {
+				return 0, false, err
+			}
+			return 0, false, nil
+		}
+		return n / 2, true, nil
+	default:
+		if err := discardCommandInfoValue(rd, 0); err != nil {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+}
+
+func discardCommandInfoValues(rd *proto.Reader, n int) error {
+	for range n {
+		if err := discardCommandInfoValue(rd, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// discardCommandInfoValue drains one value within the parser's depth limit.
+func discardCommandInfoValue(rd *proto.Reader, depth int) error {
+	if depth > maxCommandInfoDepth {
+		return fmt.Errorf("redis: COMMAND metadata exceeds maximum nesting depth %d", maxCommandInfoDepth)
+	}
+	typ, valueDepth, err := peekCommandInfoReplyType(rd, depth)
+	if err != nil {
+		return err
+	}
+	switch typ {
+	case proto.RespArray, proto.RespSet, proto.RespPush:
+		n, err := rd.ReadArrayLen()
+		if err == Nil {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		for range n {
+			if err := discardCommandInfoValue(rd, valueDepth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	case proto.RespMap:
+		n, err := rd.ReadMapLen()
+		if err == Nil {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		for range n {
+			if err := discardCommandInfoValue(rd, valueDepth+1); err != nil {
+				return err
+			}
+			if err := discardCommandInfoValue(rd, valueDepth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return rd.DiscardNext()
+	}
+}
+
+// readCommandInfoEntry parses one COMMAND entry into m, recursively
+// flattening subcommands (named "parent|child" on the wire).
+func readCommandInfoEntry(
+	rd *proto.Reader,
+	m map[string]*CommandInfo,
+	legacyRecords map[string]struct{},
+) error {
+	return readCommandInfoEntryAtDepth(rd, m, legacyRecords, 0)
+}
+
+// storeCommandInfoRecord tombstones conflicting or malformed duplicates.
+func storeCommandInfoRecord(
+	m map[string]*CommandInfo,
+	legacyRecords map[string]struct{},
+	name string,
+	info *CommandInfo,
+	legacy bool,
+) {
+	if existing, duplicate := m[name]; duplicate {
+		// Identical duplicate COMMAND INFO records are valid; conflicts are not.
+		_, existingLegacy := legacyRecords[name]
+		if existing == nil || info == nil || existingLegacy != legacy || !reflect.DeepEqual(existing, info) {
+			m[name] = nil
+			delete(legacyRecords, name)
+		}
+		return
+	}
+	m[name] = info
+	if info != nil && legacy {
+		legacyRecords[name] = struct{}{}
+	}
+}
+
+func readCommandInfoEntryAtDepth(
+	rd *proto.Reader,
+	m map[string]*CommandInfo,
+	legacyRecords map[string]struct{},
+	depth int,
+) error {
+	if depth > maxCommandInfoDepth {
+		return fmt.Errorf("redis: COMMAND subcommands exceed maximum depth %d", maxCommandInfoDepth)
+	}
+	nn, ok, err := readCommandInfoArrayLen(rd)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// The unnamed malformed value was drained.
+		return nil
+	}
+
+	// Tombstone a named short record, but keep parsing siblings.
+	if nn != numArgRedis5 && nn != numArgRedis6 && nn < numArgRedis7 {
+		var name string
+		nameOK := false
+		if nn > 0 {
+			name, nameOK, err = readCommandInfoString(rd)
+			if err != nil {
+				return err
+			}
+		}
+		if err := discardCommandInfoValues(rd, nn-1); err != nil {
+			return err
+		}
+		if nameOK && name != "" {
+			storeCommandInfoRecord(m, legacyRecords, name, nil, false)
+		}
+		return nil
+	}
+
+	cmdInfo := &CommandInfo{}
+	nameOK := false
+	if cmdInfo.Name, nameOK, err = readCommandInfoString(rd); err != nil {
+		return err
+	}
+	valid := nameOK && cmdInfo.Name != ""
+
+	arity, arityOK, err := readCommandInfoInt(rd)
+	if err != nil {
+		return err
+	}
+	if arityOK && fitsInt8(arity) {
+		cmdInfo.Arity = int8(arity)
+	} else {
+		valid = false
+	}
+
+	var flagsOK bool
+	cmdInfo.Flags, flagsOK, err = readCommandInfoStrings(rd)
+	if err != nil {
+		return err
+	}
+	valid = valid && flagsOK
+	cmdInfo.ReadOnly = slices.Contains(cmdInfo.Flags, "readonly")
+
+	firstKeyPos, firstKeyOK, err := readCommandInfoInt(rd)
+	if err != nil {
+		return err
+	}
+	lastKeyPos, lastKeyOK, err := readCommandInfoInt(rd)
+	if err != nil {
+		return err
+	}
+	stepCount, stepOK, err := readCommandInfoInt(rd)
+	if err != nil {
+		return err
+	}
+	// The public fields are int8; a value that does not fit would silently
+	// wrap into a DIFFERENT valid key position (e.g. firstkey 257 -> 1).
+	// Zero the triple instead: "key positions unknown" fails closed.
+	if firstKeyOK && lastKeyOK && stepOK &&
+		fitsInt8(firstKeyPos) && fitsInt8(lastKeyPos) && fitsInt8(stepCount) {
+		cmdInfo.FirstKeyPos = int8(firstKeyPos)
+		cmdInfo.LastKeyPos = int8(lastKeyPos)
+		cmdInfo.StepCount = int8(stepCount)
+	} else {
+		valid = false
+	}
+
+	if nn >= numArgRedis6 {
+		var aclFlagsOK bool
+		cmdInfo.ACLFlags, aclFlagsOK, err = readCommandInfoStrings(rd)
+		if err != nil {
+			return err
+		}
+		valid = valid && aclFlagsOK
+	}
+
+	if nn >= numArgRedis7 {
+		// The 8th argument is an array of tips.
+		var tipsOK bool
+		cmdInfo.Tips, tipsOK, err = readCommandInfoStrings(rd)
+		if err != nil {
+			return err
+		}
+		valid = valid && tipsOK
+		rawTips := make(map[string]string, len(cmdInfo.Tips)+1)
+		if cmdInfo.ReadOnly {
+			rawTips[routing.ReadOnlyCMD] = ""
+		}
+		for _, tip := range cmdInfo.Tips {
+			key, value, _ := strings.Cut(tip, ":")
+			rawTips[key] = value
+		}
+
+		// The 9th argument is the key specifications.
+		specsLen, specsOK, err := readCommandInfoCollectionLen(rd)
+		if err != nil {
+			return err
+		}
+		valid = valid && specsOK
+		if specsOK && specsLen > 0 {
+			cmdInfo.KeySpecs = make([]KeySpec, 0, commandInfoPrealloc(specsLen))
+			for s := 0; s < specsLen; s++ {
+				ks, specOK, err := readKeySpec(rd)
+				if err != nil {
+					return err
+				}
+				if !specOK {
+					valid = false
+					continue
+				}
+				cmdInfo.KeySpecs = append(cmdInfo.KeySpecs, ks)
+			}
+		}
+
+		// The 10th argument is the subcommands, flattened into m.
+		subLen, subcommandsOK, err := readCommandInfoCollectionLen(rd)
+		if err != nil {
+			return err
+		}
+		valid = valid && subcommandsOK
+		if subcommandsOK {
+			for s := 0; s < subLen; s++ {
+				if err := readCommandInfoEntryAtDepth(rd, m, legacyRecords, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+
+		if valid {
+			cmdInfo.CommandPolicy = parseCommandPolicies(rawTips, cmdInfo.FirstKeyPos)
+		}
+	}
+
+	if nn > numArgRedis7 {
+		// Preserve the known prefix when Redis appends new metadata fields.
+		if err := discardCommandInfoValues(rd, nn-numArgRedis7); err != nil {
+			return err
+		}
+	}
+
+	if nameOK && cmdInfo.Name != "" {
+		if valid {
+			storeCommandInfoRecord(m, legacyRecords, cmdInfo.Name, cmdInfo, nn < numArgRedis7)
+		} else {
+			storeCommandInfoRecord(m, legacyRecords, cmdInfo.Name, nil, false)
+		}
+	}
+	return nil
+}
+
+// readKeySpec parses one key specification. ReadMapLen handles both wire
+// shapes (RESP3 map, RESP2 field-value array).
+func readKeySpec(rd *proto.Reader) (KeySpec, bool, error) {
+	var ks KeySpec
+	n, ok, err := readCommandInfoMapLen(rd)
+	if err != nil {
+		return ks, false, err
+	}
+	if !ok {
+		return ks, false, nil
+	}
+	valid := true
+	var seenFlags, seenBeginSearch, seenFindKeys bool
+	for i := 0; i < n; i++ {
+		field, fieldOK, err := readCommandInfoString(rd)
+		if err != nil {
+			return ks, false, err
+		}
+		if !fieldOK {
+			valid = false
+			if err := discardCommandInfoValue(rd, 0); err != nil {
+				return ks, false, err
+			}
+			continue
+		}
+		switch field {
+		case "flags":
+			if seenFlags {
+				valid = false
+			}
+			seenFlags = true
+			var flagsOK bool
+			ks.Flags, flagsOK, err = readCommandInfoStrings(rd)
+			if err != nil {
+				return ks, false, err
+			}
+			valid = valid && flagsOK
+		case "begin_search":
+			if seenBeginSearch {
+				valid = false
+			}
+			seenBeginSearch = true
+			sectionOK, err := readKeySpecSectionChecked(rd, &ks, true)
+			if err != nil {
+				return ks, false, err
+			}
+			valid = valid && sectionOK
+		case "find_keys":
+			if seenFindKeys {
+				valid = false
+			}
+			seenFindKeys = true
+			sectionOK, err := readKeySpecSectionChecked(rd, &ks, false)
+			if err != nil {
+				return ks, false, err
+			}
+			valid = valid && sectionOK
+		default:
+			if err := discardCommandInfoValue(rd, 0); err != nil {
+				return ks, false, err
+			}
+		}
+	}
+	return ks, valid && seenFlags && seenBeginSearch && seenFindKeys, nil
+}
+
+// readKeySpecSectionChecked parses a begin_search or find_keys section.
+func readKeySpecSectionChecked(rd *proto.Reader, ks *KeySpec, beginSearch bool) (bool, error) {
+	n, ok, err := readCommandInfoMapLen(rd)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	valid := true
+	var seenType, seenSpec bool
+	seenSpecFields := make(map[string]bool)
+	for i := 0; i < n; i++ {
+		field, fieldOK, err := readCommandInfoString(rd)
+		if err != nil {
+			return false, err
+		}
+		if !fieldOK {
+			valid = false
+			if err := discardCommandInfoValue(rd, 0); err != nil {
+				return false, err
+			}
+			continue
+		}
+		switch field {
+		case "type":
+			if seenType {
+				valid = false
+			}
+			seenType = true
+			typ, typeOK, err := readCommandInfoString(rd)
+			if err != nil {
+				return false, err
+			}
+			if !typeOK {
+				valid = false
+				continue
+			}
+			if beginSearch {
+				ks.BeginSearch = typ
+			} else {
+				ks.FindKeys = typ
+			}
+		case "spec":
+			if seenSpec {
+				valid = false
+			}
+			seenSpec = true
+			sn, specOK, err := readCommandInfoMapLen(rd)
+			if err != nil {
+				return false, err
+			}
+			if !specOK {
+				valid = false
+				continue
+			}
+			for j := 0; j < sn; j++ {
+				name, nameOK, err := readCommandInfoString(rd)
+				if err != nil {
+					return false, err
+				}
+				if !nameOK {
+					valid = false
+					if err := discardCommandInfoValue(rd, 0); err != nil {
+						return false, err
+					}
+					continue
+				}
+				switch name {
+				case "keyword":
+					if !beginSearch {
+						if err := discardCommandInfoValue(rd, 0); err != nil {
+							return false, err
+						}
+						continue
+					}
+					if seenSpecFields[name] {
+						valid = false
+					}
+					seenSpecFields[name] = true
+					keyword, keywordOK, err := readCommandInfoString(rd)
+					if err != nil {
+						return false, err
+					}
+					if !keywordOK {
+						valid = false
+						continue
+					}
+					ks.Keyword = keyword
+				default:
+					var dst *int
+					if beginSearch {
+						switch name {
+						case "index":
+							dst = &ks.Index
+						case "startfrom":
+							dst = &ks.StartFrom
+						}
+					} else {
+						switch name {
+						case "lastkey":
+							dst = &ks.LastKey
+						case "keystep":
+							dst = &ks.KeyStep
+						case "limit":
+							dst = &ks.Limit
+						case "keynumidx":
+							dst = &ks.KeyNumIdx
+						case "firstkey":
+							dst = &ks.FirstKey
+						}
+					}
+					if dst == nil {
+						if err := discardCommandInfoValue(rd, 0); err != nil {
+							return false, err
+						}
+						continue
+					}
+					if seenSpecFields[name] {
+						valid = false
+					}
+					seenSpecFields[name] = true
+					v, valueOK, err := readCommandInfoInt(rd)
+					if err != nil {
+						return false, err
+					}
+					if !valueOK {
+						valid = false
+						continue
+					}
+					// Keep positions portable across 32- and 64-bit platforms.
+					if v < math.MinInt32 || v > math.MaxInt32 {
+						valid = false
+						continue
+					}
+					*dst = int(v)
+				}
+			}
+		default:
+			if err := discardCommandInfoValue(rd, 0); err != nil {
+				return false, err
+			}
+		}
+	}
+
+	typ := ks.FindKeys
+	if beginSearch {
+		typ = ks.BeginSearch
+	}
+	valid = valid && seenType && seenSpec && typ != ""
+	switch {
+	case beginSearch && typ == "index":
+		valid = valid && seenSpecFields["index"]
+	case beginSearch && typ == "keyword":
+		valid = valid && seenSpecFields["keyword"] && seenSpecFields["startfrom"]
+	case !beginSearch && typ == "range":
+		valid = valid && seenSpecFields["lastkey"] && seenSpecFields["keystep"] && seenSpecFields["limit"]
+	case !beginSearch && typ == "keynum":
+		valid = valid && seenSpecFields["keynumidx"] && seenSpecFields["firstkey"] && seenSpecFields["keystep"]
+	default:
+		// Preserve unknown algorithms; generic consumers reject them.
+	}
+	return valid, nil
 }
 
 func (cmd *CommandsInfoCmd) Clone() Cmder {
@@ -4582,31 +6502,17 @@ func (cmd *CommandsInfoCmd) Clone() Cmder {
 	if cmd.val != nil {
 		val = make(map[string]*CommandInfo, len(cmd.val))
 		for k, v := range cmd.val {
-			if v != nil {
-				newInfo := &CommandInfo{
-					Name:          v.Name,
-					Arity:         v.Arity,
-					FirstKeyPos:   v.FirstKeyPos,
-					LastKeyPos:    v.LastKeyPos,
-					StepCount:     v.StepCount,
-					ReadOnly:      v.ReadOnly,
-					CommandPolicy: v.CommandPolicy, // CommandPolicy can be shared as it's immutable
-				}
-				if v.Flags != nil {
-					newInfo.Flags = make([]string, len(v.Flags))
-					copy(newInfo.Flags, v.Flags)
-				}
-				if v.ACLFlags != nil {
-					newInfo.ACLFlags = make([]string, len(v.ACLFlags))
-					copy(newInfo.ACLFlags, v.ACLFlags)
-				}
-				val[k] = newInfo
+			if v == nil {
+				val[k] = nil
+				continue
 			}
+			val[k] = cloneCommandInfo(v)
 		}
 	}
 	return &CommandsInfoCmd{
-		baseCmd: cmd.cloneBaseCmd(),
-		val:     val,
+		baseCmd:       cmd.cloneBaseCmd(),
+		val:           val,
+		legacyRecords: maps.Clone(cmd.legacyRecords),
 	}
 }
 
@@ -4616,8 +6522,13 @@ type cmdsInfoCache struct {
 	fn func(ctx context.Context) (map[string]*CommandInfo, error)
 
 	once        internal.Once
-	refreshLock sync.Mutex
+	refreshLock sync.RWMutex
 	cmds        map[string]*CommandInfo
+	// cmdsAtomic mirrors cmds for lock-free reads via Peek. cmds is only ever
+	// replaced wholesale (never mutated in place), so an atomic pointer load is a
+	// safe, contention-free read — Peek is on the hot per-command cluster routing
+	// path where the RWMutex.RLock showed up as a bottleneck under heavy load.
+	cmdsAtomic atomic.Pointer[map[string]*CommandInfo]
 }
 
 func newCmdsInfoCache(fn func(ctx context.Context) (map[string]*CommandInfo, error)) *cmdsInfoCache {
@@ -4644,6 +6555,7 @@ func (c *cmdsInfoCache) Get(ctx context.Context) (map[string]*CommandInfo, error
 		}
 
 		c.cmds = lowerCmds
+		c.cmdsAtomic.Store(&lowerCmds)
 		return nil
 	})
 	return c.cmds, err
@@ -4656,9 +6568,28 @@ func (c *cmdsInfoCache) Refresh() {
 	c.once = internal.Once{}
 }
 
+// Peek returns the cached CommandInfo map without triggering a Redis round-trip.
+// Returns nil when the cache is cold; callers should fall back to other heuristics.
+// The read is lock-free (a single atomic load) and never blocks, even while a
+// concurrent Get() is populating the cache — it simply returns nil until the
+// first population publishes the map.
+// The returned map and its entries MUST NOT be mutated by the caller.
+func (c *cmdsInfoCache) Peek() map[string]*CommandInfo {
+	if c == nil {
+		return nil
+	}
+	// Lock-free read: cmds is replaced wholesale, never mutated in place.
+	if p := c.cmdsAtomic.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
 // ------------------------------------------------------------------------------
-const requestPolicy = "request_policy"
-const responsePolicy = "response_policy"
+const (
+	requestPolicy  = "request_policy"
+	responsePolicy = "response_policy"
+)
 
 func parseCommandPolicies(commandInfoTips map[string]string, firstKeyPos int8) *routing.CommandPolicy {
 	req := routing.ReqDefault
@@ -4698,6 +6629,10 @@ type SlowLog struct {
 	// https://redis.io/commands/slowlog#output-format
 	ClientAddr string
 	ClientName string
+	// CommandArgc is the command's total argument count (including the command
+	// name), emitted only by Redis 8.10 or greater. It may exceed len(Args) when
+	// the slow log truncates the stored arguments (slowlog-max-argc, default 32).
+	CommandArgc int64
 }
 
 type SlowLogCmd struct {
@@ -4723,14 +6658,17 @@ func (cmd *SlowLogCmd) SetVal(val []SlowLog) {
 }
 
 func (cmd *SlowLogCmd) Val() []SlowLog {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *SlowLogCmd) Result() ([]SlowLog, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *SlowLogCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -4793,6 +6731,21 @@ func (cmd *SlowLogCmd) readReply(rd *proto.Reader) error {
 				return err
 			}
 		}
+
+		// Redis 8.10+ appends a 7th field: the command's total argument count.
+		if nn >= 7 {
+			if cmd.val[i].CommandArgc, err = rd.ReadInt(); err != nil {
+				return err
+			}
+		}
+
+		// Drain any elements past the 7 this parser knows about so a server
+		// that declares a longer entry array doesn't leave frames on the wire.
+		for j := 7; j < nn; j++ {
+			if err = rd.DiscardNext(); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -4804,11 +6757,12 @@ func (cmd *SlowLogCmd) Clone() Cmder {
 		val = make([]SlowLog, len(cmd.val))
 		for i, log := range cmd.val {
 			val[i] = SlowLog{
-				ID:         log.ID,
-				Time:       log.Time,
-				Duration:   log.Duration,
-				ClientAddr: log.ClientAddr,
-				ClientName: log.ClientName,
+				ID:          log.ID,
+				Time:        log.Time,
+				Duration:    log.Duration,
+				ClientAddr:  log.ClientAddr,
+				ClientName:  log.ClientName,
+				CommandArgc: log.CommandArgc,
 			}
 			if log.Args != nil {
 				val[i].Args = make([]string, len(log.Args))
@@ -4852,14 +6806,17 @@ func (cmd *LatencyCmd) SetVal(val []Latency) {
 }
 
 func (cmd *LatencyCmd) Val() []Latency {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *LatencyCmd) Result() ([]Latency, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *LatencyCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -4874,8 +6831,8 @@ func (cmd *LatencyCmd) readReply(rd *proto.Reader) error {
 		if err != nil {
 			return err
 		}
-		if nn < 3 {
-			return fmt.Errorf("redis: got %d elements in latency get, expected at least 3", nn)
+		if nn < 4 {
+			return fmt.Errorf("redis: got %d elements in latency get, expected at least 4", nn)
 		}
 		if cmd.val[i].Name, err = rd.ReadString(); err != nil {
 			return err
@@ -4895,6 +6852,13 @@ func (cmd *LatencyCmd) readReply(rd *proto.Reader) error {
 			return err
 		}
 		cmd.val[i].Max = time.Duration(maximum) * time.Millisecond
+		// Drain any elements beyond the 4 this parser reads so a server that
+		// declares a longer entry array can't leave frames on the wire.
+		for j := 4; j < nn; j++ {
+			if err = rd.DiscardNext(); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -4967,14 +6931,17 @@ func (cmd *HotKeysCmd) SetVal(val *HotKeysResult) {
 }
 
 func (cmd *HotKeysCmd) Val() *HotKeysResult {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *HotKeysCmd) Result() (*HotKeysResult, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *HotKeysCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -5069,10 +7036,11 @@ func (cmd *HotKeysCmd) readReply(rd *proto.Reader) error {
 	if v, ok := data["collection-duration-ms"].(int64); ok {
 		result.CollectionDuration = time.Duration(v) * time.Millisecond
 	}
-	if v, ok := data["used-cpu-sys-ms"].(int64); ok {
+	// The server names these total-cpu-time-*-ms, not after the fields below.
+	if v, ok := data["total-cpu-time-sys-ms"].(int64); ok {
 		result.UsedCPUSys = time.Duration(v) * time.Millisecond
 	}
-	if v, ok := data["used-cpu-user-ms"].(int64); ok {
+	if v, ok := data["total-cpu-time-user-ms"].(int64); ok {
 		result.UsedCPUUser = time.Duration(v) * time.Millisecond
 	}
 	if v, ok := data["total-net-bytes"].(int64); ok {
@@ -5085,6 +7053,14 @@ func (cmd *HotKeysCmd) readReply(rd *proto.Reader) error {
 
 	if v, ok := data["by-net-bytes"].([]interface{}); ok {
 		result.ByNetBytes = parseHotKeysKeyEntries(v)
+	}
+
+	// Only the first element of the outer array is parsed; drain the rest so a
+	// server that wraps more than one element doesn't leave frames on the wire.
+	for i := 1; i < arrayLen; i++ {
+		if err := rd.DiscardNext(); err != nil {
+			return err
+		}
 	}
 
 	cmd.val = result
@@ -5173,14 +7149,17 @@ func (cmd *MapStringInterfaceCmd) SetVal(val map[string]interface{}) {
 }
 
 func (cmd *MapStringInterfaceCmd) Val() map[string]interface{} {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *MapStringInterfaceCmd) Result() (map[string]interface{}, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *MapStringInterfaceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -5252,14 +7231,17 @@ func (cmd *MapStringStringSliceCmd) SetVal(val []map[string]string) {
 }
 
 func (cmd *MapStringStringSliceCmd) Val() []map[string]string {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *MapStringStringSliceCmd) Result() ([]map[string]string, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *MapStringStringSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -5330,6 +7312,7 @@ func NewMapMapStringInterfaceCmd(ctx context.Context, args ...interface{}) *MapM
 }
 
 func (cmd *MapMapStringInterfaceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -5338,10 +7321,12 @@ func (cmd *MapMapStringInterfaceCmd) SetVal(val map[string]interface{}) {
 }
 
 func (cmd *MapMapStringInterfaceCmd) Result() (map[string]interface{}, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *MapMapStringInterfaceCmd) Val() map[string]interface{} {
+	cmd.await()
 	return cmd.val
 }
 
@@ -5429,14 +7414,17 @@ func (cmd *MapStringInterfaceSliceCmd) SetVal(val []map[string]interface{}) {
 }
 
 func (cmd *MapStringInterfaceSliceCmd) Val() []map[string]interface{} {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *MapStringInterfaceSliceCmd) Result() ([]map[string]interface{}, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *MapStringInterfaceSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -5516,14 +7504,17 @@ func (cmd *KeyValuesCmd) SetVal(key string, val []string) {
 }
 
 func (cmd *KeyValuesCmd) Val() (string, []string) {
+	cmd.await()
 	return cmd.key, cmd.val
 }
 
 func (cmd *KeyValuesCmd) Result() (string, []string, error) {
+	cmd.await()
 	return cmd.key, cmd.val, cmd.err
 }
 
 func (cmd *KeyValuesCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -5592,14 +7583,17 @@ func (cmd *ZSliceWithKeyCmd) SetVal(key string, val []Z) {
 }
 
 func (cmd *ZSliceWithKeyCmd) Val() (string, []Z) {
+	cmd.await()
 	return cmd.key, cmd.val
 }
 
 func (cmd *ZSliceWithKeyCmd) Result() (string, []Z, error) {
+	cmd.await()
 	return cmd.key, cmd.val, cmd.err
 }
 
 func (cmd *ZSliceWithKeyCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -5627,6 +7621,9 @@ func (cmd *ZSliceWithKeyCmd) readReply(rd *proto.Reader) (err error) {
 	if array {
 		cmd.val = make([]Z, n)
 	} else {
+		if n%2 != 0 {
+			return fmt.Errorf("redis: got %d elements in the sorted set array, wanted a multiple of 2", n)
+		}
 		cmd.val = make([]Z, n/2)
 	}
 
@@ -5698,18 +7695,22 @@ func (cmd *FunctionListCmd) SetVal(val []Library) {
 }
 
 func (cmd *FunctionListCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
 func (cmd *FunctionListCmd) Val() []Library {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *FunctionListCmd) Result() ([]Library, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *FunctionListCmd) First() (*Library, error) {
+	cmd.await()
 	if cmd.err != nil {
 		return nil, cmd.err
 	}
@@ -5911,14 +7912,17 @@ func (cmd *FunctionStatsCmd) SetVal(val FunctionStats) {
 }
 
 func (cmd *FunctionStatsCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
 func (cmd *FunctionStatsCmd) Val() FunctionStats {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *FunctionStatsCmd) Result() (FunctionStats, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
@@ -6012,11 +8016,18 @@ func (cmd *FunctionStatsCmd) readEngines(rd *proto.Reader) ([]Engine, error) {
 
 		for i := 0; i < 2; i++ {
 			key, err := rd.ReadString()
+			if err != nil {
+				return nil, err
+			}
 			switch key {
 			case "libraries_count":
 				engine.LibrariesCount, err = rd.ReadInt()
 			case "functions_count":
 				engine.FunctionsCount, err = rd.ReadInt()
+			default:
+				// Unknown field: drain its value so the reader stays aligned
+				// with the rest of the reply.
+				err = rd.DiscardNext()
 			}
 			if err != nil {
 				return nil, err
@@ -6176,14 +8187,17 @@ func (cmd *LCSCmd) SetVal(val *LCSMatch) {
 }
 
 func (cmd *LCSCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
 func (cmd *LCSCmd) Val() *LCSMatch {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *LCSCmd) Result() (*LCSMatch, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
@@ -6222,6 +8236,12 @@ func (cmd *LCSCmd) readReply(rd *proto.Reader) (err error) {
 			case "len":
 				// read match length
 				if lcs.Len, err = rd.ReadInt(); err != nil {
+					return err
+				}
+			default:
+				// Unknown field: drain its value so the reader stays aligned
+				// with the rest of the reply.
+				if err = rd.DiscardNext(); err != nil {
 					return err
 				}
 			}
@@ -6326,14 +8346,17 @@ func (cmd *KeyFlagsCmd) SetVal(val []KeyFlags) {
 }
 
 func (cmd *KeyFlagsCmd) Val() []KeyFlags {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *KeyFlagsCmd) Result() ([]KeyFlags, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *KeyFlagsCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -6429,14 +8452,17 @@ func (cmd *ClusterLinksCmd) SetVal(val []ClusterLink) {
 }
 
 func (cmd *ClusterLinksCmd) Val() []ClusterLink {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *ClusterLinksCmd) Result() ([]ClusterLink, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *ClusterLinksCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -6544,14 +8570,17 @@ func (cmd *ClusterShardsCmd) SetVal(val []ClusterShard) {
 }
 
 func (cmd *ClusterShardsCmd) Val() []ClusterShard {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *ClusterShardsCmd) Result() ([]ClusterShard, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *ClusterShardsCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -6616,6 +8645,11 @@ func (cmd *ClusterShardsCmd) readReply(rd *proto.Reader) error {
 							cmd.val[i].Nodes[k].ID, err = rd.ReadString()
 						case "endpoint":
 							cmd.val[i].Nodes[k].Endpoint, err = rd.ReadString()
+							if err == Nil {
+								// Null means reuse the connection's endpoint.
+								cmd.val[i].Nodes[k].Endpoint = ""
+								err = nil
+							}
 						case "ip":
 							cmd.val[i].Nodes[k].IP, err = rd.ReadString()
 						case "hostname":
@@ -6631,7 +8665,9 @@ func (cmd *ClusterShardsCmd) readReply(rd *proto.Reader) error {
 						case "health":
 							cmd.val[i].Nodes[k].Health, err = rd.ReadString()
 						default:
-							return fmt.Errorf("redis: unexpected key %q in CLUSTER SHARDS node reply", nodeKey)
+							if err = rd.DiscardNext(); err != nil {
+								return err
+							}
 						}
 
 						if err != nil {
@@ -6640,7 +8676,9 @@ func (cmd *ClusterShardsCmd) readReply(rd *proto.Reader) error {
 					}
 				}
 			default:
-				return fmt.Errorf("redis: unexpected key %q in CLUSTER SHARDS reply", key)
+				if err = rd.DiscardNext(); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -6700,14 +8738,17 @@ func (cmd *RankWithScoreCmd) SetVal(val RankScore) {
 }
 
 func (cmd *RankWithScoreCmd) Val() RankScore {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *RankWithScoreCmd) Result() (RankScore, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *RankWithScoreCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -6834,6 +8875,9 @@ type ClientInfo struct {
 	Resp               int           // redis version 7.0, client RESP protocol version
 	LibName            string        // redis version 7.2, client library name
 	LibVer             string        // redis version 7.2, client library version
+	ReadEvents         uint64        // redis version 8.8, number of read events processed
+	AvgPipelineLenSum  uint64        // redis version 8.8, sum of pipeline lengths
+	AvgPipelineLenCnt  uint64        // redis version 8.8, count of pipeline operations
 }
 
 type ClientInfoCmd struct {
@@ -6859,14 +8903,17 @@ func (cmd *ClientInfoCmd) SetVal(val *ClientInfo) {
 }
 
 func (cmd *ClientInfoCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
 func (cmd *ClientInfoCmd) Val() *ClientInfo {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *ClientInfoCmd) Result() (*ClientInfo, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
@@ -6888,11 +8935,10 @@ func (cmd *ClientInfoCmd) readReply(rd *proto.Reader) (err error) {
 func parseClientInfo(txt string) (info *ClientInfo, err error) {
 	info = &ClientInfo{}
 	for _, s := range strings.Split(txt, " ") {
-		kv := strings.Split(s, "=")
-		if len(kv) != 2 {
+		key, val, ok := strings.Cut(s, "=")
+		if !ok {
 			return nil, fmt.Errorf("redis: unexpected client info data (%s)", s)
 		}
-		key, val := kv[0], kv[1]
 
 		switch key {
 		case "id":
@@ -6957,7 +9003,12 @@ func parseClientInfo(txt string) (info *ClientInfo, err error) {
 				case 'T':
 					info.Flags |= ClientNoTouch
 				default:
-					return nil, fmt.Errorf("redis: unexpected client info flags(%s)", string(val[i]))
+					// Forward compatibility: servers can return client-flag
+					// characters this client does not recognize (new flags are
+					// added over time). Skip them instead of failing, as the
+					// CLIENT LIST/INFO docs advise for version-safe parsing, and
+					// matching the "skip unknown fields" behaviour of the field
+					// switch below.
 				}
 			}
 		case "db":
@@ -7014,8 +9065,14 @@ func parseClientInfo(txt string) (info *ClientInfo, err error) {
 			info.LibVer = val
 		case "io-thread":
 			info.IoThread, err = strconv.Atoi(val)
+		case "read-events":
+			info.ReadEvents, err = strconv.ParseUint(val, 10, 64)
+		case "avg-pipeline-len-sum":
+			info.AvgPipelineLenSum, err = strconv.ParseUint(val, 10, 64)
+		case "avg-pipeline-len-cnt":
+			info.AvgPipelineLenCnt, err = strconv.ParseUint(val, 10, 64)
 		default:
-			return nil, fmt.Errorf("redis: unexpected client info key(%s)", key)
+			// skip unknown fields
 		}
 
 		if err != nil {
@@ -7062,6 +9119,9 @@ func (cmd *ClientInfoCmd) Clone() Cmder {
 			Resp:               cmd.val.Resp,
 			LibName:            cmd.val.LibName,
 			LibVer:             cmd.val.LibVer,
+			ReadEvents:         cmd.val.ReadEvents,
+			AvgPipelineLenSum:  cmd.val.AvgPipelineLenSum,
+			AvgPipelineLenCnt:  cmd.val.AvgPipelineLenCnt,
 		}
 	}
 	return &ClientInfoCmd{
@@ -7108,14 +9168,17 @@ func (cmd *ACLLogCmd) SetVal(val []*ACLLogEntry) {
 }
 
 func (cmd *ACLLogCmd) Val() []*ACLLogEntry {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *ACLLogCmd) Result() ([]*ACLLogEntry, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *ACLLogCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -7168,7 +9231,10 @@ func (cmd *ACLLogCmd) readReply(rd *proto.Reader) error {
 			case "timestamp-last-updated":
 				entry.TimestampLastUpdated, err = rd.ReadInt()
 			default:
-				return fmt.Errorf("redis: unexpected key %q in ACL LOG reply", key)
+				// skip unknown fields
+				if err := rd.DiscardNext(); err != nil {
+					return err
+				}
 			}
 
 			if err != nil {
@@ -7232,6 +9298,9 @@ func (cmd *ACLLogCmd) Clone() Cmder {
 						Resp:               entry.ClientInfo.Resp,
 						LibName:            entry.ClientInfo.LibName,
 						LibVer:             entry.ClientInfo.LibVer,
+						ReadEvents:         entry.ClientInfo.ReadEvents,
+						AvgPipelineLenSum:  entry.ClientInfo.AvgPipelineLenSum,
+						AvgPipelineLenCnt:  entry.ClientInfo.AvgPipelineLenCnt,
 					}
 				}
 			}
@@ -7283,14 +9352,17 @@ func (cmd *InfoCmd) SetVal(val map[string]map[string]string) {
 }
 
 func (cmd *InfoCmd) Val() map[string]map[string]string {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *InfoCmd) Result() (map[string]map[string]string, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *InfoCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
@@ -7300,6 +9372,7 @@ func (cmd *InfoCmd) readReply(rd *proto.Reader) error {
 		return err
 	}
 
+	cmd.val = nil
 	section := ""
 	scanner := bufio.NewScanner(strings.NewReader(val))
 	for scanner.Scan() {
@@ -7330,6 +9403,7 @@ func (cmd *InfoCmd) readReply(rd *proto.Reader) error {
 }
 
 func (cmd *InfoCmd) Item(section, key string) string {
+	cmd.await()
 	if cmd.val == nil {
 		return ""
 	} else if cmd.val[section] == nil {
@@ -7387,6 +9461,7 @@ func newMonitorCmd(ctx context.Context, ch chan string) *MonitorCmd {
 }
 
 func (cmd *MonitorCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, nil)
 }
 
@@ -7452,7 +9527,7 @@ type VectorScoreSliceCmd struct {
 
 var _ Cmder = (*VectorScoreSliceCmd)(nil)
 
-func NewVectorInfoSliceCmd(ctx context.Context, args ...any) *VectorScoreSliceCmd {
+func NewVectorScoreSliceCmd(ctx context.Context, args ...any) *VectorScoreSliceCmd {
 	return &VectorScoreSliceCmd{
 		baseCmd: baseCmd{
 			ctx:  ctx,
@@ -7461,26 +9536,52 @@ func NewVectorInfoSliceCmd(ctx context.Context, args ...any) *VectorScoreSliceCm
 	}
 }
 
+// NewVectorInfoSliceCmd is an alias for NewVectorScoreSliceCmd kept for backwards compatibility.
+func NewVectorInfoSliceCmd(ctx context.Context, args ...any) *VectorScoreSliceCmd {
+	return NewVectorScoreSliceCmd(ctx, args...)
+}
+
 func (cmd *VectorScoreSliceCmd) SetVal(val []VectorScore) {
 	cmd.val = val
 }
 
 func (cmd *VectorScoreSliceCmd) Val() []VectorScore {
+	cmd.await()
 	return cmd.val
 }
 
 func (cmd *VectorScoreSliceCmd) Result() ([]VectorScore, error) {
+	cmd.await()
 	return cmd.val, cmd.err
 }
 
 func (cmd *VectorScoreSliceCmd) String() string {
+	cmd.await()
 	return cmdString(cmd, cmd.val)
 }
 
 func (cmd *VectorScoreSliceCmd) readReply(rd *proto.Reader) error {
-	n, err := rd.ReadMapLen()
+	typ, err := rd.PeekReplyType()
 	if err != nil {
 		return err
+	}
+
+	var n int
+	if typ == proto.RespMap {
+		n, err = rd.ReadMapLen()
+		if err != nil {
+			return err
+		}
+	} else {
+		// RESP2 returns a flat array [name, score, name, score, ...]
+		n, err = rd.ReadArrayLen()
+		if err != nil {
+			return err
+		}
+		if n%2 != 0 {
+			return fmt.Errorf("redis: VectorScoreSliceCmd expects even number of elements, got %d", n)
+		}
+		n /= 2
 	}
 
 	cmd.val = make([]VectorScore, n)
@@ -7503,6 +9604,331 @@ func (cmd *VectorScoreSliceCmd) readReply(rd *proto.Reader) error {
 
 func (cmd *VectorScoreSliceCmd) Clone() Cmder {
 	return &VectorScoreSliceCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		val:     cmd.val,
+	}
+}
+
+// VectorScoreSliceSliceCmd is used for VLINKS WITHSCORES which returns an array of arrays.
+// In RESP3, each inner array contains maps of element -> score.
+type VectorScoreSliceSliceCmd struct {
+	baseCmd
+
+	val [][]VectorScore
+}
+
+var _ Cmder = (*VectorScoreSliceSliceCmd)(nil)
+
+func NewVectorScoreSliceSliceCmd(ctx context.Context, args ...any) *VectorScoreSliceSliceCmd {
+	return &VectorScoreSliceSliceCmd{
+		baseCmd: baseCmd{
+			ctx:  ctx,
+			args: args,
+		},
+	}
+}
+
+func (cmd *VectorScoreSliceSliceCmd) SetVal(val [][]VectorScore) {
+	cmd.val = val
+}
+
+func (cmd *VectorScoreSliceSliceCmd) Val() [][]VectorScore {
+	cmd.await()
+	return cmd.val
+}
+
+func (cmd *VectorScoreSliceSliceCmd) Result() ([][]VectorScore, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *VectorScoreSliceSliceCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *VectorScoreSliceSliceCmd) readReply(rd *proto.Reader) error {
+	n, err := rd.ReadArrayLen()
+	if err != nil {
+		return err
+	}
+
+	cmd.val = make([][]VectorScore, n)
+	for i := range n {
+		// Each level can be either a map (RESP3) or an array (RESP2)
+		levelTyp, err := rd.PeekReplyType()
+		if err != nil {
+			return err
+		}
+
+		if levelTyp == proto.RespMap {
+			// RESP3 format: each level is a map {element: score, element: score, ...}
+			mapLen, err := rd.ReadMapLen()
+			if err != nil {
+				return err
+			}
+
+			cmd.val[i] = make([]VectorScore, mapLen)
+			for j := range mapLen {
+				name, err := rd.ReadString()
+				if err != nil {
+					return err
+				}
+				score, err := rd.ReadFloat()
+				if err != nil {
+					return err
+				}
+				cmd.val[i][j] = VectorScore{Name: name, Score: score}
+			}
+		} else {
+			// RESP2 format: each level is an array of [element, score, element, score, ...] pairs
+			innerLen, err := rd.ReadArrayLen()
+			if err != nil {
+				return err
+			}
+
+			if innerLen%2 != 0 {
+				return fmt.Errorf("redis: got %d elements in the VLINKS array, wanted a multiple of 2", innerLen)
+			}
+
+			cmd.val[i] = make([]VectorScore, innerLen/2)
+			for j := 0; j < innerLen; j += 2 {
+				name, err := rd.ReadString()
+				if err != nil {
+					return err
+				}
+				score, err := rd.ReadFloat()
+				if err != nil {
+					return err
+				}
+				cmd.val[i][j/2] = VectorScore{Name: name, Score: score}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (cmd *VectorScoreSliceSliceCmd) Clone() Cmder {
+	var val [][]VectorScore
+	if cmd.val != nil {
+		val = make([][]VectorScore, len(cmd.val))
+		for i, slice := range cmd.val {
+			if slice != nil {
+				val[i] = make([]VectorScore, len(slice))
+				copy(val[i], slice)
+			}
+		}
+	}
+	return &VectorScoreSliceSliceCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		val:     val,
+	}
+}
+
+func readVectorAttribStringOrNil(rd *proto.Reader) (*string, error) {
+	v, err := rd.ReadReply()
+	if err != nil {
+		if err == proto.Nil {
+			return nil, nil
+		}
+		return nil, err
+	}
+	s, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("redis: can't parse reply=%T reading string", v)
+	}
+	return &s, nil
+}
+
+type VectorAttribSliceCmd struct {
+	baseCmd
+
+	val []VectorAttrib
+}
+
+var _ Cmder = (*VectorAttribSliceCmd)(nil)
+
+func NewVectorAttribSliceCmd(ctx context.Context, args ...any) *VectorAttribSliceCmd {
+	return &VectorAttribSliceCmd{
+		baseCmd: baseCmd{
+			ctx:  ctx,
+			args: args,
+		},
+	}
+}
+
+func (cmd *VectorAttribSliceCmd) SetVal(val []VectorAttrib) {
+	cmd.val = val
+}
+
+func (cmd *VectorAttribSliceCmd) Val() []VectorAttrib {
+	cmd.await()
+	return cmd.val
+}
+
+func (cmd *VectorAttribSliceCmd) Result() ([]VectorAttrib, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *VectorAttribSliceCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *VectorAttribSliceCmd) readReply(rd *proto.Reader) error {
+	replyType, err := rd.PeekReplyType()
+	if err != nil {
+		return err
+	}
+
+	if replyType == proto.RespMap {
+		n, err := rd.ReadMapLen()
+		if err != nil {
+			return err
+		}
+		cmd.val = make([]VectorAttrib, n)
+		for i := 0; i < n; i++ {
+			name, err := rd.ReadString()
+			if err != nil {
+				return err
+			}
+			attrib, err := readVectorAttribStringOrNil(rd)
+			if err != nil {
+				return err
+			}
+			cmd.val[i] = VectorAttrib{Name: name, Attribs: attrib}
+		}
+		return nil
+	}
+
+	n, err := rd.ReadArrayLen()
+	if err != nil {
+		return err
+	}
+	if n%2 != 0 {
+		return fmt.Errorf("redis: got %d elements in the VSIM array, wanted a multiple of 2", n)
+	}
+	cmd.val = make([]VectorAttrib, n/2)
+	for i := range cmd.val {
+		name, err := rd.ReadString()
+		if err != nil {
+			return err
+		}
+		attrib, err := readVectorAttribStringOrNil(rd)
+		if err != nil {
+			return err
+		}
+		cmd.val[i] = VectorAttrib{Name: name, Attribs: attrib}
+	}
+	return nil
+}
+
+func (cmd *VectorAttribSliceCmd) Clone() Cmder {
+	return &VectorAttribSliceCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		val:     cmd.val,
+	}
+}
+
+type VectorScoreAttribSliceCmd struct {
+	baseCmd
+
+	val []VectorScoreAttrib
+}
+
+var _ Cmder = (*VectorScoreAttribSliceCmd)(nil)
+
+func NewVectorScoreAttribSliceCmd(ctx context.Context, args ...any) *VectorScoreAttribSliceCmd {
+	return &VectorScoreAttribSliceCmd{
+		baseCmd: baseCmd{
+			ctx:  ctx,
+			args: args,
+		},
+	}
+}
+
+func (cmd *VectorScoreAttribSliceCmd) SetVal(val []VectorScoreAttrib) {
+	cmd.val = val
+}
+
+func (cmd *VectorScoreAttribSliceCmd) Val() []VectorScoreAttrib {
+	cmd.await()
+	return cmd.val
+}
+
+func (cmd *VectorScoreAttribSliceCmd) Result() ([]VectorScoreAttrib, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *VectorScoreAttribSliceCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *VectorScoreAttribSliceCmd) readReply(rd *proto.Reader) error {
+	replyType, err := rd.PeekReplyType()
+	if err != nil {
+		return err
+	}
+
+	if replyType == proto.RespMap {
+		n, err := rd.ReadMapLen()
+		if err != nil {
+			return err
+		}
+		cmd.val = make([]VectorScoreAttrib, n)
+		for i := 0; i < n; i++ {
+			name, err := rd.ReadString()
+			if err != nil {
+				return err
+			}
+			if err := rd.ReadFixedArrayLen(2); err != nil {
+				return err
+			}
+			score, err := rd.ReadFloat()
+			if err != nil {
+				return err
+			}
+			attrib, err := readVectorAttribStringOrNil(rd)
+			if err != nil {
+				return err
+			}
+			cmd.val[i] = VectorScoreAttrib{Name: name, Score: score, Attribs: attrib}
+		}
+		return nil
+	}
+
+	n, err := rd.ReadArrayLen()
+	if err != nil {
+		return err
+	}
+	if n%3 != 0 {
+		return fmt.Errorf("redis: got %d elements in the VSIM array, wanted a multiple of 3", n)
+	}
+	cmd.val = make([]VectorScoreAttrib, n/3)
+	for i := range cmd.val {
+		name, err := rd.ReadString()
+		if err != nil {
+			return err
+		}
+		score, err := rd.ReadFloat()
+		if err != nil {
+			return err
+		}
+		attrib, err := readVectorAttribStringOrNil(rd)
+		if err != nil {
+			return err
+		}
+		cmd.val[i] = VectorScoreAttrib{Name: name, Score: score, Attribs: attrib}
+	}
+	return nil
+}
+
+func (cmd *VectorScoreAttribSliceCmd) Clone() Cmder {
+	return &VectorScoreAttribSliceCmd{
 		baseCmd: cmd.cloneBaseCmd(),
 		val:     cmd.val,
 	}
@@ -7542,6 +9968,13 @@ func ExtractCommandValue(cmd interface{}) (interface{}, error) {
 				Err() error
 			}); ok {
 				return intCmd.Val(), intCmd.Err()
+			}
+		case CmdTypeUint:
+			if uintCmd, ok := cmd.(interface {
+				Val() uint64
+				Err() error
+			}); ok {
+				return uintCmd.Val(), uintCmd.Err()
 			}
 		case CmdTypeBool:
 			if boolCmd, ok := cmd.(interface {
@@ -7620,6 +10053,14 @@ func ExtractCommandValue(cmd interface{}) (interface{}, error) {
 			}); ok {
 				messages, start := xAutoClaimCmd.Val()
 				return CmdTypeXAutoClaimValue{messages: messages, start: start}, xAutoClaimCmd.Err()
+			}
+		case CmdTypeXAutoClaimWithDeleted:
+			if xAutoClaimWithDeletedCmd, ok := cmd.(interface {
+				Val() ([]XMessage, string, []string)
+				Err() error
+			}); ok {
+				messages, start, deletedIDs := xAutoClaimWithDeletedCmd.Val()
+				return CmdTypeXAutoClaimWithDeletedValue{messages: messages, start: start, deletedIDs: deletedIDs}, xAutoClaimWithDeletedCmd.Err()
 			}
 		case CmdTypeXAutoClaimJustID:
 			if xAutoClaimJustIDCmd, ok := cmd.(interface {
@@ -7727,6 +10168,20 @@ func ExtractCommandValue(cmd interface{}) (interface{}, error) {
 				Err() error
 			}); ok {
 				return hotKeysCmd.Val(), hotKeysCmd.Err()
+			}
+		case CmdTypeIncrEXInt:
+			if incrEXCmd, ok := cmd.(interface {
+				Val() IncrEXIntResult
+				Err() error
+			}); ok {
+				return incrEXCmd.Val(), incrEXCmd.Err()
+			}
+		case CmdTypeIncrEXFloat:
+			if incrEXCmd, ok := cmd.(interface {
+				Val() IncrEXFloatResult
+				Err() error
+			}); ok {
+				return incrEXCmd.Val(), incrEXCmd.Err()
 			}
 		case CmdTypeKeyValues:
 			if keyValuesCmd, ok := cmd.(interface {
@@ -7933,6 +10388,13 @@ func ExtractCommandValue(cmd interface{}) (interface{}, error) {
 			}); ok {
 				return tsTimestampValueSliceCmd.Val(), tsTimestampValueSliceCmd.Err()
 			}
+		case CmdTypeTSNRangePivotRowSlice:
+			if tsNRangePivotRowSliceCmd, ok := cmd.(interface {
+				Val() []TSNRangePivotRow
+				Err() error
+			}); ok {
+				return tsNRangePivotRowSliceCmd.Val(), tsNRangePivotRowSliceCmd.Err()
+			}
 		case CmdTypeStringSlice:
 			if stringSliceCmd, ok := cmd.(interface {
 				Val() []string
@@ -7946,6 +10408,13 @@ func ExtractCommandValue(cmd interface{}) (interface{}, error) {
 				Err() error
 			}); ok {
 				return intSliceCmd.Val(), intSliceCmd.Err()
+			}
+		case CmdTypeUintSlice:
+			if uintSliceCmd, ok := cmd.(interface {
+				Val() []uint64
+				Err() error
+			}); ok {
+				return uintSliceCmd.Val(), uintSliceCmd.Err()
 			}
 		case CmdTypeBoolSlice:
 			if boolSliceCmd, ok := cmd.(interface {
@@ -7974,6 +10443,13 @@ func ExtractCommandValue(cmd interface{}) (interface{}, error) {
 				Err() error
 			}); ok {
 				return keyValueSliceCmd.Val(), keyValueSliceCmd.Err()
+			}
+		case CmdTypeAREntrySlice:
+			if arEntrySliceCmd, ok := cmd.(interface {
+				Val() []AREntry
+				Err() error
+			}); ok {
+				return arEntrySliceCmd.Val(), arEntrySliceCmd.Err()
 			}
 		case CmdTypeMapStringString:
 			if mapCmd, ok := cmd.(interface {
@@ -8025,4 +10501,215 @@ func ExtractCommandValue(cmd interface{}) (interface{}, error) {
 
 	// If we can't get the command type, return nil
 	return nil, nil
+}
+
+//------------------------------------------------------------------------------
+
+// IncrEXIntResult is the reply of an INCREX command issued via IncrEXInt.
+// Value is the new value of the key; AppliedIncrement is the increment that
+// the server actually applied (0 when an out-of-bounds operation was
+// rejected, clamped when SATURATE was set).
+type IncrEXIntResult struct {
+	Value            int64
+	AppliedIncrement int64
+}
+
+type IncrEXIntCmd struct {
+	baseCmd
+
+	val IncrEXIntResult
+}
+
+var _ Cmder = (*IncrEXIntCmd)(nil)
+
+func NewIncrEXIntCmd(ctx context.Context, args ...interface{}) *IncrEXIntCmd {
+	return &IncrEXIntCmd{
+		baseCmd: baseCmd{
+			ctx:     ctx,
+			args:    args,
+			cmdType: CmdTypeIncrEXInt,
+		},
+	}
+}
+
+func (cmd *IncrEXIntCmd) SetVal(val IncrEXIntResult) { cmd.val = val }
+func (cmd *IncrEXIntCmd) Val() IncrEXIntResult {
+	cmd.await()
+	return cmd.val
+}
+
+func (cmd *IncrEXIntCmd) Result() (IncrEXIntResult, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *IncrEXIntCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *IncrEXIntCmd) readReply(rd *proto.Reader) error {
+	if err := rd.ReadFixedArrayLen(2); err != nil {
+		return err
+	}
+	value, err := rd.ReadInt()
+	if err != nil {
+		return err
+	}
+	applied, err := rd.ReadInt()
+	if err != nil {
+		return err
+	}
+	cmd.val = IncrEXIntResult{Value: value, AppliedIncrement: applied}
+	return nil
+}
+
+func (cmd *IncrEXIntCmd) Clone() Cmder {
+	return &IncrEXIntCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		val:     cmd.val,
+	}
+}
+
+// IncrEXFloatResult is the reply of an INCREX command issued via IncrEXFloat.
+type IncrEXFloatResult struct {
+	Value            float64
+	AppliedIncrement float64
+}
+
+type IncrEXFloatCmd struct {
+	baseCmd
+
+	val IncrEXFloatResult
+}
+
+var _ Cmder = (*IncrEXFloatCmd)(nil)
+
+func NewIncrEXFloatCmd(ctx context.Context, args ...interface{}) *IncrEXFloatCmd {
+	return &IncrEXFloatCmd{
+		baseCmd: baseCmd{
+			ctx:     ctx,
+			args:    args,
+			cmdType: CmdTypeIncrEXFloat,
+		},
+	}
+}
+
+func (cmd *IncrEXFloatCmd) SetVal(val IncrEXFloatResult) { cmd.val = val }
+func (cmd *IncrEXFloatCmd) Val() IncrEXFloatResult {
+	cmd.await()
+	return cmd.val
+}
+
+func (cmd *IncrEXFloatCmd) Result() (IncrEXFloatResult, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *IncrEXFloatCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *IncrEXFloatCmd) readReply(rd *proto.Reader) error {
+	if err := rd.ReadFixedArrayLen(2); err != nil {
+		return err
+	}
+	value, err := rd.ReadFloat()
+	if err != nil {
+		return err
+	}
+	applied, err := rd.ReadFloat()
+	if err != nil {
+		return err
+	}
+	cmd.val = IncrEXFloatResult{Value: value, AppliedIncrement: applied}
+	return nil
+}
+
+func (cmd *IncrEXFloatCmd) Clone() Cmder {
+	return &IncrEXFloatCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		val:     cmd.val,
+	}
+}
+
+//------------------------------------------------------------------------------
+
+// AREntrySliceCmd is a command that returns index-value pairs from ARSCAN or ARGREP.
+type AREntrySliceCmd struct {
+	baseCmd
+	val []AREntry
+}
+
+var _ Cmder = (*AREntrySliceCmd)(nil)
+
+func NewAREntrySliceCmd(ctx context.Context, args ...any) *AREntrySliceCmd {
+	return &AREntrySliceCmd{
+		baseCmd: baseCmd{
+			ctx:     ctx,
+			args:    args,
+			cmdType: CmdTypeAREntrySlice,
+		},
+	}
+}
+
+func (cmd *AREntrySliceCmd) SetVal(val []AREntry) {
+	cmd.val = val
+}
+
+func (cmd *AREntrySliceCmd) Val() []AREntry {
+	cmd.await()
+	return cmd.val
+}
+
+func (cmd *AREntrySliceCmd) Result() ([]AREntry, error) {
+	cmd.await()
+	return cmd.val, cmd.err
+}
+
+func (cmd *AREntrySliceCmd) String() string {
+	cmd.await()
+	return cmdString(cmd, cmd.val)
+}
+
+func (cmd *AREntrySliceCmd) readReply(rd *proto.Reader) error {
+	n, err := rd.ReadArrayLen()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		cmd.val = make([]AREntry, 0)
+		return nil
+	}
+
+	cmd.val = make([]AREntry, n)
+	for i := range n {
+		if err = rd.ReadFixedArrayLen(2); err != nil {
+			return err
+		}
+
+		cmd.val[i].Index, err = rd.ReadUint()
+		if err != nil {
+			return err
+		}
+
+		cmd.val[i].Value, err = rd.ReadString()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cmd *AREntrySliceCmd) Clone() Cmder {
+	var val []AREntry
+	if cmd.val != nil {
+		val = make([]AREntry, len(cmd.val))
+		copy(val, cmd.val)
+	}
+	return &AREntrySliceCmd{
+		baseCmd: cmd.cloneBaseCmd(),
+		val:     val,
+	}
 }

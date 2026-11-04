@@ -2,6 +2,8 @@
 // It also includes a basic implementation of credentials using username and password.
 package auth
 
+import "context"
+
 // StreamingCredentialsProvider is an interface that defines the methods for a streaming credentials provider.
 // It is used to provide credentials for authentication.
 // The CredentialsListener is used to receive updates when the credentials change.
@@ -9,12 +11,41 @@ type StreamingCredentialsProvider interface {
 	// Subscribe subscribes to the credentials provider for updates.
 	// It returns the current credentials, a cancel function to unsubscribe from the provider,
 	// and an error if any.
-	// TODO(ndyakov): Should we add context to the Subscribe method?
+	//
+	// Implementations MUST be idempotent with respect to listener identity:
+	// subscribing the same listener value more than once must not produce
+	// duplicate notifications and must not create multiple independent
+	// subscriptions that each need to be cancelled separately. Every
+	// UnsubscribeFunc returned for a given listener must cancel that
+	// listener's subscription; calling any one of them must be sufficient to
+	// stop updates to that listener, and calling subsequent ones must be a
+	// safe no-op. Callers (including go-redis internals) may retain only
+	// the most recently returned UnsubscribeFunc and rely on it to fully
+	// unsubscribe the listener.
+	//
 	Subscribe(listener CredentialsListener) (Credentials, UnsubscribeFunc, error)
+}
+
+// ContextStreamingCredentialsProvider is an optional extension for providers
+// that can cooperatively cancel subscription setup using the caller's context.
+// The context bounds only the initial SubscribeWithContext call; it does not
+// define the lifetime of a successfully established subscription. Canceling one
+// caller must not abort token acquisition or subscriptions shared by other
+// connections. Provider wrappers must forward SubscribeWithContext to retain
+// this behavior; otherwise go-redis calls the legacy Subscribe method.
+type ContextStreamingCredentialsProvider interface {
+	StreamingCredentialsProvider
+	SubscribeWithContext(ctx context.Context, listener CredentialsListener) (Credentials, UnsubscribeFunc, error)
 }
 
 // UnsubscribeFunc is a function that is used to cancel the subscription to the credentials provider.
 // It is used to unsubscribe from the provider when the credentials are no longer needed.
+//
+// Per the StreamingCredentialsProvider.Subscribe contract, if the same
+// listener is subscribed multiple times, every UnsubscribeFunc returned for
+// that listener must fully unsubscribe it on first invocation, and
+// subsequent invocations (from any of the equivalent UnsubscribeFuncs) must
+// be a safe no-op.
 type UnsubscribeFunc func() error
 
 // CredentialsListener is an interface that defines the methods for a credentials listener.

@@ -229,3 +229,167 @@ func TestPoolWithHooks(t *testing.T) {
 		t.Errorf("Expected 1 hook after removing, got %d", manager.GetHookCount())
 	}
 }
+
+// TestCloseConnInvokesOnRemove guards against a regression where (*ConnPool).CloseConn
+// removed a connection from the pool without notifying pool hooks via OnRemove,
+// causing per-connection state (e.g. streaming credentials listeners) to leak
+// for every stale-conn close, idle/lifetime expiry, or health-check failure.
+func TestCloseConnInvokesOnRemove(t *testing.T) {
+	opt := &Options{
+		Dialer: func(ctx context.Context) (net.Conn, error) {
+			return &net.TCPConn{}, nil
+		},
+		PoolSize:           1,
+		MaxConcurrentDials: 1,
+		DialTimeout:        time.Second,
+	}
+
+	p := NewConnPool(opt)
+	defer p.Close()
+
+	hook := &TestHook{ShouldPool: true, ShouldAccept: true}
+	p.AddPoolHook(hook)
+
+	ctx := context.Background()
+	cn, err := p.NewConn(ctx)
+	if err != nil {
+		t.Fatalf("NewConn failed: %v", err)
+	}
+
+	// The underlying net.TCPConn{} is a zero value, so cn.Close() may report
+	// "invalid argument" — we don't care about the close error, only about
+	// whether the OnRemove hook fired before the close.
+	_ = p.CloseConn(ctx, cn, CloseReasonStale, MetricStateIdle)
+
+	if hook.OnRemoveCalled != 1 {
+		t.Errorf("Expected OnRemove to fire once for CloseConn, got %d", hook.OnRemoveCalled)
+	}
+}
+
+// closeOnPutHook is a PoolHook whose OnPut drives the connection to StateClosed while still
+// asking for it to be pooled, so that Put reaches the StateClosed-on-Put branch of putConn.
+type closeOnPutHook struct {
+	onRemoveCalled int
+}
+
+func (h *closeOnPutHook) OnGet(ctx context.Context, conn *Conn, isNewConn bool) (bool, error) {
+	return true, nil
+}
+
+func (h *closeOnPutHook) OnPut(ctx context.Context, conn *Conn) (bool, bool, error) {
+	conn.GetStateMachine().Transition(StateClosed)
+	return true, false, nil
+}
+
+func (h *closeOnPutHook) OnRemove(ctx context.Context, conn *Conn, reason error) {
+	h.onRemoveCalled++
+}
+
+func TestPutConnEvictsOnIdleFullInvokesOnRemove(t *testing.T) {
+	opt := &Options{
+		Dialer: func(ctx context.Context) (net.Conn, error) {
+			return &net.TCPConn{}, nil
+		},
+		PoolSize:           2,
+		MaxIdleConns:       1,
+		MaxConcurrentDials: 2,
+		DialTimeout:        time.Second,
+	}
+
+	p := NewConnPool(opt)
+	defer p.Close()
+
+	hook := &TestHook{ShouldPool: true, ShouldAccept: true}
+	p.AddPoolHook(hook)
+
+	ctx := context.Background()
+	cn1, err := p.newConn(ctx, true)
+	if err != nil {
+		t.Fatalf("newConn cn1 failed: %v", err)
+	}
+	cn1.GetStateMachine().Transition(StateInUse)
+	cn2, err := p.newConn(ctx, true)
+	if err != nil {
+		t.Fatalf("newConn cn2 failed: %v", err)
+	}
+	cn2.GetStateMachine().Transition(StateInUse)
+
+	p.putConnWithoutTurn(ctx, cn1) // pools: idle=1
+	p.putConnWithoutTurn(ctx, cn2) // idle pool full -> evicted on Put
+
+	if hook.OnRemoveCalled != 1 {
+		t.Errorf("Expected OnRemove to fire once for idle-full eviction, got %d", hook.OnRemoveCalled)
+	}
+	if got := p.Stats().StaleConns; got != 1 {
+		t.Errorf("Expected StaleConns=1, got %d", got)
+	}
+}
+
+func TestPutConnStateClosedByHookInvokesOnRemove(t *testing.T) {
+	opt := &Options{
+		Dialer: func(ctx context.Context) (net.Conn, error) {
+			return &net.TCPConn{}, nil
+		},
+		PoolSize:           1,
+		MaxIdleConns:       1,
+		MaxConcurrentDials: 1,
+		DialTimeout:        time.Second,
+	}
+
+	p := NewConnPool(opt)
+	defer p.Close()
+
+	hook := &closeOnPutHook{}
+	p.AddPoolHook(hook)
+
+	ctx := context.Background()
+	cn, err := p.newConn(ctx, true)
+	if err != nil {
+		t.Fatalf("newConn failed: %v", err)
+	}
+	cn.GetStateMachine().Transition(StateInUse)
+
+	p.putConnWithoutTurn(ctx, cn) // OnPut sets StateClosed -> StateClosed-on-Put branch
+
+	if hook.onRemoveCalled != 1 {
+		t.Errorf("Expected OnRemove to fire once for StateClosed-on-Put, got %d", hook.onRemoveCalled)
+	}
+}
+
+// TestFilterInvokesOnRemove checks Filter runs OnRemove for the idle conns it
+// drops, so per-connection hook state (e.g. streaming credentials listeners)
+// does not leak on every Sentinel failover.
+func TestFilterInvokesOnRemove(t *testing.T) {
+	opt := &Options{
+		Dialer: func(ctx context.Context) (net.Conn, error) {
+			c, _ := net.Pipe()
+			return c, nil
+		},
+		PoolSize:           1,
+		MaxConcurrentDials: 1,
+		DialTimeout:        time.Second,
+		PoolTimeout:        time.Second,
+	}
+
+	p := NewConnPool(opt)
+	defer p.Close()
+
+	hook := &TestHook{ShouldPool: true, ShouldAccept: true}
+	p.AddPoolHook(hook)
+
+	ctx := context.Background()
+	cn, err := p.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	p.Put(ctx, cn)
+
+	_ = p.Filter(func(*Conn) bool { return true })
+
+	if hook.OnRemoveCalled != 1 {
+		t.Errorf("Expected OnRemove to fire once for Filter, got %d", hook.OnRemoveCalled)
+	}
+	if n := p.Len(); n != 0 {
+		t.Errorf("Expected Len=0 after Filter, got %d", n)
+	}
+}
