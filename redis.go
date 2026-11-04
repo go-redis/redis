@@ -511,10 +511,11 @@ type baseClient struct {
 	// initConn's internal conn wrapper: the handshake it runs (HELLO, AUTH,
 	// SELECT, CLIENT SETINFO, CLIENT MAINT_NOTIFICATIONS) belongs to the
 	// command that dials the connection, which the caller already admitted and
-	// reports as one operation. Admitting each handshake command again double
-	// counts against a rate limiter and, with a circuit breaker in half-open,
-	// lets a handshake exhaust the probe budget and report the breaker's own
-	// rejection back as a failure, so the breaker never closes.
+	// reports as one operation. The OnConnect callback is exempt for the same
+	// reason: it sends its commands on that wrapper. Admitting each handshake
+	// command again double counts against a rate limiter and, with a circuit
+	// breaker in half-open, lets a handshake exhaust the probe budget and report
+	// the breaker's own rejection back as a failure, so the breaker never closes.
 	limiterExempt bool
 
 	// The following are OWNER-ONLY and NOT copied by clone(): derived clients
@@ -1453,7 +1454,7 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 	}
 
 	// Set the connection initialization function for potential reconnections
-	// This must be set before transitioning to IDLE so that handoff/reauth can use it
+	// This must be set before transitioning to IDLE so that a handoff can use it
 	cn.SetInitConnFunc(c.createInitConnFunc())
 
 	// Initialization succeeded - transition to IDLE state
@@ -2186,8 +2187,11 @@ func (c *baseClient) context(ctx context.Context) context.Context {
 }
 
 // createInitConnFunc creates a connection initialization function that can be used for reconnections.
-// A reconnect (a maintenance handoff or a re-auth) dials outside getConnLimited,
-// so the handshake it runs is admitted once and reported once against Options.Limiter.
+// Only the maintenance handoff runs it, through SetNetConnAndInitConn: it dials outside
+// getConnLimited, so the handshake it runs is admitted once and reported once against
+// Options.Limiter. Streaming re-auth does not come through here: it sends AUTH on the
+// pooled connection through the Conn built by reAuthConnection, which getConnLimited
+// admits per command.
 func (c *baseClient) createInitConnFunc() func(context.Context, *pool.Conn) error {
 	return func(ctx context.Context, cn *pool.Conn) error {
 		closeConn := func(error) { cn.GetStateMachine().Transition(pool.StateClosed) }
