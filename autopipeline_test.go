@@ -20,6 +20,7 @@ import (
 
 	. "github.com/bsm/ginkgo/v2"
 	. "github.com/bsm/gomega"
+
 	"github.com/redis/go-redis/v9"
 	"github.com/redis/go-redis/v9/internal/hashtag"
 	"github.com/redis/go-redis/v9/internal/routing"
@@ -36,6 +37,65 @@ func apTestAddr() string {
 	return ":6379"
 }
 
+// apRELoadOnce guards a lazy, one-time load of the Redis Enterprise connection
+// for the plain go tests in this file. redisOptions() resolves reConn in the
+// ginkgo BeforeSuite, but plain TestXxx funcs may run before it, so
+// apTestOptions() loads it on first use instead.
+var apRELoadOnce sync.Once
+
+// apTestOptions returns the base options for the plain go tests: the resolved
+// Redis Enterprise database (address, credentials, TLS) when running against an
+// external RE cluster (RE_CLUSTER=true and REDIS_ENDPOINTS_CONFIG_PATH set),
+// otherwise Addr: apTestAddr(). Unlike redisOptions() it does not depend on
+// BeforeSuite, so it is safe to call from plain TestXxx funcs. Callers that need
+// extra options mutate the returned struct before NewClient.
+func apTestOptions() *redis.Options {
+	apRELoadOnce.Do(func() {
+		if reConn != nil {
+			return
+		}
+		if re, _ := strconv.ParseBool(os.Getenv("RE_CLUSTER")); re && os.Getenv("REDIS_ENDPOINTS_CONFIG_PATH") != "" {
+			reConn, _ = loadREConnection()
+		}
+	})
+	opt := &redis.Options{Addr: apTestAddr()}
+	applyREConnection(opt) // no-op when reConn is nil (non-RE runs)
+	return opt
+}
+
+// apBaselineRTT returns a conservative baseline round-trip time to the test
+// server so latency-bound assertions can scale to the endpoint (localhost vs a
+// remote Redis Enterprise database) instead of assuming a fixed local bound. It
+// warms the connection, then returns the minimum of a few PINGs (least noisy);
+// on error it returns 0 and callers fall back to their fixed floor.
+func apBaselineRTT(ctx context.Context, c *redis.Client) time.Duration {
+	_ = c.Ping(ctx).Err() // warm dial + handshake
+	best := time.Duration(0)
+	for i := 0; i < 5; i++ {
+		start := time.Now()
+		if err := c.Ping(ctx).Err(); err != nil {
+			return 0
+		}
+		if d := time.Since(start); best == 0 || d < best {
+			best = d
+		}
+	}
+	return best
+}
+
+// apLatencyBudget scales a per-round-trip time budget to the measured RTT, with
+// a fixed floor so localhost (near-zero RTT) still enforces a tight ceiling.
+// roundTrips is the number of sequential server round trips the timed section
+// makes; the 2x factor plus 20ms leaves headroom for scheduling/jitter without
+// masking a real per-command coalescing regression.
+func apLatencyBudget(rtt time.Duration, roundTrips int, floor time.Duration) time.Duration {
+	scaled := time.Duration(roundTrips)*rtt*2 + 20*time.Millisecond
+	if scaled < floor {
+		return floor
+	}
+	return scaled
+}
+
 // ===== from autopipeline_accessor_test.go =====
 // TestAutoPipelineSecondaryAccessors guards a regression where the deferred
 // await() was injected only on the canonical Val()/Result() of each command
@@ -45,7 +105,7 @@ func apTestAddr() string {
 // real value, not the zero value. Run under -race to catch the missing barrier.
 func TestAutoPipelineSecondaryAccessors(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	c.FlushDB(ctx)
 	// The deferred face is where secondary accessors must block until the
@@ -123,7 +183,9 @@ func TestAutoPipelineSecondaryAccessors(t *testing.T) {
 // the enqueue/permit/flush path under a producer that outruns per-command waits.
 func TestAutoPipelineWindowedNoDeadlock(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr(), PoolSize: 20})
+	opt := apTestOptions()
+	opt.PoolSize = 20
+	client := redis.NewClient(opt)
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -182,7 +244,9 @@ func TestAutoPipelineSoak(t *testing.T) {
 		t.Skip("soak skipped in -short")
 	}
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr(), PoolSize: 20})
+	opt := apTestOptions()
+	opt.PoolSize = 20
+	client := redis.NewClient(opt)
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -240,9 +304,7 @@ var _ = Describe("AutoPipeline Blocking Commands", func() {
 	var ap *redis.AutoPipeliner
 
 	BeforeEach(func() {
-		client = redis.NewClient(&redis.Options{
-			Addr: apTestAddr(),
-		})
+		client = redis.NewClient(redisOptions())
 		Expect(client.FlushDB(ctx).Err()).NotTo(HaveOccurred())
 
 		var err error
@@ -263,6 +325,7 @@ var _ = Describe("AutoPipeline Blocking Commands", func() {
 
 		// BLPOP should execute immediately without autopipelining.
 		// ap.Do returns a generic *redis.Cmd; use its typed accessors.
+		rtt := apBaselineRTT(ctx, client)
 		start := time.Now()
 		result := ap.Do(ctx, "BLPOP", "list", "1")
 		val, err := result.StringSlice()
@@ -270,8 +333,9 @@ var _ = Describe("AutoPipeline Blocking Commands", func() {
 
 		Expect(err).NotTo(HaveOccurred())
 		Expect(val).To(Equal([]string{"list", "value"}))
-		// Should complete quickly since value is available
-		Expect(elapsed).To(BeNumerically("<", 100*time.Millisecond))
+		// Value is available, so this is ~one round trip; bound scales to the
+		// measured RTT (100ms floor for localhost).
+		Expect(elapsed).To(BeNumerically("<", apLatencyBudget(rtt, 1, 100*time.Millisecond)))
 	})
 
 	It("should mix blocking and non-blocking commands", func() {
@@ -303,10 +367,9 @@ var _ = Describe("AutoPipeline Blocking Commands", func() {
 // Autopipeline + zero-copy GetToBuffer/SetFromBuffer, standalone, concurrent.
 func TestAPZeroCopyBuffer(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{
-		Addr:                apTestAddr(),
-		AutoPipelineOptions: &redis.AutoPipelineOptions{MaxBatchSize: 100, MaxConcurrentBatches: 30, Unordered: true},
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = &redis.AutoPipelineOptions{MaxBatchSize: 100, MaxConcurrentBatches: 30, Unordered: true}
+	c := redis.NewClient(opt)
 	defer c.Close()
 	c.FlushDB(ctx)
 	ap, err := c.AutoPipeline()
@@ -386,7 +449,7 @@ func TestAPZeroCopyBuffer(t *testing.T) {
 func TestAutoPipelineCloseRace(t *testing.T) {
 	for iter := 0; iter < 50; iter++ {
 		ctx := context.Background()
-		c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+		c := redis.NewClient(apTestOptions())
 		ap, err := c.AutoPipeline()
 		if err != nil {
 			t.Fatal(err)
@@ -436,7 +499,7 @@ func TestAutoPipelineCloseRace(t *testing.T) {
 // the autopipeliner would report open after the client is gone.
 func TestClientCloseClosesAutoPipeliner(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	c.FlushDB(ctx)
 
 	ap, err := c.AutoPipeline()
@@ -471,9 +534,7 @@ var _ = Describe("AutoPipeline Cmdable Interface", func() {
 	var ap *redis.AutoPipeliner
 
 	BeforeEach(func() {
-		client = redis.NewClient(&redis.Options{
-			Addr: apTestAddr(),
-		})
+		client = redis.NewClient(redisOptions())
 		Expect(client.FlushDB(ctx).Err()).NotTo(HaveOccurred())
 
 		var err error
@@ -692,7 +753,7 @@ func TestAutoPipelineOptionsNotMutated(t *testing.T) {
 // batched SET/GET before and after the BLPOP all return their correct replies.
 func TestAutoPipelineBlockingCommandIsolation(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -736,7 +797,7 @@ func TestAutoPipelineBlockingCommandIsolation(t *testing.T) {
 // not panic (it may return an error, but must not crash or hang).
 func TestAutoPipelineDoubleClose(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -766,7 +827,7 @@ func TestAutoPipelineDoubleClose(t *testing.T) {
 // result is still produced.
 func TestAPContextCancelDoesNotCancelExecution(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -797,7 +858,7 @@ func TestAPContextCancelDoesNotCancelExecution(t *testing.T) {
 // Wait returns the real result.
 func TestAPWaitContextAbandonsWaitOnly(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -826,7 +887,7 @@ func TestAPWaitContextAbandonsWaitOnly(t *testing.T) {
 // AP-C3: WaitContext returns the real result when the batch completes first.
 func TestAPWaitContextReturnsResult(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -850,7 +911,9 @@ func TestAPWaitContextReturnsResult(t *testing.T) {
 // path (unlike batched commands, which execute on Background).
 func TestAPBlockingCommandHonorsContext(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr(), ContextTimeoutEnabled: true})
+	opt := apTestOptions()
+	opt.ContextTimeoutEnabled = true
+	client := redis.NewClient(opt)
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -879,7 +942,7 @@ func TestAPBlockingCommandHonorsContext(t *testing.T) {
 // AP-C5: submitting after Close returns ErrClosed.
 func TestAPSubmitAfterCloseErrClosed(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -911,10 +974,9 @@ func TestAPZeroFutureWaitContext(t *testing.T) {
 // got exactly what it wrote.
 func TestAPNoCrossTalk(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{
-		Addr:                apTestAddr(),
-		AutoPipelineOptions: &redis.AutoPipelineOptions{MaxBatchSize: 200, MaxConcurrentBatches: 50, Unordered: true},
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = &redis.AutoPipelineOptions{MaxBatchSize: 200, MaxConcurrentBatches: 50, Unordered: true}
+	c := redis.NewClient(opt)
 	defer c.Close()
 	c.FlushDB(ctx)
 	ap, err := c.AutoPipeline()
@@ -974,10 +1036,9 @@ func TestAPNoCrossTalk(t *testing.T) {
 // the right command).
 func TestAPPerGoroutineOrder(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{
-		Addr:                apTestAddr(),
-		AutoPipelineOptions: &redis.AutoPipelineOptions{MaxBatchSize: 100, MaxConcurrentBatches: 30, Unordered: true},
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = &redis.AutoPipelineOptions{MaxBatchSize: 100, MaxConcurrentBatches: 30, Unordered: true}
+	c := redis.NewClient(opt)
 	defer c.Close()
 	c.FlushDB(ctx)
 	ap, err := c.AutoPipeline()
@@ -1013,10 +1074,9 @@ func TestAPPerGoroutineOrder(t *testing.T) {
 // count keys; must be exactly N.
 func TestAPNoLostCommands(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{
-		Addr:                apTestAddr(),
-		AutoPipelineOptions: &redis.AutoPipelineOptions{MaxBatchSize: 256, MaxConcurrentBatches: 64, Unordered: true},
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = &redis.AutoPipelineOptions{MaxBatchSize: 256, MaxConcurrentBatches: 64, Unordered: true}
+	c := redis.NewClient(opt)
 	defer c.Close()
 	c.FlushDB(ctx)
 	ap, err := c.AutoPipeline()
@@ -1053,10 +1113,9 @@ func TestAPNoLostCommands(t *testing.T) {
 // corrupt sibling commands sharing the same batch.
 func TestAPErrorIsolation(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{
-		Addr:                apTestAddr(),
-		AutoPipelineOptions: &redis.AutoPipelineOptions{MaxBatchSize: 64, MaxConcurrentBatches: 16, Unordered: true},
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = &redis.AutoPipelineOptions{MaxBatchSize: 64, MaxConcurrentBatches: 16, Unordered: true}
+	c := redis.NewClient(opt)
 	defer c.Close()
 	c.FlushDB(ctx)
 	// Seed a list key so INCR on it errors with WRONGTYPE.
@@ -1107,7 +1166,7 @@ func atomicAdd(p *int64) {
 // the returned cmd already holds its result without an explicit further wait.
 func TestBlockingFaceExecutesOnCall(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	c.FlushDB(ctx)
 	ap, err := c.AutoPipeline() // blocking face
@@ -1147,7 +1206,7 @@ func TestBlockingFaceExecutesOnCall(t *testing.T) {
 // is read later. Windowed submit then read works.
 func TestAsyncFaceDeferred(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	c.FlushDB(ctx)
 	ap, err := c.AsyncAutoPipeline() // deferred face, ordered default
@@ -1174,7 +1233,7 @@ func TestAsyncFaceDeferred(t *testing.T) {
 // with the result deferred until read. No cross-talk across goroutines.
 func TestFutureFaceTyped(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	c.FlushDB(ctx)
 	fap, err := c.AsyncAutoPipeline()
@@ -1218,7 +1277,7 @@ func TestFutureFaceTyped(t *testing.T) {
 // strict per-key ordering even though it never blocks between submits.
 func TestOrderedModeWindowed(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	c.FlushDB(ctx)
 	// Deferred face: submits genuinely don't block, so the windowed claim is
@@ -1293,7 +1352,7 @@ func TestAutoPipelineOptionsValidate(t *testing.T) {
 // with an error (not a panic): AsyncAutoPipeline runs from a post-init call, so a
 // bad config surfaces as a returned error the caller can handle.
 func TestAutoPipelineErrorsOnUnsafeConfig(t *testing.T) {
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	ap, err := c.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{MaxConcurrentBatches: 8})
 	if err == nil {
@@ -1388,6 +1447,7 @@ func (batchCountingHook) DialHook(next redis.DialHook) redis.DialHook { return n
 func (batchCountingHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return next
 }
+
 func (h batchCountingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		if len(cmds) >= 2 {
@@ -1405,9 +1465,11 @@ type fuzzOp struct {
 }
 
 func genOps(rng *rand.Rand, n int) []fuzzOp {
-	kinds := []string{"set", "get", "getdel", "incr", "incrby", "append", "strlen",
+	kinds := []string{
+		"set", "get", "getdel", "incr", "incrby", "append", "strlen",
 		"exists", "del", "hset", "hget", "hgetall", "lpush", "lrange", "llen",
-		"expire", "ttl", "type", "setbig", "setbin"}
+		"expire", "ttl", "type", "setbig", "setbin",
+	}
 	keys := make([]string, 8)
 	for i := range keys {
 		keys[i] = fmt.Sprintf("fz:%d", i)
@@ -1415,8 +1477,10 @@ func genOps(rng *rand.Rand, n int) []fuzzOp {
 	ops := make([]fuzzOp, n)
 	for i := range ops {
 		k := keys[rng.Intn(len(keys))]
-		ops[i] = fuzzOp{kind: kinds[rng.Intn(len(kinds))], key: k,
-			val: fmt.Sprintf("v%d", rng.Intn(1000)), n: int64(rng.Intn(50))}
+		ops[i] = fuzzOp{
+			kind: kinds[rng.Intn(len(kinds))], key: k,
+			val: fmt.Sprintf("v%d", rng.Intn(1000)), n: int64(rng.Intn(50)),
+		}
 	}
 	return ops
 }
@@ -1637,7 +1701,7 @@ func runWithWatchdog(t *testing.T, timeout time.Duration, fn func()) {
 
 func testAsyncHookPeek(t *testing.T, before bool) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	c.AddHook(resultPeekHook{before: before})
 	c.FlushDB(ctx)
@@ -1682,7 +1746,7 @@ func TestAsyncAutoPipelineHookSoloCommand(t *testing.T) {
 	for _, before := range []bool{false, true} {
 		t.Run(fmt.Sprintf("before=%v", before), func(t *testing.T) {
 			ctx := context.Background()
-			c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+			c := redis.NewClient(apTestOptions())
 			defer c.Close()
 			c.AddHook(resultPeekHook{before: before})
 			c.FlushDB(ctx)
@@ -1714,7 +1778,7 @@ func TestBlockingAutoPipelineHookReads(t *testing.T) {
 	for _, before := range []bool{false, true} {
 		t.Run(fmt.Sprintf("before=%v", before), func(t *testing.T) {
 			ctx := context.Background()
-			c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+			c := redis.NewClient(apTestOptions())
 			defer c.Close()
 			c.AddHook(resultPeekHook{before: before})
 			c.FlushDB(ctx)
@@ -1742,7 +1806,7 @@ func TestAsyncAutoPipelineDoHookReads(t *testing.T) {
 	for _, before := range []bool{false, true} {
 		t.Run(fmt.Sprintf("before=%v", before), func(t *testing.T) {
 			ctx := context.Background()
-			c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+			c := redis.NewClient(apTestOptions())
 			defer c.Close()
 			c.AddHook(resultPeekHook{before: before})
 
@@ -1768,7 +1832,9 @@ func TestAsyncAutoPipelineDoHookReads(t *testing.T) {
 // flushers AND dispatcher workers all exit on Close, nothing leaks.
 func TestAutoPipelineNoGoroutineLeak(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr(), PoolSize: 50})
+	opt := apTestOptions()
+	opt.PoolSize = 50
+	client := redis.NewClient(opt)
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -1793,7 +1859,7 @@ func TestAutoPipelineNoGoroutineLeak(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				var wg = make([]redis.AutoFuture, 0, 200)
+				wg := make([]redis.AutoFuture, 0, 200)
 				for i := 0; i < 200; i++ {
 					if async {
 						wg = append(wg, ap.Submit(ctx, redis.NewCmd(ctx, "set", "leak:k", i)))
@@ -1874,8 +1940,24 @@ func TestAutoPipelineRetriesOnNetworkError(t *testing.T) {
 	}
 	defer ap.Close()
 
-	// Arm after the handshake: the pooled conn is healthy, so it passes the
-	// pool health check, and the batch's first write dies on the wire.
+	// Warm the DEDICATED PIPELINE POOL connection first: creating the
+	// autopipeliner created the pipeline pool (lazily), and BATCHES run there,
+	// not on the main-pool conn the Ping dialed. Without this warm-up the
+	// batch's first dispatch dials a fresh pipeline conn and the dial count
+	// reads one high for a reason unrelated to the retry. The warm-up must be
+	// a real multi-command batch: a lone command takes the solo fast path
+	// (Process on the main pool) and would not touch the pipeline pool.
+	w1 := ap.Set(ctx, "apr:warm", 1, 0)
+	w2 := ap.Incr(ctx, "apr:warm2")
+	if err := w1.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Arm after the handshake: the pipeline-pool conn is healthy, so it passes
+	// the pool health check, and the batch's first write dies on the wire.
 	dialsBefore := dials.Load()
 	failNextWrite.Store(true)
 
@@ -1944,15 +2026,14 @@ func TestAutoPipelineRetryExhaustionSurfacesError(t *testing.T) {
 func TestAutoPipelineSequential(t *testing.T) {
 	ctx := context.Background()
 
-	client := redis.NewClient(&redis.Options{
-		Addr: apTestAddr(),
-		AutoPipelineOptions: &redis.AutoPipelineOptions{
-			MaxBatchSize:         10,
-			MaxFlushDelay:        50 * time.Millisecond,
-			MaxConcurrentBatches: 5,
-			Unordered:            true,
-		},
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = &redis.AutoPipelineOptions{
+		MaxBatchSize:         10,
+		MaxFlushDelay:        50 * time.Millisecond,
+		MaxConcurrentBatches: 5,
+		Unordered:            true,
+	}
+	client := redis.NewClient(opt)
 	defer client.Close()
 
 	if err := client.FlushDB(ctx).Err(); err != nil {
@@ -1996,15 +2077,14 @@ func TestAutoPipelineSequential(t *testing.T) {
 func TestAutoPipelineSequentialSmallBatches(t *testing.T) {
 	ctx := context.Background()
 
-	client := redis.NewClient(&redis.Options{
-		Addr: apTestAddr(),
-		AutoPipelineOptions: &redis.AutoPipelineOptions{
-			MaxBatchSize:         1000,                  // Large batch size
-			MaxFlushDelay:        20 * time.Millisecond, // Rely on timer
-			MaxConcurrentBatches: 5,
-			Unordered:            true,
-		},
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = &redis.AutoPipelineOptions{
+		MaxBatchSize:         1000,                  // Large batch size
+		MaxFlushDelay:        20 * time.Millisecond, // Rely on timer
+		MaxConcurrentBatches: 5,
+		Unordered:            true,
+	}
+	client := redis.NewClient(opt)
 	defer client.Close()
 
 	if err := client.FlushDB(ctx).Err(); err != nil {
@@ -2047,15 +2127,14 @@ func TestAutoPipelineSequentialSmallBatches(t *testing.T) {
 func TestAutoPipelineSequentialMixed(t *testing.T) {
 	ctx := context.Background()
 
-	client := redis.NewClient(&redis.Options{
-		Addr: apTestAddr(),
-		AutoPipelineOptions: &redis.AutoPipelineOptions{
-			MaxBatchSize:         5,
-			MaxFlushDelay:        50 * time.Millisecond,
-			MaxConcurrentBatches: 5,
-			Unordered:            true,
-		},
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = &redis.AutoPipelineOptions{
+		MaxBatchSize:         5,
+		MaxFlushDelay:        50 * time.Millisecond,
+		MaxConcurrentBatches: 5,
+		Unordered:            true,
+	}
+	client := redis.NewClient(opt)
 	defer client.Close()
 
 	if err := client.FlushDB(ctx).Err(); err != nil {
@@ -2101,7 +2180,7 @@ func TestAutoPipelineSequentialMixed(t *testing.T) {
 // and pipeline pool. Every concurrent caller must observe the SAME instance.
 func TestAutoPipelineConcurrentFirstCall(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	c.FlushDB(ctx)
 
@@ -2151,15 +2230,14 @@ var _ = Describe("AutoPipeline", func() {
 	var ap *redis.AutoPipeliner
 
 	BeforeEach(func() {
-		client = redis.NewClient(&redis.Options{
-			Addr: apTestAddr(),
-			AutoPipelineOptions: &redis.AutoPipelineOptions{
-				MaxBatchSize:         10,
-				MaxFlushDelay:        50 * time.Millisecond,
-				MaxConcurrentBatches: 5,
-				Unordered:            true,
-			},
-		})
+		opt := redisOptions()
+		opt.AutoPipelineOptions = &redis.AutoPipelineOptions{
+			MaxBatchSize:         10,
+			MaxFlushDelay:        50 * time.Millisecond,
+			MaxConcurrentBatches: 5,
+			Unordered:            true,
+		}
+		client = redis.NewClient(opt)
 		Expect(client.FlushDB(ctx).Err()).NotTo(HaveOccurred())
 
 		var err error
@@ -2372,15 +2450,14 @@ var _ = Describe("AutoPipeline", func() {
 
 	It("should respect MaxConcurrentBatches", func() {
 		// Create autopipeliner with low concurrency limit
-		client2 := redis.NewClient(&redis.Options{
-			Addr: apTestAddr(),
-			AutoPipelineOptions: &redis.AutoPipelineOptions{
-				MaxBatchSize:         5,
-				MaxFlushDelay:        10 * time.Millisecond,
-				MaxConcurrentBatches: 2,
-				Unordered:            true,
-			},
-		})
+		opt := redisOptions()
+		opt.AutoPipelineOptions = &redis.AutoPipelineOptions{
+			MaxBatchSize:         5,
+			MaxFlushDelay:        10 * time.Millisecond,
+			MaxConcurrentBatches: 2,
+			Unordered:            true,
+		}
+		client2 := redis.NewClient(opt)
 		defer client2.Close()
 
 		ap2, err := client2.AutoPipeline()
@@ -2438,15 +2515,14 @@ var _ = Describe("AutoPipeline", func() {
 func TestAutoPipelineBasic(t *testing.T) {
 	ctx := context.Background()
 
-	client := redis.NewClient(&redis.Options{
-		Addr: apTestAddr(),
-		AutoPipelineOptions: &redis.AutoPipelineOptions{
-			MaxBatchSize:         10,
-			MaxFlushDelay:        50 * time.Millisecond,
-			MaxConcurrentBatches: 5,
-			Unordered:            true,
-		},
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = &redis.AutoPipelineOptions{
+		MaxBatchSize:         10,
+		MaxFlushDelay:        50 * time.Millisecond,
+		MaxConcurrentBatches: 5,
+		Unordered:            true,
+	}
+	client := redis.NewClient(opt)
 	defer client.Close()
 
 	if err := client.FlushDB(ctx).Err(); err != nil {
@@ -2491,15 +2567,14 @@ func TestAutoPipelineBasic(t *testing.T) {
 func TestAutoPipelineMaxFlushDelay(t *testing.T) {
 	ctx := context.Background()
 
-	client := redis.NewClient(&redis.Options{
-		Addr: apTestAddr(),
-		AutoPipelineOptions: &redis.AutoPipelineOptions{
-			MaxBatchSize:         1000, // Large batch size so only timer triggers flush
-			MaxFlushDelay:        50 * time.Millisecond,
-			MaxConcurrentBatches: 5,
-			Unordered:            true,
-		},
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = &redis.AutoPipelineOptions{
+		MaxBatchSize:         1000, // Large batch size so only timer triggers flush
+		MaxFlushDelay:        50 * time.Millisecond,
+		MaxConcurrentBatches: 5,
+		Unordered:            true,
+	}
+	client := redis.NewClient(opt)
 	defer client.Close()
 
 	if err := client.FlushDB(ctx).Err(); err != nil {
@@ -2511,6 +2586,7 @@ func TestAutoPipelineMaxFlushDelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ap.Close()
+	rtt := apBaselineRTT(ctx, client)
 
 	// Send commands slowly, one at a time
 	// They should be flushed by the timer, not by batch size
@@ -2546,10 +2622,11 @@ func TestAutoPipelineMaxFlushDelay(t *testing.T) {
 		}
 	}
 
-	// Should complete in roughly 10 * 10ms = 100ms + some flush intervals
-	// If timer doesn't work, commands would wait until Close() is called
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("Commands took too long (%v), flush interval may not be working", elapsed)
+	// Roughly 10*10ms sends + a few flush intervals; if the timer doesn't work,
+	// commands would wait until Close(). Bound scales to RTT (500ms floor).
+	bound := apLatencyBudget(rtt, 10, 500*time.Millisecond)
+	if elapsed > bound {
+		t.Fatalf("Commands took too long (%v, bound %v, rtt %v), flush interval may not be working", elapsed, bound, rtt)
 	}
 
 	t.Logf("Completed in %v (flush interval working correctly)", elapsed)
@@ -2558,10 +2635,9 @@ func TestAutoPipelineMaxFlushDelay(t *testing.T) {
 func TestAutoPipelineConcurrency(t *testing.T) {
 	ctx := context.Background()
 
-	client := redis.NewClient(&redis.Options{
-		Addr:                apTestAddr(),
-		AutoPipelineOptions: redis.DefaultAutoPipelineOptions(),
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = redis.DefaultAutoPipelineOptions()
+	client := redis.NewClient(opt)
 	defer client.Close()
 
 	if err := client.FlushDB(ctx).Err(); err != nil {
@@ -2612,10 +2688,9 @@ func TestAutoPipelineConcurrency(t *testing.T) {
 // TestAutoPipelineSingleCommandNoBlock verifies that single commands don't block
 func TestAutoPipelineSingleCommandNoBlock(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{
-		Addr:                apTestAddr(),
-		AutoPipelineOptions: redis.DefaultAutoPipelineOptions(),
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = redis.DefaultAutoPipelineOptions()
+	client := redis.NewClient(opt)
 	defer client.Close()
 
 	ap, err := client.AutoPipeline()
@@ -2629,6 +2704,7 @@ func TestAutoPipelineSingleCommandNoBlock(t *testing.T) {
 	if err := ap.Ping(ctx).Err(); err != nil {
 		t.Fatal(err)
 	}
+	rtt := apBaselineRTT(ctx, client)
 
 	start := time.Now()
 	cmd := ap.Ping(ctx)
@@ -2642,10 +2718,11 @@ func TestAutoPipelineSingleCommandNoBlock(t *testing.T) {
 		t.Fatalf("Ping = %q, want PONG", cmd.Val())
 	}
 
-	// A warmed lone caller flushes immediately (no coalescing wait); 50ms is
-	// a generous bound for one local round trip.
-	if elapsed > 50*time.Millisecond {
-		t.Errorf("Single command took too long: %v (should be < 50ms)", elapsed)
+	// A warmed lone caller flushes immediately (no coalescing wait): one round
+	// trip. The bound scales to the measured RTT (50ms floor for localhost).
+	bound := apLatencyBudget(rtt, 1, 50*time.Millisecond)
+	if elapsed > bound {
+		t.Errorf("Single command took too long: %v (bound %v, rtt %v)", elapsed, bound, rtt)
 	}
 
 	t.Logf("Single command completed in %v", elapsed)
@@ -2654,10 +2731,9 @@ func TestAutoPipelineSingleCommandNoBlock(t *testing.T) {
 // TestAutoPipelineSequentialSingleThread verifies sequential single-threaded execution
 func TestAutoPipelineSequentialSingleThread(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{
-		Addr:                apTestAddr(),
-		AutoPipelineOptions: redis.DefaultAutoPipelineOptions(),
-	})
+	opt := apTestOptions()
+	opt.AutoPipelineOptions = redis.DefaultAutoPipelineOptions()
+	client := redis.NewClient(opt)
 	defer client.Close()
 
 	ap, err := client.AutoPipeline()
@@ -2670,6 +2746,7 @@ func TestAutoPipelineSequentialSingleThread(t *testing.T) {
 	if err := ap.Ping(ctx).Err(); err != nil {
 		t.Fatal(err)
 	}
+	rtt := apBaselineRTT(ctx, client)
 
 	// Execute 10 commands sequentially in a single thread
 	start := time.Now()
@@ -2686,9 +2763,11 @@ func TestAutoPipelineSequentialSingleThread(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 
-	// Should complete reasonably fast (< 100ms for 10 commands)
-	if elapsed > 100*time.Millisecond {
-		t.Errorf("10 sequential commands took too long: %v (should be < 100ms)", elapsed)
+	// Ten sequential round trips: the bound scales to the measured RTT so this
+	// holds against a remote endpoint, with a 100ms floor to keep localhost tight.
+	bound := apLatencyBudget(rtt, 10, 100*time.Millisecond)
+	if elapsed > bound {
+		t.Errorf("10 sequential commands took too long: %v (bound %v, rtt %v)", elapsed, bound, rtt)
 	}
 
 	t.Logf("10 sequential commands completed in %v (avg: %v per command)", elapsed, elapsed/10)
@@ -2699,9 +2778,7 @@ func TestAutoPipelineSequentialSingleThread(t *testing.T) {
 // work correctly with autopipelining and block until execution.
 func TestAutoPipelineTypedCommands(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{
-		Addr: apTestAddr(),
-	})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 
 	// Skip if Redis is not available
@@ -2739,9 +2816,7 @@ func TestAutoPipelineTypedCommands(t *testing.T) {
 // TestAutoPipelineTypedCommandsMultiple tests multiple typed commands
 func TestAutoPipelineTypedCommandsMultiple(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{
-		Addr: apTestAddr(),
-	})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 
 	// Skip if Redis is not available
@@ -2792,9 +2867,7 @@ func TestAutoPipelineTypedCommandsMultiple(t *testing.T) {
 // TestAutoPipelineTypedCommandsVal tests the Val() method
 func TestAutoPipelineTypedCommandsVal(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{
-		Addr: apTestAddr(),
-	})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 
 	// Skip if Redis is not available
@@ -2871,7 +2944,7 @@ func TestUniversalClientAutoPipeline(t *testing.T) {
 // surface (PoolStats, Do, ...) delegates to the underlying client.
 func TestAutoPipelinerAsUniversalClient(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -3380,6 +3453,7 @@ func (h shortCircuitHook) DialHook(next redis.DialHook) redis.DialHook { return 
 func (h shortCircuitHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error { return h.err }
 }
+
 func (h shortCircuitHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error { return h.err }
 }
@@ -3397,6 +3471,7 @@ func (h pipelineBreakerHook) DialHook(next redis.DialHook) redis.DialHook { retu
 func (h pipelineBreakerHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error { return next(ctx, cmd) }
 }
+
 func (h pipelineBreakerHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		if !h.armed.Load() {
@@ -3414,7 +3489,7 @@ func TestAutoPipelineHookShortCircuit(t *testing.T) {
 	}{{"blocking", false}, {"async", true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+			c := redis.NewClient(apTestOptions())
 			defer c.Close()
 			if err := c.Ping(ctx).Err(); err != nil {
 				t.Skipf("no redis: %v", err)
@@ -3466,7 +3541,7 @@ func TestAutoPipelineHookShortCircuit(t *testing.T) {
 // delegating AddHook) take effect and may read results without deadlocking.
 func TestAutoPipelineHookAddedAfterCreate(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	if err := c.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -3507,7 +3582,7 @@ func TestAutoPipelineHookAddedAfterCreate(t *testing.T) {
 // hung) by the shutdown drain.
 func TestAutoPipelineCloseFlushesPendingFutures(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	if err := c.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -3574,12 +3649,45 @@ func TestAutoPipelineClientLevelOptionsApply(t *testing.T) {
 	}
 }
 
+// TestAutoPipelineMaxBatchBytesDefaultsToGuardrail pins that an unset (or
+// explicitly zero) MaxBatchBytes resolves to the 128 KiB full-duplex deadlock
+// guardrail (see the field's GoDoc), not to "unbounded" — the previous
+// behavior. Checked via both preset constructors and the actual resolved
+// config on a constructed autopipeliner, since MaxBatchSize's own default is
+// applied redundantly in three places and MaxBatchBytes now mirrors that.
+func TestAutoPipelineMaxBatchBytesDefaultsToGuardrail(t *testing.T) {
+	const want = 128 * 1024
+
+	if got := redis.DefaultAutoPipelineOptions().MaxBatchBytes; got != want {
+		t.Errorf("DefaultAutoPipelineOptions().MaxBatchBytes = %d, want %d", got, want)
+	}
+	if got := redis.DefaultBlockingAutoPipelineOptions().MaxBatchBytes; got != want {
+		t.Errorf("DefaultBlockingAutoPipelineOptions().MaxBatchBytes = %d, want %d", got, want)
+	}
+
+	c := redis.NewClient(&redis.Options{
+		Addr: apTestAddr(),
+		AutoPipelineOptions: &redis.AutoPipelineOptions{
+			MaxBatchSize: 50, // leave MaxBatchBytes at its zero value
+		},
+	})
+	defer c.Close()
+
+	ap, err := c.AutoPipeline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ap.Config().MaxBatchBytes; got != want {
+		t.Fatalf("resolved MaxBatchBytes = %d, want %d (zero must default to the guardrail, not stay unbounded)", got, want)
+	}
+}
+
 // TestAsyncAutoPipelineBlockingCommand covers the readTimeout diversion on the
 // DEFERRED face: BLPOP must bypass the batch (it would stall a whole pipeline)
 // and still deliver its result through the usual accessors.
 func TestAsyncAutoPipelineBlockingCommand(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	if err := c.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -3617,7 +3725,7 @@ func TestAsyncAutoPipelineBlockingCommand(t *testing.T) {
 // tested; no command had ever executed under this configuration).
 func TestAdaptiveDelayEndToEnd(t *testing.T) {
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	if err := c.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -3674,9 +3782,7 @@ func TestClusterPipelineUsesDedicatedPool(t *testing.T) {
 		PipelineReadBufferSize: 64 * 1024,
 	})
 	defer c.Close()
-	if err := c.Ping(ctx).Err(); err != nil {
-		t.Skipf("no cluster: %v", err)
-	}
+	skipIfClusterUnhealthy(t, c)
 
 	runWithWatchdog(t, 60*time.Second, func() {
 		// Manual pipeline spanning many slots.
@@ -3732,7 +3838,7 @@ func TestAutoPipelineDoRawOutsidePipeline(t *testing.T) {
 	}{{"blocking", false}, {"async", true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+			c := redis.NewClient(apTestOptions())
 			defer c.Close()
 			if err := c.Ping(ctx).Err(); err != nil {
 				t.Skipf("no redis: %v", err)
@@ -3794,9 +3900,8 @@ func TestClusterNodeHookShortCircuit(t *testing.T) {
 	// are pipelines too) and armed just before the asserted round.
 	var armed atomic.Bool
 	c.OnNewNode(func(cl *redis.Client) { cl.AddHook(pipelineBreakerHook{err: errBreaker, armed: &armed}) })
-	if err := c.Ping(ctx).Err(); err != nil {
-		t.Skipf("no cluster: %v", err)
-	}
+
+	skipIfClusterUnhealthy(t, c)
 
 	runWithWatchdog(t, 60*time.Second, func() {
 		// Warm pooled connections on every node so the asserted round doesn't
@@ -3839,6 +3944,7 @@ func (h postNextErrorHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook
 		return h.err
 	}
 }
+
 func (h postNextErrorHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		_ = next(ctx, cmds)
@@ -3857,7 +3963,7 @@ func TestAutoPipelineHookPostNextError(t *testing.T) {
 	}{{"blocking", false}, {"async", true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+			c := redis.NewClient(apTestOptions())
 			defer c.Close()
 			if err := c.Ping(ctx).Err(); err != nil {
 				t.Skipf("no redis: %v", err)
@@ -3916,7 +4022,7 @@ func TestAutoPipelineHookPostNextError(t *testing.T) {
 func TestAutoPipelineHookPostNextErrorPartialBatch(t *testing.T) {
 	errInjected := errors.New("hook injected after next")
 	ctx := context.Background()
-	c := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	c := redis.NewClient(apTestOptions())
 	defer c.Close()
 	if err := c.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -3927,7 +4033,6 @@ func TestAutoPipelineHookPostNextErrorPartialBatch(t *testing.T) {
 	if err := c.Set(ctx, "pnp:present", "v", 0).Err(); err != nil {
 		t.Fatal(err)
 	}
-	c.AddHook(postNextErrorHook{err: errInjected})
 
 	// Wide flush window so all three commands deterministically land in ONE
 	// pipeline batch (the rule is per-batch: hooks fire per batch).
@@ -3939,6 +4044,23 @@ func TestAutoPipelineHookPostNextErrorPartialBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ap.Close()
+
+	// Initialize the dedicated pipeline-pool connection BEFORE installing the
+	// error-injecting hook: connection init runs its handshake pipeline through
+	// the client's hook chain (newConn shares hooksMixin), so a hook that
+	// unconditionally injects an error would fail the pipeline conn's init and
+	// this test would measure init poisoning instead of the post-next rule.
+	// Must be a real multi-command batch — a lone command takes the solo fast
+	// path (Process on the main pool) and would not init the pipeline conn.
+	w1 := ap.Set(ctx, "pnp:warm", 1, 0)
+	w2 := ap.Set(ctx, "pnp:warm2", 1, 0)
+	if err := w1.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.Err(); err != nil {
+		t.Fatal(err)
+	}
+	c.AddHook(postNextErrorHook{err: errInjected})
 
 	runWithWatchdog(t, 30*time.Second, func() {
 		// One batch: a hit, a miss (redis.Nil), and a write.
@@ -3966,7 +4088,7 @@ func TestAutoPipelineHookPostNextErrorPartialBatch(t *testing.T) {
 // on the first command was enough to trigger it. rawErr() is the fix.
 func TestAsyncAutoPipelineErrorFirstReplyNoHooks(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 
 	// Forced single batch: everything lands in one flush, first reply is a
@@ -4000,7 +4122,7 @@ func TestAsyncAutoPipelineErrorFirstReplyNoHooks(t *testing.T) {
 // HIMPORT support too: the reads happen regardless of the reply.
 func TestAsyncAutoPipelineHImportBatchNoHooks(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 
 	ap, err := client.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
@@ -4036,7 +4158,7 @@ func TestAsyncAutoPipelineHImportBatchNoHooks(t *testing.T) {
 // flush delay — i.e. without waiting for any result.
 func TestAsyncAutoPipelinePublishDoesNotAwait(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -4086,6 +4208,7 @@ func (h routeRecordingHook) ProcessHook(next redis.ProcessHook) redis.ProcessHoo
 		return next(ctx, cmd)
 	}
 }
+
 func (h routeRecordingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		h.mu.Lock()
@@ -4159,6 +4282,7 @@ func (h armablePostNextPipelineHook) DialHook(next redis.DialHook) redis.DialHoo
 func (h armablePostNextPipelineHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return next
 }
+
 func (h armablePostNextPipelineHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		err := next(ctx, cmds)
@@ -4186,9 +4310,8 @@ func TestClusterNodeHookPostNextError(t *testing.T) {
 	c.OnNewNode(func(cl *redis.Client) {
 		cl.AddHook(armablePostNextPipelineHook{err: errVerdict, armed: &armed})
 	})
-	if err := c.Ping(ctx).Err(); err != nil {
-		t.Skipf("no cluster: %v", err)
-	}
+
+	skipIfClusterUnhealthy(t, c)
 
 	runWithWatchdog(t, 60*time.Second, func() {
 		warm := c.Pipeline()
@@ -4222,7 +4345,7 @@ func TestClusterNodeHookPostNextError(t *testing.T) {
 // the caller. Next() now awaits the fetch before reading.
 func TestAsyncAutoPipelineScanIterator(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -4270,11 +4393,9 @@ func markNonPipelinable(c *redis.ClusterClient, name string) {
 	}))
 }
 
-// TestClusterPipelineNonPipelinableAllOrNothing pins user Pipeline() atomicity:
-// a command whose request policy cannot ride a pipeline fails the WHOLE batch
-// before anything dispatches — existing users rely on all-or-nothing (review
-// decision on #3942; an earlier revision executed the rest and returned an
-// error, silently landing partial writes).
+// An explicitly configured custom fan-out policy unsupported by Pipeline is
+// rejected before batch dispatch. This validation does not make ordinary
+// pipelines atomic; Redis command errors can still accompany successful writes.
 func TestClusterPipelineNonPipelinableAllOrNothing(t *testing.T) {
 	ctx := context.Background()
 	c := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{":16600", ":16601", ":16602"}})
@@ -4305,42 +4426,93 @@ func TestClusterPipelineNonPipelinableAllOrNothing(t *testing.T) {
 	}
 }
 
-// TestAPClusterNonPipelinableRejectedAtSubmit pins the autopipeline side of the
-// same decision: the offending command is rejected at submit (before it can
-// join a merged batch), while unrelated batch-mates execute normally — one
-// caller's bad command must not poison everyone else's batch.
-func TestAPClusterNonPipelinableRejectedAtSubmit(t *testing.T) {
-	ctx := context.Background()
-	c := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{":16600", ":16601", ":16602"}})
-	defer c.Close()
-	if err := c.Ping(ctx).Err(); err != nil {
-		t.Skipf("no cluster: %v", err)
+// Fan-out is rejected on ordered async streams and remains available with an
+// explicit Unordered opt-in. Neither outcome affects neighboring batches.
+func TestAPClusterFanoutRespectsOrdering(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		fullDuplex bool
+		unordered  bool
+	}{
+		{name: "ordered"},
+		{name: "ordered-full-duplex", fullDuplex: true},
+		{name: "unordered", unordered: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			c := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{":16600", ":16601", ":16602"}})
+			defer c.Close()
+			skipIfClusterUnhealthy(t, c)
+			c.SetCommandInfoResolver(redis.NewCommandInfoResolver(func(_ context.Context, cmd redis.Cmder) *routing.CommandPolicy {
+				if cmd.Name() == "ping" {
+					return &routing.CommandPolicy{Request: routing.ReqAllShards, Response: routing.RespAllSucceeded}
+				}
+				return nil
+			}))
+
+			var hooksMu sync.Mutex
+			var hooks []routeRecordingHook
+			if err := c.ForEachMaster(ctx, func(_ context.Context, node *redis.Client) error {
+				hook := routeRecordingHook{mu: &sync.Mutex{}, pipeline: map[string]bool{}, direct: map[string]bool{}}
+				node.AddHook(hook)
+				hooksMu.Lock()
+				hooks = append(hooks, hook)
+				hooksMu.Unlock()
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if len(hooks) < 2 {
+				t.Fatal("fan-out test requires multiple masters")
+			}
+
+			ap, err := c.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+				MaxBatchSize:  100,
+				MaxFlushDelay: 20 * time.Millisecond,
+				FullDuplex:    tc.fullDuplex,
+				Unordered:     tc.unordered,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			key1 := fmt.Sprintf("apfanout:%s:{a}:1", tc.name)
+			key2 := fmt.Sprintf("apfanout:%s:{a}:2", tc.name)
+			defer c.Del(ctx, key1, key2)
+
+			runWithWatchdog(t, 30*time.Second, func() {
+				set1 := ap.Set(ctx, key1, "v1", 0)
+				ping := ap.Ping(ctx)
+				set2 := ap.Set(ctx, key2, "v2", 0)
+
+				got, err := ping.Result()
+				if tc.unordered {
+					if err != nil || got != "PONG" {
+						t.Fatalf("fan-out PING = %q, %v; want PONG", got, err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), "ordered AsyncAutoPipeline") {
+					t.Fatalf("fan-out PING = %q, %v; want ordering rejection", got, err)
+				}
+				if err := set1.Err(); err != nil {
+					t.Fatalf("neighboring set1 failed: %v", err)
+				}
+				if err := set2.Err(); err != nil {
+					t.Fatalf("neighboring set2 failed: %v", err)
+				}
+			})
+			for i, hook := range hooks {
+				hook.mu.Lock()
+				direct, pipelined := hook.direct["ping"], hook.pipeline["ping"]
+				hook.mu.Unlock()
+				if direct != tc.unordered || pipelined {
+					t.Fatalf("master %d: PING direct=%v pipelined=%v; want direct=%v and no pipelining", i, direct, pipelined, tc.unordered)
+				}
+			}
+			values, err := c.MGet(ctx, key1, key2).Result()
+			if err != nil || len(values) != 2 || values[0] != "v1" || values[1] != "v2" {
+				t.Fatalf("neighboring writes = %v, %v; want [v1 v2]", values, err)
+			}
+		})
 	}
-	markNonPipelinable(c, "getdel")
-
-	ap, err := c.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
-		MaxBatchSize:  100,
-		MaxFlushDelay: 20 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	runWithWatchdog(t, 30*time.Second, func() {
-		set1 := ap.Set(ctx, "apnp:{a}:1", "v1", 0)
-		bad := ap.GetDel(ctx, "apnp:{a}:marked")
-		set2 := ap.Set(ctx, "apnp:{a}:2", "v2", 0)
-
-		if err := bad.Err(); err == nil || !strings.Contains(err.Error(), "cannot pipeline command") {
-			t.Fatalf("marked command: err = %v, want the request-policy rejection", err)
-		}
-		if err := set1.Err(); err != nil {
-			t.Fatalf("batch-mate set1 poisoned: %v", err)
-		}
-		if err := set2.Err(); err != nil {
-			t.Fatalf("batch-mate set2 poisoned: %v", err)
-		}
-	})
 }
 
 // Regression: reading a Submit()-ed command's result accessors BEFORE calling
@@ -4350,7 +4522,7 @@ func TestAPClusterNonPipelinableRejectedAtSubmit(t *testing.T) {
 // -race on the unfixed code).
 func TestAutoPipelineSubmitReadBeforeWait(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -4396,6 +4568,7 @@ func (h batchSizeRecordingHook) ProcessHook(next redis.ProcessHook) redis.Proces
 		return next(ctx, cmd)
 	}
 }
+
 func (h batchSizeRecordingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		n := 0
@@ -4424,7 +4597,7 @@ func TestAutoPipelineMaxBatchBytes(t *testing.T) {
 	value := strings.Repeat("x", payload)
 
 	run := func(maxBytes int) []int {
-		client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+		client := redis.NewClient(apTestOptions())
 		defer client.Close()
 		if err := client.Ping(ctx).Err(); err != nil {
 			t.Skipf("no redis: %v", err)
@@ -4477,7 +4650,10 @@ func TestAutoPipelineMaxBatchBytes(t *testing.T) {
 			t.Fatalf("capped run had a %d-command batch (%v) — cap not enforced", maxBatch, capped)
 		}
 
-		uncapped := run(0)
+		// 0 no longer means "uncapped" (it now gets the 128 KiB default
+		// guardrail — see MaxBatchBytes's GoDoc); opt out explicitly with a
+		// value comfortably above this run's total payload (10 x 64 KiB).
+		uncapped := run(10 * 1024 * 1024)
 		utotal := 0
 		for _, n := range uncapped {
 			utotal += n
@@ -4502,6 +4678,7 @@ func (h panicPipelineHook) DialHook(next redis.DialHook) redis.DialHook { return
 func (h panicPipelineHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return next
 }
+
 func (h panicPipelineHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		if h.armed.Load() {
@@ -4518,7 +4695,7 @@ func (h panicPipelineHook) ProcessPipelineHook(next redis.ProcessPipelineHook) r
 // descriptive error, and the engine must stay usable afterwards.
 func TestAutoPipelinePanicInDispatchWakesWaiters(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -4562,7 +4739,7 @@ func TestAutoPipelinePanicInDispatchWakesWaiters(t *testing.T) {
 // the executed result.
 func TestAPBlockingContextCancelDoesNotCancelExecution(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -4596,7 +4773,7 @@ func TestAPBlockingContextCancelDoesNotCancelExecution(t *testing.T) {
 // inline, so an async ap.BLPop froze the caller for the full block duration.
 func TestAsyncAutoPipelineBlockingCommandDoesNotStallSubmit(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -4628,7 +4805,7 @@ func TestAsyncAutoPipelineBlockingCommandDoesNotStallSubmit(t *testing.T) {
 // building fresh flushers against dead pools.
 func TestWithTimeoutCloneCloseBlocksParentResurrection(t *testing.T) {
 	ctx := context.Background()
-	parent := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	parent := redis.NewClient(apTestOptions())
 	if err := parent.Ping(ctx).Err(); err != nil {
 		parent.Close()
 		t.Skipf("no redis: %v", err)
@@ -4655,7 +4832,7 @@ func TestWithTimeoutCloneCloseBlocksParentResurrection(t *testing.T) {
 // dispatch at a time (codex on #3942).
 func TestWithTimeoutCloneCloseStopsCachedAutoPipeliner(t *testing.T) {
 	ctx := context.Background()
-	parent := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	parent := redis.NewClient(apTestOptions())
 	if err := parent.Ping(ctx).Err(); err != nil {
 		parent.Close()
 		t.Skipf("no redis: %v", err)
@@ -4694,9 +4871,7 @@ func TestAPClusterWideCommandsDelegate(t *testing.T) {
 	ctx := context.Background()
 	c := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{":16600", ":16601", ":16602"}})
 	defer c.Close()
-	if err := c.Ping(ctx).Err(); err != nil {
-		t.Skipf("no cluster: %v", err)
-	}
+	skipIfClusterUnhealthy(t, c)
 	ap, err := c.AsyncAutoPipeline()
 	if err != nil {
 		t.Fatal(err)
@@ -4739,7 +4914,7 @@ func TestAPClusterWideCommandsDelegate(t *testing.T) {
 // also calls String and relies on the dispatch-gid guard in await.
 func TestAsyncCommandStringAwaits(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	client := redis.NewClient(apTestOptions())
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skipf("no redis: %v", err)
@@ -4790,11 +4965,1168 @@ func (h gateHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		return next(ctx, cmd)
 	}
 }
+
 func (h gateHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		if h.armed.Load() {
 			<-h.gate
 		}
 		return next(ctx, cmds)
+	}
+}
+
+// ===== from autopipeline_fd_shards_test.go =====
+
+// With N full-duplex engines on one client, every reply must
+// still be the reply to its own command. Mis-correlation is the failure mode
+// that matters -- N engines means N independent FIFO streams, and a command
+// routed to engine A whose reply is read off engine B would corrupt data
+// silently rather than error.
+//
+// Requires a local server (apTestAddr: REDIS_PORT, default 6379).
+
+func TestFDShardsReplyCorrelation(t *testing.T) {
+	ctx := context.Background()
+	cl := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	defer cl.Close()
+	if err := cl.Ping(ctx).Err(); err != nil {
+		t.Skipf("no local redis: %v", err)
+	}
+
+	shards := 8
+	if v := os.Getenv("FD_SHARDS"); v != "" {
+		// Overridable so the same test can run at ONE engine, which is how the
+		// silent half-duplex fallback was first caught: 1 passed, 8 failed.
+		shards, _ = strconv.Atoi(v)
+	}
+	ap, err := cl.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		FullDuplex:           true,
+		NumShards:            shards,
+		MaxConcurrentBatches: 1,
+	})
+	if err != nil {
+		t.Fatalf("construct: %v", err)
+	}
+	defer ap.Close()
+
+	// Each key's value encodes the key, so a reply landing on the wrong command
+	// is caught rather than merely suspected.
+	const keys = 2000
+	for i := 0; i < keys; i++ {
+		k := fmt.Sprintf("fdshards:{%d}", i)
+		if err := ap.Set(ctx, k, fmt.Sprintf("val-%d", i), 0).Err(); err != nil {
+			t.Fatalf("set %d: %v", i, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, keys)
+	for w := 0; w < 64; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := w; i < keys; i += 64 {
+				k := fmt.Sprintf("fdshards:{%d}", i)
+				want := fmt.Sprintf("val-%d", i)
+				got, err := ap.Get(ctx, k).Result()
+				if err != nil {
+					errs <- fmt.Errorf("get %s: %w", k, err)
+					return
+				}
+				if got != want {
+					errs <- fmt.Errorf("MIS-CORRELATED: %s got %q want %q", k, got, want)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	n := 0
+	for e := range errs {
+		if n < 5 {
+			t.Error(e)
+		}
+		n++
+	}
+	if n > 0 {
+		t.Fatalf("%d correlation failures across %d keys", n, keys)
+	}
+
+	// Per-caller ordering on the deferred face: write then read the SAME key
+	// without waiting in between. Key routing must put both on one engine.
+	for i := 0; i < 500; i++ {
+		k := fmt.Sprintf("fdshards:order:{%d}", i)
+		setF := ap.Set(ctx, k, "second", 0)
+		getF := ap.Get(ctx, k)
+		if err := setF.Err(); err != nil {
+			t.Fatalf("ordered set: %v", err)
+		}
+		got, err := getF.Result()
+		if err != nil {
+			t.Fatalf("ordered get: %v", err)
+		}
+		if got != "second" {
+			t.Fatalf("ORDER VIOLATION at %s: got %q, want the value written just before it", k, got)
+		}
+	}
+	t.Logf("ok: %d keys correlated, 500 same-key write-then-read ordered, %d engines", keys, shards)
+}
+
+// The two-sited rule: NumShards>1 under FullDuplex must actually ENGAGE full
+// duplex, not fall back to half-duplex shards. Config() reports the EFFECTIVE
+// state, so a fallback surfaces as FullDuplex:false.
+func TestFDShardsKeepsFullDuplexOn(t *testing.T) {
+	ctx := context.Background()
+	cl := redis.NewClient(&redis.Options{Addr: apTestAddr()})
+	defer cl.Close()
+	if err := cl.Ping(ctx).Err(); err != nil {
+		t.Skipf("no local redis: %v", err)
+	}
+	ap, err := cl.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		FullDuplex:           true,
+		NumShards:            8,
+		MaxConcurrentBatches: 1,
+	})
+	if err != nil {
+		t.Fatalf("construct: %v", err)
+	}
+	defer ap.Close()
+	if got := ap.Config(); !got.FullDuplex {
+		t.Fatal("FullDuplex reported false with NumShards=8: the engine fell back " +
+			"to half-duplex shards, which are unordered")
+	}
+}
+
+// Full duplex that cannot engage (no pipeline pool) falls back to round-robin
+// half-duplex shards, which do not keep submit order. The NumShards>1 ordering
+// check must then apply: the FullDuplex exemption follows the effective state,
+// not the requested one. Construction only, so no server is needed.
+func TestFDShardsFallbackStillNeedsUnordered(t *testing.T) {
+	cl := redis.NewClient(&redis.Options{
+		Addr:             apTestAddr(),
+		PipelinePoolSize: -1,
+	})
+	defer cl.Close()
+	ap, err := cl.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		FullDuplex:           true,
+		NumShards:            2,
+		MaxConcurrentBatches: 1,
+	})
+	if err == nil {
+		ap.Close()
+		t.Fatal("FullDuplex without a pipeline pool fell back to round-robin shards " +
+			"without the Unordered opt-in")
+	}
+	if !strings.Contains(err.Error(), "Unordered") {
+		t.Fatalf("error should name the Unordered opt-in, got: %v", err)
+	}
+}
+
+// More engines than the pipeline pool can hold must fail at construction rather
+// than leave the surplus spilling to the main pool for the client's lifetime.
+func TestFDShardsRejectsMoreEnginesThanPool(t *testing.T) {
+	ctx := context.Background()
+	cl := redis.NewClient(&redis.Options{
+		Addr:             apTestAddr(),
+		PipelinePoolSize: 4,
+	})
+	defer cl.Close()
+	if err := cl.Ping(ctx).Err(); err != nil {
+		t.Skipf("no local redis: %v", err)
+	}
+	_, err := cl.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		FullDuplex:           true,
+		NumShards:            8,
+		MaxConcurrentBatches: 1,
+	})
+	if err == nil {
+		t.Fatal("expected NumShards=8 with PipelinePoolSize=4 to be rejected")
+	}
+	if !strings.Contains(err.Error(), "pipeline pool") {
+		t.Fatalf("error should name the pipeline pool, got: %v", err)
+	}
+}
+
+// ===== from autopipeline_truth_test.go =====
+
+// Truth battery: adversarial end-to-end validation of the AutoPipeliner's
+// core contracts against a live server — per-goroutine ORDER, exact RESPONSE
+// demultiplexing, no lost/duplicated executions — under both faces, ordered
+// and unordered configs, chunked dispatch, mid-flight cancellation and
+// close-drain. Written for the PR #3942 validation pass; every test derives
+// an independent ground truth (a model value computed client-side, or a
+// differential run against a plain client) rather than trusting the engine's
+// own accounting.
+
+func truthAddr() string { return apTestAddr() }
+
+func newTruthClient(t *testing.T) *redis.Client {
+	t.Helper()
+	c := redis.NewClient(&redis.Options{Addr: truthAddr(), PoolSize: 64})
+	if err := c.Ping(context.Background()).Err(); err != nil {
+		c.Close()
+		t.Skipf("no redis: %v", err)
+	}
+	return c
+}
+
+// TestTruthBlockingPerGoroutineOrder pins the blocking face's ordering
+// contract with a server-side proof: each goroutine RPUSHes its own strictly
+// increasing sequence through a SHARED autopipeliner; the list on the server
+// is the ground truth and must come back exactly 0..M-1 for every goroutine.
+func TestTruthBlockingPerGoroutineOrder(t *testing.T) {
+	ctx := context.Background()
+	client := newTruthClient(t)
+	defer client.Close()
+	client.FlushDB(ctx)
+	ap, err := client.AutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		MaxBatchSize: 64, MaxConcurrentBatches: 8, Unordered: true, NumShards: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const G, M = 64, 200
+	runWithWatchdog(t, 60*time.Second, func() {
+		var wg sync.WaitGroup
+		for g := 0; g < G; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				key := "order:blocking:" + strconv.Itoa(g)
+				for i := 0; i < M; i++ {
+					if err := ap.RPush(ctx, key, i).Err(); err != nil {
+						t.Errorf("g%d rpush %d: %v", g, i, err)
+						return
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+	})
+	for g := 0; g < G; g++ {
+		vals, err := client.LRange(ctx, "order:blocking:"+strconv.Itoa(g), 0, -1).Result()
+		if err != nil {
+			t.Fatalf("lrange g%d: %v", g, err)
+		}
+		if len(vals) != M {
+			t.Fatalf("g%d: %d elements, want %d (lost or duplicated commands)", g, len(vals), M)
+		}
+		for i, v := range vals {
+			if v != strconv.Itoa(i) {
+				t.Fatalf("g%d: position %d = %q, want %d (per-goroutine order violated)", g, i, v, i)
+			}
+		}
+	}
+}
+
+// TestTruthAsyncOrderedSingleGoroutine pins the deferred face's ordering on
+// the ORDERED default config: one goroutine submits an increasing sequence
+// without awaiting; the server-side list must be exactly in submit order,
+// and a read submitted after a write in the same window must observe it.
+func TestTruthAsyncOrderedSingleGoroutine(t *testing.T) {
+	ctx := context.Background()
+	client := newTruthClient(t)
+	defer client.Close()
+	client.FlushDB(ctx)
+	ap, err := client.AsyncAutoPipeline() // ordered default
+	if err != nil {
+		t.Fatal(err)
+	}
+	const N = 3000
+	runWithWatchdog(t, 60*time.Second, func() {
+		cmds := make([]*redis.IntCmd, N)
+		for i := 0; i < N; i++ {
+			cmds[i] = ap.RPush(ctx, "order:async", i)
+		}
+		// read-your-write inside the window: SET then GET, same key, no await
+		// between them.
+		set := ap.Set(ctx, "order:ryw", "written", 0)
+		get := ap.Get(ctx, "order:ryw")
+		for i, c := range cmds {
+			if err := c.Err(); err != nil {
+				t.Fatalf("rpush %d: %v", i, err)
+			}
+		}
+		if err := set.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if v, err := get.Result(); err != nil || v != "written" {
+			t.Fatalf("read-your-write: v=%q err=%v, want %q", v, err, "written")
+		}
+	})
+	vals, err := client.LRange(ctx, "order:async", 0, -1).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vals) != N {
+		t.Fatalf("%d elements, want %d", len(vals), N)
+	}
+	for i, v := range vals {
+		if v != strconv.Itoa(i) {
+			t.Fatalf("position %d = %q, want %d (submit order violated on ordered face)", i, v, i)
+		}
+	}
+}
+
+// TestTruthResponseDemux pins reply demultiplexing: every one of G*M GETs
+// must return exactly the unique payload its OWN goroutine wrote — any
+// cross-wiring of replies between commands or goroutines fails loudly.
+// Run on the most adversarial config: unordered, striped, parallel batches.
+func TestTruthResponseDemux(t *testing.T) {
+	ctx := context.Background()
+	client := newTruthClient(t)
+	defer client.Close()
+	client.FlushDB(ctx)
+	ap, err := client.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		MaxBatchSize: 128, MaxConcurrentBatches: 32, Unordered: true, NumShards: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const G, M = 100, 300
+	// Unordered config: a GET may overtake its own SET by design, so the
+	// phases are separated — all writes awaited, then all reads. The demux
+	// property under test is untouched: every reply must match its OWN
+	// command's unique payload.
+	runWithWatchdog(t, 120*time.Second, func() {
+		var wg sync.WaitGroup
+		for g := 0; g < G; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				sets := make([]*redis.StatusCmd, M)
+				for i := 0; i < M; i++ {
+					key := fmt.Sprintf("demux:%d:%d", g, i)
+					want := fmt.Sprintf("payload|g=%d|i=%d|%x", g, i, g*1_000_003+i*7919)
+					sets[i] = ap.Set(ctx, key, want, 0)
+				}
+				for i, s := range sets {
+					if err := s.Err(); err != nil {
+						t.Errorf("set g%d i%d: %v", g, i, err)
+						return
+					}
+				}
+				gets := make([]*redis.StringCmd, M)
+				for i := 0; i < M; i++ {
+					gets[i] = ap.Get(ctx, fmt.Sprintf("demux:%d:%d", g, i))
+				}
+				for i, gc := range gets {
+					want := fmt.Sprintf("payload|g=%d|i=%d|%x", g, i, g*1_000_003+i*7919)
+					got, err := gc.Result()
+					if err != nil {
+						t.Errorf("get g%d i%d: %v", g, i, err)
+						return
+					}
+					if got != want {
+						t.Errorf("DEMUX VIOLATION g%d i%d: got %q want %q", g, i, got, want)
+						return
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+	})
+}
+
+// TestTruthOrderedPairsAcrossGoroutines pins per-goroutine read-your-write
+// on the ORDERED default config with many goroutines sharing the pipeliner:
+// each goroutine interleaves SET/GET pairs on its own keys without any
+// barrier — the ordered face must preserve each goroutine's submit order.
+func TestTruthOrderedPairsAcrossGoroutines(t *testing.T) {
+	ctx := context.Background()
+	client := newTruthClient(t)
+	defer client.Close()
+	client.FlushDB(ctx)
+	ap, err := client.AsyncAutoPipeline() // ordered default
+	if err != nil {
+		t.Fatal(err)
+	}
+	const G, M = 64, 150
+	runWithWatchdog(t, 120*time.Second, func() {
+		var wg sync.WaitGroup
+		for g := 0; g < G; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				for i := 0; i < M; i++ {
+					key := fmt.Sprintf("pair:%d:%d", g, i)
+					want := fmt.Sprintf("v|%d|%d", g, i)
+					set := ap.Set(ctx, key, want, 0)
+					get := ap.Get(ctx, key) // no await between: ordered face must sequence
+					if err := set.Err(); err != nil {
+						t.Errorf("set g%d i%d: %v", g, i, err)
+						return
+					}
+					got, err := get.Result()
+					if err != nil || got != want {
+						t.Errorf("ORDER VIOLATION g%d i%d: got %q err=%v want %q", g, i, got, err, want)
+						return
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+	})
+}
+
+// TestTruthCountersExact pins no-lost-no-duplicated execution: G goroutines
+// INCRBY random deltas on one shared counter; the client-side sum is the
+// ground truth and the final server value must equal it exactly. A dropped
+// command, a duplicated retry, or a misrouted reply cannot pass.
+func TestTruthCountersExact(t *testing.T) {
+	ctx := context.Background()
+	client := newTruthClient(t)
+	defer client.Close()
+	client.FlushDB(ctx)
+	for _, cfg := range []struct {
+		name string
+		opts *redis.AutoPipelineOptions
+	}{
+		{"ordered-default", nil},
+		{"unordered-parallel", &redis.AutoPipelineOptions{MaxBatchSize: 200, MaxConcurrentBatches: 40, Unordered: true, NumShards: 8}},
+		{"tiny-batches", &redis.AutoPipelineOptions{MaxBatchSize: 2, MaxConcurrentBatches: 4, Unordered: true}},
+	} {
+		t.Run(cfg.name, func(t *testing.T) {
+			var ap *redis.AutoPipeliner
+			var err error
+			if cfg.opts == nil {
+				ap, err = client.AsyncAutoPipeline()
+			} else {
+				ap, err = client.AsyncAutoPipelineWithOptions(cfg.opts)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := "counter:" + cfg.name
+			client.Del(ctx, key)
+			const G, M = 50, 200
+			var wantTotal atomic.Int64
+			runWithWatchdog(t, 90*time.Second, func() {
+				var wg sync.WaitGroup
+				for g := 0; g < G; g++ {
+					wg.Add(1)
+					go func(g int) {
+						defer wg.Done()
+						rng := rand.New(rand.NewSource(int64(g)*7919 + 1))
+						futs := make([]*redis.IntCmd, M)
+						deltas := make([]int64, M)
+						for i := 0; i < M; i++ {
+							deltas[i] = rng.Int63n(1000) - 500
+							futs[i] = ap.IncrBy(ctx, key, deltas[i])
+						}
+						for i, f := range futs {
+							if err := f.Err(); err != nil {
+								t.Errorf("incrby: %v", err)
+								return
+							}
+							wantTotal.Add(deltas[i])
+						}
+					}(g)
+				}
+				wg.Wait()
+			})
+			got, err := client.Get(ctx, key).Int64()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != wantTotal.Load() {
+				t.Fatalf("counter drift: server=%d client-sum=%d (lost or duplicated executions)", got, wantTotal.Load())
+			}
+		})
+	}
+}
+
+// TestTruthDifferentialVsPlainClient runs an identical randomized mixed
+// workload through a plain client (the model) and the autopipeliner (the
+// subject) on disjoint keyspaces, then diffs the full keyspace dumps. Any
+// divergence in values, hashes, or list contents is an engine correctness
+// bug by construction.
+func TestTruthDifferentialVsPlainClient(t *testing.T) {
+	ctx := context.Background()
+	client := newTruthClient(t)
+	defer client.Close()
+	client.FlushDB(ctx)
+	ap, err := client.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		MaxBatchSize: 100, MaxConcurrentBatches: 16, Unordered: true, NumShards: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type op struct {
+		kind       int
+		key, field string
+		val        int64
+	}
+	const G, M = 32, 150
+	plans := make([][]op, G)
+	for g := 0; g < G; g++ {
+		rng := rand.New(rand.NewSource(int64(g) + 42))
+		plans[g] = make([]op, M)
+		for i := range plans[g] {
+			plans[g][i] = op{
+				kind:  rng.Intn(4),
+				key:   strconv.Itoa(rng.Intn(20)), // few keys -> heavy contention
+				field: "f" + strconv.Itoa(rng.Intn(5)),
+				val:   rng.Int63n(100),
+			}
+		}
+	}
+	run := func(prefix string, exec redis.Cmdable) {
+		var wg sync.WaitGroup
+		for g := 0; g < G; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				for _, o := range plans[g] {
+					key := prefix + o.key
+					var err error
+					switch o.kind {
+					case 0:
+						err = exec.IncrBy(ctx, key+":c", o.val).Err()
+					case 1:
+						err = exec.HIncrBy(ctx, key+":h", o.field, o.val).Err()
+					case 2:
+						err = exec.SAdd(ctx, key+":s", o.val).Err()
+					case 3:
+						err = exec.RPush(ctx, key+":l:"+strconv.Itoa(g), o.val).Err()
+					}
+					if err != nil {
+						t.Errorf("%s op: %v", prefix, err)
+						return
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+	}
+	runWithWatchdog(t, 120*time.Second, func() {
+		run("model:", client) // plain client = the model
+		run("subject:", ap)   // autopipeliner = the subject
+	})
+	dump := func(prefix string) map[string]string {
+		out := map[string]string{}
+		keys, err := client.Keys(ctx, prefix+"*").Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range keys {
+			short := strings.TrimPrefix(k, prefix)
+			switch typ := client.Type(ctx, k).Val(); typ {
+			case "string":
+				out[short] = client.Get(ctx, k).Val()
+			case "hash":
+				out[short] = fmt.Sprint(client.HGetAll(ctx, k).Val())
+			case "set":
+				vals, _ := client.SMembers(ctx, k).Result()
+				m := map[string]bool{}
+				for _, v := range vals {
+					m[v] = true
+				}
+				out[short] = fmt.Sprint(len(m)) // set cardinality (order-free)
+			case "list":
+				out[short] = strings.Join(client.LRange(ctx, k, 0, -1).Val(), ",")
+			default:
+				out[short] = "type:" + typ
+			}
+		}
+		return out
+	}
+	model, subject := dump("model:"), dump("subject:")
+	if len(model) != len(subject) {
+		t.Fatalf("keyspace size differs: model=%d subject=%d", len(model), len(subject))
+	}
+	for k, mv := range model {
+		if sv, ok := subject[k]; !ok || sv != mv {
+			t.Errorf("DIVERGENCE key %q: model=%q subject=%q", k, mv, sv)
+		}
+	}
+}
+
+// TestTruthChunkedDispatchIntegrity drives the MaxBatchBytes chunked path
+// with values large enough to split every drain into several chunks and
+// verifies exact payload echo — chunk boundaries must not tear, reorder, or
+// cross-wire replies.
+func TestTruthChunkedDispatchIntegrity(t *testing.T) {
+	ctx := context.Background()
+	client := newTruthClient(t)
+	defer client.Close()
+	client.FlushDB(ctx)
+	ap, err := client.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		MaxBatchSize: 500, MaxConcurrentBatches: 8, Unordered: true,
+		MaxBatchBytes: 64 * 1024, // ~4 x 16KiB values per chunk
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const G, M = 16, 40
+	base := strings.Repeat("x", 16*1024)
+	runWithWatchdog(t, 120*time.Second, func() {
+		var wg sync.WaitGroup
+		for g := 0; g < G; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				sets := make([]*redis.StatusCmd, M)
+				for i := 0; i < M; i++ {
+					key := fmt.Sprintf("chunk:%d:%d", g, i)
+					want := fmt.Sprintf("%s|tail=%d:%d", base, g, i)
+					sets[i] = ap.Set(ctx, key, want, 0)
+				}
+				for i, s := range sets {
+					if err := s.Err(); err != nil {
+						t.Errorf("set g%d i%d: %v", g, i, err)
+						return
+					}
+				}
+				for i := 0; i < M; i++ {
+					key := fmt.Sprintf("chunk:%d:%d", g, i)
+					want := fmt.Sprintf("%s|tail=%d:%d", base, g, i)
+					got, err := ap.Get(ctx, key).Result()
+					if err != nil {
+						t.Errorf("get %s: %v", key, err)
+						return
+					}
+					if got != want {
+						t.Errorf("CHUNK TEAR %s: got %d bytes tail %q, want %d bytes", key, len(got), got[len(got)-24:], len(want))
+						return
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+	})
+}
+
+// TestTruthCancelNeverLies pins cancellation semantics: a context canceled
+// mid-flight may fail the WAIT, but any command that reports success must
+// have really executed, and any that reports an error must not have half a
+// result. Verified by re-reading the keyspace with a fresh context.
+func TestTruthCancelNeverLies(t *testing.T) {
+	ctx := context.Background()
+	client := newTruthClient(t)
+	defer client.Close()
+	client.FlushDB(ctx)
+	ap, err := client.AsyncAutoPipeline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const N = 2000
+	runWithWatchdog(t, 60*time.Second, func() {
+		cctx, cancel := context.WithCancel(ctx)
+		futs := make([]*redis.StatusCmd, N)
+		for i := 0; i < N; i++ {
+			futs[i] = ap.Set(cctx, "cancel:"+strconv.Itoa(i), "v"+strconv.Itoa(i), 0)
+			if i == N/2 {
+				cancel()
+			}
+		}
+		okCount, errCount := 0, 0
+		for i, f := range futs {
+			if err := f.Err(); err == nil {
+				okCount++
+				// claimed success must be true on the server
+				v, gerr := client.Get(ctx, "cancel:"+strconv.Itoa(i)).Result()
+				if gerr != nil || v != "v"+strconv.Itoa(i) {
+					t.Fatalf("cmd %d reported OK but server has %q/%v", i, v, gerr)
+				}
+			} else {
+				errCount++
+			}
+		}
+		t.Logf("cancel split: %d ok, %d error (both outcomes legal; lies are not)", okCount, errCount)
+		cancel()
+	})
+}
+
+// TestTruthCloseDrains pins Close's drain contract under load: every future
+// submitted BEFORE Close returns a definite outcome (value or error, no
+// hang), and successes are really on the server.
+func TestTruthCloseDrains(t *testing.T) {
+	ctx := context.Background()
+	client := newTruthClient(t)
+	defer client.Close()
+	client.FlushDB(ctx)
+	ap, err := client.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		MaxBatchSize: 64, MaxConcurrentBatches: 8, Unordered: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const N = 5000
+	runWithWatchdog(t, 60*time.Second, func() {
+		futs := make([]*redis.StatusCmd, N)
+		for i := 0; i < N; i++ {
+			futs[i] = ap.Set(ctx, "drain:"+strconv.Itoa(i), "v", 0)
+		}
+		if err := ap.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		okCount := 0
+		for i, f := range futs {
+			if err := f.Err(); err == nil {
+				okCount++
+			} else if err != redis.ErrClosed {
+				t.Fatalf("future %d: unexpected error %v", i, err)
+			}
+		}
+		// Every claimed success must exist server-side.
+		var present int64
+		for i := 0; i < N; i++ {
+			if client.Exists(ctx, "drain:"+strconv.Itoa(i)).Val() == 1 {
+				present++
+			}
+		}
+		if int(present) < okCount {
+			t.Fatalf("%d futures claimed OK but only %d keys present", okCount, present)
+		}
+		t.Logf("close drain: %d/%d confirmed executed, rest cleanly rejected", okCount, N)
+	})
+}
+
+// TestTruthClusterOrderAndDemux repeats the order and demux proofs against a
+// live cluster through the sharded autopipeliner: per-goroutine order on
+// hashtagged keys (one slot per goroutine, so order is meaningful) and exact
+// payload echo across slot-spread keys.
+func TestTruthClusterOrderAndDemux(t *testing.T) {
+	ctx := context.Background()
+	cc := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{":16600", ":16601", ":16602"}})
+	defer cc.Close()
+	skipIfClusterUnhealthy(t, cc)
+	for _, n := range []string{":16600", ":16601", ":16602"} {
+		nc := redis.NewClient(&redis.Options{Addr: n})
+		nc.FlushDB(ctx)
+		nc.Close()
+	}
+	ap, err := cc.AsyncAutoPipeline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const G, M = 32, 100
+	runWithWatchdog(t, 120*time.Second, func() {
+		var wg sync.WaitGroup
+		for g := 0; g < G; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				// order proof: hashtag pins the goroutine's list to one slot
+				key := fmt.Sprintf("{ord%d}:list", g)
+				futs := make([]*redis.IntCmd, M)
+				for i := 0; i < M; i++ {
+					futs[i] = ap.RPush(ctx, key, i)
+				}
+				for i, f := range futs {
+					if err := f.Err(); err != nil {
+						t.Errorf("g%d rpush %d: %v", g, i, err)
+						return
+					}
+				}
+				// demux proof: slot-spread unique echoes, phase-separated
+				sets := make([]*redis.StatusCmd, M)
+				for i := 0; i < M; i++ {
+					sets[i] = ap.Set(ctx, fmt.Sprintf("cdemux:%d:%d", g, i), fmt.Sprintf("p|%d|%d", g, i), 0)
+				}
+				for i, s := range sets {
+					if err := s.Err(); err != nil {
+						t.Errorf("g%d set %d: %v", g, i, err)
+						return
+					}
+				}
+				for i := 0; i < M; i++ {
+					want := fmt.Sprintf("p|%d|%d", g, i)
+					got, err := ap.Get(ctx, fmt.Sprintf("cdemux:%d:%d", g, i)).Result()
+					if err != nil || got != want {
+						t.Errorf("CLUSTER DEMUX g%d i%d: got %q err=%v want %q", g, i, got, err, want)
+						return
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+	})
+	for g := 0; g < G; g++ {
+		vals, err := cc.LRange(ctx, fmt.Sprintf("{ord%d}:list", g), 0, -1).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(vals) != M {
+			t.Fatalf("cluster g%d: %d elements want %d", g, len(vals), M)
+		}
+		for i, v := range vals {
+			if v != strconv.Itoa(i) {
+				t.Fatalf("CLUSTER ORDER g%d: pos %d = %q want %d", g, i, v, i)
+			}
+		}
+	}
+}
+
+// TestTruthRESP2Demux repeats the demultiplexing proof on RESP2, where
+// replies carry no push-frame framing and a desynchronized stream shows up
+// as cross-wired values rather than a protocol error.
+func TestTruthRESP2Demux(t *testing.T) {
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: truthAddr(), Protocol: 2, PoolSize: 32})
+	defer client.Close()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Skipf("no redis: %v", err)
+	}
+	client.FlushDB(ctx)
+	ap, err := client.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		MaxBatchSize: 100, MaxConcurrentBatches: 16, Unordered: true, NumShards: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const G, M = 40, 150
+	runWithWatchdog(t, 90*time.Second, func() {
+		var wg sync.WaitGroup
+		for g := 0; g < G; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				sets := make([]*redis.StatusCmd, M)
+				for i := 0; i < M; i++ {
+					sets[i] = ap.Set(ctx, fmt.Sprintf("r2:%d:%d", g, i), fmt.Sprintf("v|%d|%d", g, i), 0)
+				}
+				for _, s := range sets {
+					if err := s.Err(); err != nil {
+						t.Errorf("resp2 set: %v", err)
+						return
+					}
+				}
+				// mixed reply SHAPES in one batch: string, integer, array,
+				// hash, nil — a demux slip shows up as a type/shape mismatch.
+				for i := 0; i < M; i++ {
+					key := fmt.Sprintf("r2:%d:%d", g, i)
+					sv := ap.Get(ctx, key)
+					iv := ap.StrLen(ctx, key)
+					av := ap.LRange(ctx, "r2:missing:list", 0, -1)
+					nv := ap.Get(ctx, "r2:missing:key")
+					want := fmt.Sprintf("v|%d|%d", g, i)
+					if got, err := sv.Result(); err != nil || got != want {
+						t.Errorf("RESP2 string demux g%d i%d: %q %v", g, i, got, err)
+						return
+					}
+					if got, err := iv.Result(); err != nil || got != int64(len(want)) {
+						t.Errorf("RESP2 int demux g%d i%d: %d %v want %d", g, i, got, err, len(want))
+						return
+					}
+					if got, err := av.Result(); err != nil || len(got) != 0 {
+						t.Errorf("RESP2 array demux g%d i%d: %v %v", g, i, got, err)
+						return
+					}
+					if _, err := nv.Result(); err != redis.Nil {
+						t.Errorf("RESP2 nil demux g%d i%d: err=%v want redis.Nil", g, i, err)
+						return
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+	})
+}
+
+// TestTruthPipelinePoolInterleaving runs the autopipeliner against a client
+// configured with the DEDICATED pipeline pool while a plain client hammers
+// the same server through the regular pool: batched traffic and single
+// commands must not contaminate each other's connections.
+func TestTruthPipelinePoolInterleaving(t *testing.T) {
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{
+		Addr: truthAddr(), PoolSize: 32,
+		PipelineReadBufferSize: 128 << 10, PipelineWriteBufferSize: 128 << 10,
+		PipelinePoolSize: 4,
+	})
+	defer client.Close()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Skipf("no redis: %v", err)
+	}
+	client.FlushDB(ctx)
+	ap, err := client.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		MaxBatchSize: 128, MaxConcurrentBatches: 16, Unordered: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const G, M = 24, 200
+	runWithWatchdog(t, 120*time.Second, func() {
+		var wg sync.WaitGroup
+		// plain-client noise on the regular pool
+		stop := make(chan struct{})
+		for n := 0; n < 8; n++ {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				for i := 0; ; i++ {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					key := fmt.Sprintf("noise:%d", n)
+					want := fmt.Sprintf("n|%d|%d", n, i)
+					if err := client.Set(ctx, key, want, 0).Err(); err != nil {
+						t.Errorf("noise set: %v", err)
+						return
+					}
+					if got, err := client.Get(ctx, key).Result(); err != nil || got != want {
+						t.Errorf("NOISE CONTAMINATION: got %q err=%v want %q", got, err, want)
+						return
+					}
+				}
+			}(n)
+		}
+		// autopipelined traffic on the pipeline pool
+		var apWg sync.WaitGroup
+		for g := 0; g < G; g++ {
+			apWg.Add(1)
+			go func(g int) {
+				defer apWg.Done()
+				sets := make([]*redis.StatusCmd, M)
+				for i := 0; i < M; i++ {
+					sets[i] = ap.Set(ctx, fmt.Sprintf("pp:%d:%d", g, i), fmt.Sprintf("p|%d|%d", g, i), 0)
+				}
+				for _, s := range sets {
+					if err := s.Err(); err != nil {
+						t.Errorf("pp set: %v", err)
+						return
+					}
+				}
+				for i := 0; i < M; i++ {
+					want := fmt.Sprintf("p|%d|%d", g, i)
+					got, err := ap.Get(ctx, fmt.Sprintf("pp:%d:%d", g, i)).Result()
+					if err != nil || got != want {
+						t.Errorf("PIPELINE POOL DEMUX g%d i%d: got %q err=%v want %q", g, i, got, err, want)
+						return
+					}
+				}
+			}(g)
+		}
+		apWg.Wait()
+		close(stop)
+		wg.Wait()
+	})
+}
+
+// TestTruthRetriesDoNotDuplicate pins at-most-once execution across the
+// engine's retry machinery: non-idempotent INCRs run through an
+// autopipeliner whose client has retries ENABLED while the server is
+// pounded concurrently; the final counter must equal the exact number of
+// successful futures — a retried batch that re-executed a committed command
+// would overshoot.
+func TestTruthRetriesDoNotDuplicate(t *testing.T) {
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: truthAddr(), PoolSize: 32, MaxRetries: 3})
+	defer client.Close()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Skipf("no redis: %v", err)
+	}
+	client.FlushDB(ctx)
+	ap, err := client.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{
+		MaxBatchSize: 64, MaxConcurrentBatches: 16, Unordered: true, NumShards: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const G, M = 40, 250
+	var okCount atomic.Int64
+	runWithWatchdog(t, 120*time.Second, func() {
+		var wg sync.WaitGroup
+		for g := 0; g < G; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				futs := make([]*redis.IntCmd, M)
+				for i := 0; i < M; i++ {
+					futs[i] = ap.Incr(ctx, "retry:counter")
+				}
+				for _, f := range futs {
+					if err := f.Err(); err == nil {
+						okCount.Add(1)
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+	})
+	got, err := client.Get(ctx, "retry:counter").Int64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != okCount.Load() {
+		t.Fatalf("at-most-once violated: counter=%d successful futures=%d", got, okCount.Load())
+	}
+	t.Logf("at-most-once: %d increments == %d successful futures", got, okCount.Load())
+}
+
+// ===== from osscluster_autopipeline_fd_moved_test.go =====
+
+// clusterFDAddrs is the local 6-node cluster (3 masters + 3 replicas) the FD
+// MOVED tests target; SwapNodes needs the replicas to swap a slot's master.
+var clusterFDAddrs = []string{":16600", ":16601", ":16602", ":16603", ":16604", ":16605"}
+
+// TestAPClusterFDMovedRedirectFollowed is the discriminating proof that native
+// cluster full-duplex FOLLOWS a MOVED redirect. SwapNodes forces the client to
+// believe a replica is the master for a slot; a command routed there is answered
+// with MOVED. The FD child's reader diverts the redirect to the redirect-aware
+// ClusterClient path, which re-routes to the real master and reloads topology, so
+// the value is still read back correctly. Before the redirect fix this returned
+// the MOVED error and the test failed.
+func TestAPClusterFDMovedRedirectFollowed(t *testing.T) {
+	ctx := context.Background()
+	c := redis.NewClusterClient(&redis.ClusterOptions{Addrs: clusterFDAddrs})
+	defer c.Close()
+	skipIfClusterUnhealthy(t, c)
+
+	ap, err := c.AutoPipelineWithOptions(&redis.AutoPipelineOptions{FullDuplex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ap.Close()
+	if !ap.Config().FullDuplex {
+		t.Fatalf("Config().FullDuplex = false, want true (cluster FD not active)")
+	}
+
+	const key, val = "fdmoved:key", "fdmoved:val"
+	if err := ap.Set(ctx, key, val, 0).Err(); err != nil {
+		t.Fatalf("initial set: %v", err)
+	}
+	// Point the slot at the wrong node so the next access is answered with MOVED
+	// and must be followed.
+	if err := c.SwapNodes(ctx, key); err != nil {
+		t.Fatalf("SwapNodes: %v", err)
+	}
+
+	got, err := ap.Get(ctx, key).Result()
+	if err != nil {
+		t.Fatalf("get after MOVED: %v (FD redirect not followed)", err)
+	}
+	if got != val {
+		t.Fatalf("get after MOVED = %q, want %q (FD redirect not followed correctly)", got, val)
+	}
+}
+
+// TestAPClusterFDMovedSurfacedWithoutRedirects anchors the positive test: with
+// MaxRedirects disabled (-1 -> 0, one attempt), the FD divert still routes through
+// ClusterClient.process, which now honors the zero-redirect budget and surfaces
+// the forced MOVED as an error. This proves SwapNodes really induced a redirect on
+// the FD path (so the positive test exercised the redirect logic, not a trivial
+// pass) and that the FD reprocess goes through the cluster budget.
+func TestAPClusterFDMovedSurfacedWithoutRedirects(t *testing.T) {
+	ctx := context.Background()
+	c := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:        clusterFDAddrs,
+		MaxRedirects: -1, // normalized to 0: a single attempt, no follow-through
+	})
+	defer c.Close()
+	skipIfClusterUnhealthy(t, c)
+
+	ap, err := c.AutoPipelineWithOptions(&redis.AutoPipelineOptions{FullDuplex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ap.Close()
+	if !ap.Config().FullDuplex {
+		t.Fatalf("Config().FullDuplex = false, want true (cluster FD not active)")
+	}
+
+	const key = "fdmoved:noredir:key"
+	if err := ap.Set(ctx, key, "v", 0).Err(); err != nil {
+		t.Fatalf("initial set: %v", err)
+	}
+
+	// SwapNodes is racy against the periodic LazyReload, so re-swap and retry until
+	// we observe the MOVED (or give up and skip — the swap never stuck).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := c.SwapNodes(ctx, key); err != nil {
+			t.Fatalf("SwapNodes: %v", err)
+		}
+		err := ap.Get(ctx, key).Err()
+		if err != nil && strings.Contains(err.Error(), "MOVED") {
+			return // proven: the redirect was needed and, with no redirects, surfaced
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Skip("could not observe a MOVED (swap kept being reverted by topology reload)")
+}
+
+// ===== from osscluster_autopipeline_nodehook_test.go =====
+
+type nodePeekHook struct{ armed *atomic.Bool }
+
+func (h nodePeekHook) DialHook(next redis.DialHook) redis.DialHook          { return next }
+func (h nodePeekHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+func (h nodePeekHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		if h.armed.Load() {
+			for _, c := range cmds {
+				_ = c.Err() // redisotel via rediscmd.CmdsString does exactly this pre-next
+				_ = c.String()
+			}
+		}
+		err := next(ctx, cmds)
+		if h.armed.Load() {
+			for _, c := range cmds {
+				_ = c.Err()
+				_ = c.String()
+			}
+		}
+		return err
+	}
+}
+
+// TestClusterNodeHookResultPeekNoDeadlock pins the batch-executor guard for
+// cluster per-node goroutines: redisotel installs tracing hooks on NODE
+// clients via OnNewNode, and rediscmd.CmdsString reads every command's Err()
+// BEFORE next() — on the deferred face those reads used to block on a batch
+// that completes only after the node call returns, wedging the dispatch
+// permanently (found while assessing the String review round on #3942).
+func TestClusterNodeHookResultPeekNoDeadlock(t *testing.T) {
+	ctx := context.Background()
+	probe := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{":16600", ":16601", ":16602"}})
+	if err := probe.Ping(ctx).Err(); err != nil {
+		probe.Close()
+		t.Skipf("no cluster: %v", err)
+	}
+	probe.Close()
+
+	cc := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{":16600", ":16601", ":16602"}})
+	defer cc.Close()
+	var armed atomic.Bool
+	var installs atomic.Int32
+	cc.OnNewNode(func(nc *redis.Client) {
+		installs.Add(1)
+		nc.AddHook(nodePeekHook{armed: &armed})
+	})
+	cc.Ping(ctx)
+	t.Logf("node hooks installed: %d", installs.Load())
+
+	ap, err := cc.AsyncAutoPipeline()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		armed.Store(true)
+		defer armed.Store(false)
+		cmds := make([]*redis.StatusCmd, 50)
+		for i := range cmds {
+			cmds[i] = ap.Set(ctx, "nodehook:"+string(rune('a'+i%26))+":"+string(rune('0'+i%10)), "v", 0)
+		}
+		var firstErr error
+		for _, c := range cmds {
+			if err := c.Err(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		done <- firstErr
+	}()
+	select {
+	case err := <-done:
+		t.Logf("no hang, err=%v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("node-level hook result peek wedged the async cluster dispatch (batch executor registration regressed)")
 	}
 }

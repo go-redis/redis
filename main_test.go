@@ -613,6 +613,14 @@ func cleanupTLSCluster() {
 	// TLS cluster is auto-managed by the container, no cleanup needed
 }
 
+// isFullDuplexSubject reports whether GOREDIS_TEST_SUBJECT selects a
+// full-duplex face (ap-fd, ap-fd-blocking). Those keep a warm spare in the
+// pipeline pool, so exact pipeline-pool counts differ.
+func isFullDuplexSubject() bool {
+	s := os.Getenv("GOREDIS_TEST_SUBJECT")
+	return s == "ap-fd" || s == "ap-fd-blocking"
+}
+
 // newUniversalSubject returns the redis.UniversalClient that a parametrized
 // command suite runs against, selected by the GOREDIS_TEST_SUBJECT env var so a
 // whole suite can be replayed through the autopipeliner without touching each
@@ -621,6 +629,10 @@ func cleanupTLSCluster() {
 //	(unset)|client -> the *redis.Client itself (default; unchanged behavior)
 //	ap-blocking     -> client.AutoPipeline()      (synchronous drop-in face)
 //	ap-async        -> client.AsyncAutoPipeline()  (deferred face; result reads block)
+//	ap-fd-blocking  -> the blocking face with FullDuplex: true (one held connection,
+//	                   writer/reader goroutine pair; blocking and same-connection
+//	                   commands take the divert path)
+//	ap-fd           -> the deferred face with FullDuplex: true
 //
 // It returns the subject plus a single closer that closes the autopipeliner (if
 // any) and then the underlying *redis.Client — so callers just defer/AfterEach
@@ -652,6 +664,18 @@ func newUniversalSubject(c *redis.Client) (redis.UniversalClient, func() error) 
 		return ap, closeWith(ap)
 	case "ap-async":
 		ap, err := c.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{MaxBatchSize: 300})
+		if err != nil {
+			panic(err)
+		}
+		return ap, closeWith(ap)
+	case "ap-fd-blocking":
+		ap, err := c.AutoPipelineWithOptions(&redis.AutoPipelineOptions{MaxBatchSize: 300, FullDuplex: true})
+		if err != nil {
+			panic(err)
+		}
+		return ap, closeWith(ap)
+	case "ap-fd":
+		ap, err := c.AsyncAutoPipelineWithOptions(&redis.AutoPipelineOptions{MaxBatchSize: 300, FullDuplex: true})
 		if err != nil {
 			panic(err)
 		}

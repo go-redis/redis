@@ -43,9 +43,22 @@ type Manager struct {
 // The manager creates a ReAuthPoolHook sized to match the pool size, ensuring that
 // re-auth operations don't exhaust the connection pool.
 func NewManager(pl pool.Pooler, reAuthTimeout time.Duration) *Manager {
+	return NewManagerWithWorkers(pl, reAuthTimeout, pl.Size())
+}
+
+// NewManagerWithWorkers is like NewManager but sizes the re-auth worker
+// semaphore explicitly. Use it when the returned PoolHook is shared across more
+// than one pool (e.g. the main pool plus the dedicated pipeline pool): the
+// semaphore must cover the COMBINED connection ceiling, or after a credential
+// rotation the extra pool's connections queue behind pl.Size() workers and wait
+// outside reAuthTimeout.
+func NewManagerWithWorkers(pl pool.Pooler, reAuthTimeout time.Duration, workers int) *Manager {
+	if workers < 1 {
+		workers = 1
+	}
 	m := &Manager{
 		pool:                 pl,
-		poolHookRef:          NewReAuthPoolHook(pl.Size(), reAuthTimeout),
+		poolHookRef:          NewReAuthPoolHook(workers, reAuthTimeout),
 		credentialsListeners: NewCredentialsListeners(),
 	}
 	m.poolHookRef.manager = m
@@ -119,8 +132,7 @@ func (m *Manager) Listener(
 //
 // Thread-safe: Called by credentials listeners when credentials change.
 func (m *Manager) MarkForReAuth(poolCn *pool.Conn, reAuthFn func(error)) {
-	connID := poolCn.GetID()
-	m.poolHookRef.MarkForReAuth(connID, reAuthFn)
+	m.poolHookRef.markForReAuthIfOpen(poolCn, reAuthFn)
 }
 
 // RemoveListener removes the credentials listener for a connection.
@@ -134,4 +146,24 @@ func (m *Manager) MarkForReAuth(poolCn *pool.Conn, reAuthFn func(error)) {
 // Thread-safe: Called during connection removal.
 func (m *Manager) RemoveListener(connID uint64) {
 	m.credentialsListeners.Remove(connID)
+}
+
+// RemoveConn drops all re-auth state of a connection that is closed outside
+// the pools the pool hook is registered on. Pub/sub connections are such
+// connections: they never return to a pool, so OnRemove never runs for them.
+// Call it after the connection is closed: MarkForReAuth then adds no new
+// state for it.
+//
+// Thread-safe: Called when a connection is closed.
+func (m *Manager) RemoveConn(connID uint64) {
+	m.poolHookRef.removeConn(connID)
+}
+
+// IsTracking reports whether the manager holds re-auth state for a
+// connection: a credentials listener, or a pending or active re-auth.
+func (m *Manager) IsTracking(connID uint64) bool {
+	if _, ok := m.credentialsListeners.Get(connID); ok {
+		return true
+	}
+	return m.poolHookRef.hasReAuth(connID)
 }

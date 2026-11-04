@@ -83,11 +83,38 @@ var _ = Describe("Commands", func() {
 			Expect(cmds[0].Err().Error()).To(authErr)
 
 			stats := rawClient.PoolStats()
-			Expect(stats.Hits).To(Equal(uint32(2)))
-			Expect(stats.Misses).To(Equal(uint32(1)))
-			Expect(stats.Timeouts).To(Equal(uint32(0)))
-			Expect(stats.TotalConns).To(Equal(uint32(1)))
-			Expect(stats.IdleConns).To(Equal(uint32(1)))
+			if stats.PipelineStats != nil && isFullDuplexSubject() {
+				// Full-duplex keeps a warm spare in the pipeline pool, refilled
+				// by a background dial, so whether a lease hits the spare or
+				// dials races that refill, and the held session can carry the
+				// second Pipelined without a pool operation. Pin the intent
+				// instead: the pipelines ran on the pipeline pool, and the main
+				// pool served only the BeforeEach FlushDB.
+				Expect(stats.PipelineStats.Hits + stats.PipelineStats.Misses).To(BeNumerically(">=", 1))
+				Expect(stats.PipelineStats.Timeouts).To(Equal(uint32(0)))
+				Expect(stats.Hits).To(Equal(uint32(0)))
+				Expect(stats.Misses).To(Equal(uint32(1)))
+			} else if stats.PipelineStats != nil {
+				// The autopipeline subject faces create the dedicated pipeline
+				// pool lazily, so the two Pipelined calls above ran there: the
+				// first dialed (miss), the second reused (hit). The main pool
+				// served only the BeforeEach FlushDB.
+				Expect(stats.PipelineStats.Hits).To(Equal(uint32(1)))
+				Expect(stats.PipelineStats.Misses).To(Equal(uint32(1)))
+				Expect(stats.PipelineStats.Timeouts).To(Equal(uint32(0)))
+				Expect(stats.PipelineStats.TotalConns).To(Equal(uint32(1)))
+				Expect(stats.PipelineStats.IdleConns).To(Equal(uint32(1)))
+				Expect(stats.Hits).To(Equal(uint32(0)))
+				Expect(stats.Misses).To(Equal(uint32(1)))
+			} else {
+				// No dedicated pipeline pool: FlushDB dialed the one connection
+				// (miss) and both Pipelined calls reused it (hits).
+				Expect(stats.Hits).To(Equal(uint32(2)))
+				Expect(stats.Misses).To(Equal(uint32(1)))
+				Expect(stats.Timeouts).To(Equal(uint32(0)))
+				Expect(stats.TotalConns).To(Equal(uint32(1)))
+				Expect(stats.IdleConns).To(Equal(uint32(1)))
+			}
 		})
 
 		It("should hello", func() {
@@ -393,8 +420,15 @@ var _ = Describe("Commands", func() {
 				}()
 				pipe.ClientSetInfo(ctx, libInfo)
 			}).To(Panic())
-			// Test setting the default options for libName, libName suffix and libVer
-			clientInfo := rawClient.ClientInfo(ctx).Val()
+			// Test setting the default options for libName, libName suffix and libVer.
+			// CLIENT SETINFO is per-connection state. Set the libName and read
+			// CLIENT INFO in the same Exec, so both run on one connection; separate
+			// Execs are not guaranteed to share one.
+			pipe.ClientSetInfo(ctx, redis.WithLibraryName(libName))
+			infoCmd := pipe.ClientInfo(ctx)
+			_, err = pipe.Exec(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			clientInfo := infoCmd.Val()
 			Expect(clientInfo.LibName).To(ContainSubstring("go-redis(go-redis,"))
 			// Test setting the libName suffix in options
 			opt := redisOptions()
@@ -417,7 +451,12 @@ var _ = Describe("Commands", func() {
 
 			info, err := conn.ClientInfo(ctx).Result()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(info.Flags & redis.ClientTracking).NotTo(BeZero())
+			// Redis Enterprise's proxy does not surface the client-tracking flag in
+			// CLIENT INFO, so assert it only against a direct server. Tracking still
+			// works on RE (the command returns OK and CSC operates).
+			if !RECluster {
+				Expect(info.Flags & redis.ClientTracking).NotTo(BeZero())
+			}
 
 			status, err = conn.ClientTrackingOff(ctx).Result()
 			Expect(err).NotTo(HaveOccurred())
@@ -444,8 +483,13 @@ var _ = Describe("Commands", func() {
 
 			info, err := conn.ClientInfo(ctx).Result()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(info.Flags & redis.ClientTracking).NotTo(BeZero())
-			Expect(info.Flags & redis.ClientTrackingBCAST).NotTo(BeZero())
+			// Redis Enterprise's proxy does not surface tracking flags in CLIENT
+			// INFO, so assert them only against a direct server (tracking still
+			// works on RE).
+			if !RECluster {
+				Expect(info.Flags & redis.ClientTracking).NotTo(BeZero())
+				Expect(info.Flags & redis.ClientTrackingBCAST).NotTo(BeZero())
+			}
 			// Redis does not expose the NOLOOP flag in CLIENT INFO; it is only
 			// observable via CLIENT TRACKINGINFO.
 
@@ -1198,6 +1242,14 @@ var _ = Describe("Commands", func() {
 			Expect(pttl.Val()).To(BeNumerically("~", expiration, 100*time.Millisecond))
 		})
 
+		It("should PExpireAt beyond the nanosecond timestamp range", func() {
+			deadline := time.Date(2270, time.January, 2, 3, 4, 5, 123000000, time.UTC)
+			Expect(client.Set(ctx, "key", "hello", 0).Err()).NotTo(HaveOccurred())
+			Expect(client.PExpireAt(ctx, "key", deadline).Result()).To(BeTrue())
+			Expect(client.Get(ctx, "key").Result()).To(Equal("hello"))
+			Expect(client.Do(ctx, "PEXPIRETIME", "key").Result()).To(Equal(int64(9467204645123)))
+		})
+
 		It("should PExpireTime", func() {
 			// The command returns -1 if the key exists but has no associated expiration time.
 			// The command returns -2 if the key does not exist.
@@ -1803,6 +1855,58 @@ var _ = Describe("Commands", func() {
 
 			_, err = client.BitPos(ctx, "mykey", 0, 0, 0, 0, 0).Result()
 			Expect(err).Should(MatchError("too many arguments"))
+		})
+
+		It("should BitRangeIntArray", func() {
+			SkipBeforeRedisVersion("8.12", "BITRANGEINTARRAY needs Redis 8.12")
+
+			for _, off := range []int64{1, 7, 9, 30} {
+				Expect(client.SetBit(ctx, "bria", off, 1).Err()).NotTo(HaveOccurred())
+			}
+
+			offs, err := client.BitRangeIntArray(ctx, "bria", 0, -1).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(offs).To(Equal([]int64{1, 7, 9, 30}))
+
+			offs, err = client.BitRangeIntArray(ctx, "bria", 1, -1).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(offs).To(Equal([]int64{9, 30}))
+
+			offs, err = client.BitRangeIntArrayWithArgs(ctx, "bria", 5, 10, &redis.BitRangeIntArrayArgs{
+				Unit: redis.BitCountIndexBit,
+			}).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(offs).To(Equal([]int64{7, 9}))
+
+			offs, err = client.BitRangeIntArrayWithArgs(ctx, "bria", 24, 31, &redis.BitRangeIntArrayArgs{
+				Unit:  redis.BitCountIndexBit,
+				Zeros: true,
+			}).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(offs).To(Equal([]int64{24, 25, 26, 27, 28, 29, 31}))
+
+			offs, err = client.BitRangeIntArrayWithArgs(ctx, "bria", 2, -1, &redis.BitRangeIntArrayArgs{
+				Unit:  redis.BitCountIndexBit,
+				Limit: 2,
+			}).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(offs).To(Equal([]int64{7, 9}))
+
+			// BYTE units complete the byte that holds the last offset.
+			offs, err = client.BitRangeIntArrayWithArgs(ctx, "bria", 0, -1, &redis.BitRangeIntArrayArgs{
+				Limit: 1,
+			}).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(offs).To(Equal([]int64{1, 7}))
+
+			offs, err = client.BitRangeIntArray(ctx, "nosuchkey", 0, -1).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(offs).To(BeEmpty())
+
+			err = client.BitRangeIntArrayWithArgs(ctx, "bria", 0, -1, &redis.BitRangeIntArrayArgs{
+				Unit: "nibble",
+			}).Err()
+			Expect(err).To(MatchError("redis: invalid bitrangeintarray unit"))
 		})
 
 		It("should BitPosSpan", func() {
@@ -3554,9 +3658,7 @@ var _ = Describe("Commands", func() {
 				"value1",
 				"ARGS",
 				"arg1",
-				"ARGS",
 				"arg2",
-				"ARGS",
 				3,
 			}
 
@@ -4067,6 +4169,16 @@ var _ = Describe("Commands", func() {
 			Expect(res).To(Equal([]int64{1, 1, -2}))
 		})
 
+		It("should HPExpireAt beyond the nanosecond timestamp range", Label("hash-expiration"), func() {
+			SkipBeforeRedisVersion("7.4", "requires hash field expiration")
+			deadline := time.Date(2270, time.January, 2, 3, 4, 5, 123000000, time.UTC)
+			Expect(client.HSet(ctx, "myhash", "key1", "hello", "key2", "world").Err()).NotTo(HaveOccurred())
+			Expect(client.HPExpireAt(ctx, "myhash", deadline, "key1").Result()).To(Equal([]int64{1}))
+			Expect(client.HPExpireAtWithArgs(ctx, "myhash", deadline, redis.HExpireArgs{NX: true}, "key2").Result()).To(Equal([]int64{1}))
+			Expect(client.HMGet(ctx, "myhash", "key1", "key2").Result()).To(Equal([]interface{}{"hello", "world"}))
+			Expect(client.HPExpireTime(ctx, "myhash", "key1", "key2").Result()).To(Equal([]int64{9467204645123, 9467204645123}))
+		})
+
 		It("should HPersist", Label("hash-expiration", "NonRedisEnterprise"), func() {
 			SkipBeforeRedisVersion("7.4", "doesn't work with older redis stack images")
 			resEmpty, err := client.HPersist(ctx, "no_such_key", "field1", "field2", "field3").Result()
@@ -4169,8 +4281,9 @@ var _ = Describe("Commands", func() {
 
 			res, err = client.HPTTL(ctx, "myhash", "key1", "key2", "key200").Result()
 			Expect(err).NotTo(HaveOccurred())
-			// overhead of the push notification check is about 1-2ms for 100 commands
-			Expect(res[0]).To(BeNumerically("~", 10*time.Second.Milliseconds(), 2))
+			// TTL only counts down; allow slack for slow CI runners.
+			Expect(res[0]).To(BeNumerically("<=", 10*time.Second.Milliseconds()))
+			Expect(res[0]).To(BeNumerically(">", 9*time.Second.Milliseconds()))
 		})
 
 		It("should HGETDEL", Label("hash", "HGETDEL"), func() {
@@ -8144,6 +8257,45 @@ var _ = Describe("Commands", func() {
 			Expect(err).To(Equal(redis.Nil))
 		})
 
+		It("should XRead with per-stream IDs", Label("NonRedisEnterprise"), func() {
+			_, err := client.XAdd(ctx, &redis.XAddArgs{Stream: "stream2", ID: "1-0", Values: map[string]interface{}{"alpha": "a"}}).Result()
+			Expect(err).NotTo(HaveOccurred())
+			_, err = client.XAdd(ctx, &redis.XAddArgs{Stream: "stream2", ID: "2-0", Values: map[string]interface{}{"beta": "b"}}).Result()
+			Expect(err).NotTo(HaveOccurred())
+
+			// "stream" is read after 2-0 and "stream2" from the start.
+			res, err := client.XRead(ctx, &redis.XReadArgs{
+				Streams: []string{"stream", "stream2"},
+				IDs:     []string{"2-0", "0"},
+				Block:   -1,
+			}).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res).To(Equal([]redis.XStream{
+				{
+					Stream: "stream",
+					Messages: []redis.XMessage{
+						{ID: "3-0", Values: map[string]interface{}{"tres": "troix"}},
+					},
+				},
+				{
+					Stream: "stream2",
+					Messages: []redis.XMessage{
+						{ID: "1-0", Values: map[string]interface{}{"alpha": "a"}},
+						{ID: "2-0", Values: map[string]interface{}{"beta": "b"}},
+					},
+				},
+			}))
+		})
+
+		It("should XRead fail when IDs and Streams lengths differ", func() {
+			err := client.XRead(ctx, &redis.XReadArgs{
+				Streams: []string{"stream", "stream2"},
+				IDs:     []string{"0"},
+				Block:   -1,
+			}).Err()
+			Expect(err).To(MatchError("redis: XRead IDs length must match Streams length"))
+		})
+
 		It("should XRead with MAXCOUNT capping cumulative entries across streams", func() {
 			SkipBeforeRedisVersion("8.10", "XREAD MAXCOUNT requires Redis 8.10+")
 
@@ -9116,6 +9268,28 @@ var _ = Describe("Commands", func() {
 				}))
 			})
 
+			It("should return -1 for nil lag in XINFO STREAM FULL", func() {
+				for _, id := range []string{"0-1", "0-2", "0-3"} {
+					err := client.XAdd(ctx, &redis.XAddArgs{Stream: "s", ID: id, Values: []string{"foo", id}}).Err()
+					Expect(err).NotTo(HaveOccurred())
+				}
+
+				err := client.XGroupCreate(ctx, "s", "g", "0").Err()
+				Expect(err).NotTo(HaveOccurred())
+				err = client.XReadGroup(ctx, &redis.XReadGroupArgs{Group: "g", Consumer: "c", Streams: []string{"s", ">"}, Count: 1, Block: -1}).Err()
+				Expect(err).NotTo(HaveOccurred())
+
+				// Deleting an entry the group has not read yet makes Redis reply with a nil lag.
+				err = client.XDel(ctx, "s", "0-2").Err()
+				Expect(err).NotTo(HaveOccurred())
+
+				res, err := client.XInfoStreamFull(ctx, "s", 0).Result()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(res.Groups).To(HaveLen(1))
+				Expect(res.Groups[0].EntriesRead).To(Equal(int64(1)))
+				Expect(res.Groups[0].Lag).To(Equal(int64(-1))) // nil lag from Redis is reported as -1
+			})
+
 			It("should XINFO CONSUMERS", func() {
 				res, err := client.XInfoConsumers(ctx, "stream", "group1").Result()
 				Expect(err).NotTo(HaveOccurred())
@@ -9247,6 +9421,24 @@ var _ = Describe("Commands", func() {
 			Expect(res[0].GeoHash).To(Equal(int64(3479447370796909)))
 			Expect(res[0].Longitude).To(Equal(15.087267458438873))
 			Expect(res[0].Latitude).To(Equal(37.50266842333162))
+		})
+
+		It("should search geo radius twice with the same query", func() {
+			q := &redis.GeoRadiusQuery{
+				Radius:   200,
+				Unit:     "km",
+				WithDist: true,
+				Sort:     "ASC",
+			}
+			for i := 0; i < 2; i++ {
+				res, err := client.GeoRadius(ctx, "Sicily", 15, 37, q).Result()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(res).To(HaveLen(2))
+				Expect(res[0].Name).To(Equal("Catania"))
+				Expect(res[0].Dist).To(Equal(56.4413))
+				Expect(res[1].Name).To(Equal("Palermo"))
+				Expect(res[1].Dist).To(Equal(190.4424))
+			}
 		})
 
 		It("should search geo radius by member with options", func() {
@@ -9431,6 +9623,18 @@ var _ = Describe("Commands", func() {
 			Expect(val).To(Equal([]string{"Palermo"}))
 		})
 
+		It("should geo search without changing the query", func() {
+			q := &redis.GeoSearchQuery{
+				Member: "Catania",
+				Radius: 200,
+				Sort:   "asc",
+			}
+			val, err := client.GeoSearch(ctx, "Sicily", q).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val).To(Equal([]string{"Catania", "Palermo"}))
+			Expect(q.RadiusUnit).To(BeEmpty())
+		})
+
 		It("should geo search with options", func() {
 			q := &redis.GeoSearchLocationQuery{
 				GeoSearchQuery: redis.GeoSearchQuery{
@@ -9444,7 +9648,16 @@ var _ = Describe("Commands", func() {
 				WithDist:  true,
 				WithCoord: true,
 			}
-			val, err := client.GeoSearchLocation(ctx, "Sicily", q).Result()
+			cmd := client.GeoSearchLocation(ctx, "Sicily", q)
+			Expect(cmd.Args()).To(Equal([]interface{}{
+				"geosearch", "Sicily",
+				"fromlonlat", float64(15), float64(37),
+				"byradius", float64(200), "km",
+				"asc",
+				"withcoord", "withdist", "withhash",
+			}))
+
+			val, err := cmd.Result()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(val).To(Equal([]redis.GeoLocation{
 				{
@@ -10045,6 +10258,14 @@ var _ = Describe("Commands", func() {
 		})
 
 		It("returns the number of slow queries", Label("NonRedisEnterprise"), func() {
+			// Warm the autopipeline face's dedicated pipeline pool before lowering
+			// the slowlog threshold. That pool dials lazily on the first flush, so
+			// its HELLO + CLIENT SETINFO handshake would otherwise be recorded as
+			// slow queries once slowlog-log-slower-than is 0 and inflate the count.
+			// Read the result so the dial has completed before we reset. Harmless
+			// on the default (non-autopipeline) subject.
+			Expect(client.Set(ctx, "test", "true", 0).Err()).NotTo(HaveOccurred())
+
 			// Reset slowlog
 			err := rawClient.SlowLogReset(ctx).Err()
 			Expect(err).NotTo(HaveOccurred())
@@ -10257,7 +10478,7 @@ func (n *numberStruct) ScanRedis(str string) error {
 
 func deref(viface interface{}) interface{} {
 	v := reflect.ValueOf(viface)
-	for v.Kind() == reflect.Ptr {
+	for v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	return v.Interface()

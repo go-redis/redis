@@ -69,6 +69,14 @@ func (p *Processor) ProcessPendingNotifications(ctx context.Context, handlerCtx 
 // and then continues only through frames already buffered by that read. It is
 // used by callers that have already established socket readiness and must not
 // wait for another frame after draining the current batch.
+//
+// After the first notification it starts a push frame only when the whole frame
+// is buffered. Callers run it under one hard read deadline for the whole call, and
+// handler time counts against it: a partly buffered frame started after slow
+// handlers could need a socket read after the deadline passed, time out
+// mid-frame, and retire a healthy connection. Such a frame is left untouched for
+// the next drain. A partly buffered attribute is still read here: the pool's
+// put-path check would parse it without a deadline.
 func (p *Processor) ProcessPendingNotificationsBuffered(
 	ctx context.Context, handlerCtx NotificationHandlerContext, rd *proto.Reader,
 ) error {
@@ -108,6 +116,12 @@ func (p *Processor) processPendingNotifications(
 					return err
 				}
 			}
+			// At a push frame with nothing of it consumed (any attributes before it
+			// are gone): leave it for the next drain unless it is fully buffered,
+			// rather than read the rest under a deadline the handlers may have used up.
+			if processed && replyType == proto.RespPush && !rd.HasBufferedFrame() {
+				return nil
+			}
 		} else {
 			var err error
 			replyType, err = rd.PeekReplyType()
@@ -125,17 +139,18 @@ func (p *Processor) processPendingNotifications(
 		// see if we should skip this notification
 		notificationName, err := rd.PeekPushNotificationName()
 		if err != nil {
-			// Name too long to peek: consume & dispatch below rather than leave the
-			// frame at the buffer head (which would stall and desync the next reply).
-			if !errors.Is(err, proto.ErrPushNotificationNameTooLong) {
-				if bufferedContinuation {
-					if isTimeoutError(err) {
-						return nil
-					}
-					return err
-				}
-				break
+			// A buffered probe stops cleanly when no full frame is available yet.
+			if bufferedContinuation && isTimeoutError(err) {
+				return nil
 			}
+			// The frame is a CONFIRMED push (peeked above) but its name cannot be
+			// peeked — too long, or a non-string / malformed name. Fall through to
+			// ReadReply to CONSUME it. Do NOT break: that leaves the push at the
+			// buffer head for the caller's reply read to eat as the command value
+			// (cache poison / one-frame reply shift). A genuine mid-frame read error
+			// surfaces at ReadReply below (fatal → the reply-expected drain retires
+			// the conn); a non-string name is gracefully ignored (the type assertion
+			// below fails, so no handler runs).
 		} else if willHandleNotificationInClient(notificationName) {
 			break
 		}

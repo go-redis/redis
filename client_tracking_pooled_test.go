@@ -62,6 +62,29 @@ func TestPooledClientTrackingPreservesArgs(t *testing.T) {
 	}
 }
 
+// TestMultiDBClientRejectsConnStateCommands: the MultiDB client rejects the
+// per-connection commands like the other pooled clients.
+func TestMultiDBClientRejectsConnStateCommands(t *testing.T) {
+	ctx := context.Background()
+	c := &MultiDBClient{}
+	for name, cmd := range map[string]*StatusCmd{
+		"ClientTracking(on)":  c.ClientTracking(ctx, true, nil),
+		"ClientTracking(off)": c.ClientTracking(ctx, false, nil),
+	} {
+		if !errors.Is(cmd.Err(), errClientTrackingOnPooledClient) {
+			t.Fatalf("%s: Err() = %v, want %v", name, cmd.Err(), errClientTrackingOnPooledClient)
+		}
+	}
+	cmd := c.ClientMaintNotifications(ctx, true, "")
+	if !errors.Is(cmd.Err(), errClientMaintNotificationsOnPooledClient) {
+		t.Fatalf("ClientMaintNotifications: Err() = %v, want %v", cmd.Err(), errClientMaintNotificationsOnPooledClient)
+	}
+	want := []interface{}{"client", "maint_notifications", "on", "moving-endpoint-type", "none"}
+	if got := cmd.Args(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Args() = %v, want %v", got, want)
+	}
+}
+
 // TestPooledClientMaintNotificationsDefaultEndpoint verifies the empty endpoint
 // type defaults to "none", matching the stateful command.
 func TestPooledClientMaintNotificationsDefaultEndpoint(t *testing.T) {

@@ -172,7 +172,7 @@ func TestAutoPipelineHeterogeneousReplyDemux(t *testing.T) {
 // (redis.go), which was previously untested: the CI harness runs with
 // MaxRetries=-1 (-> 0), so the retry loop never iterated. AutoPipeline dispatches
 // through this same execer, so it inherits whatever is proven here
-// (see autopipeline_retry_test.go for the AutoPipeline-specific coverage).
+// (see autopipeline_test.go for the AutoPipeline-specific coverage).
 
 // TestPipelineRetriesOnNetworkError arms the pooled conn's next write to fail
 // at the wire (a seeded broken idle conn would be filtered by the pool health
@@ -199,6 +199,17 @@ func TestPipelineRetriesOnNetworkError(t *testing.T) {
 		t.Skipf("no redis: %v", err)
 	}
 	if err := client.Set(ctx, "pr:n", 0, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Warm the DEDICATED PIPELINE POOL connection first: pipelines run there,
+	// not on the main-pool conn the Ping dialed. Without this the pipeline's
+	// first Exec dials a fresh pipeline conn and the dial count reads one high
+	// for a reason unrelated to the retry.
+	if _, err := client.Pipelined(ctx, func(p redis.Pipeliner) error {
+		p.Ping(ctx)
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 
