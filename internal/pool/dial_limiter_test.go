@@ -595,3 +595,106 @@ func TestDialRateLimitDisabled(t *testing.T) {
 		t.Fatal("no waiters expected when limiter disabled")
 	}
 }
+
+// rejectIdleHook rejects every idle connection on Get (accept=false, no
+// error), so the pool puts it back. New connections are accepted.
+type rejectIdleHook struct {
+	rejected atomic.Int32
+}
+
+func (h *rejectIdleHook) OnGet(_ context.Context, _ *pool.Conn, isNewConn bool) (bool, error) {
+	if isNewConn {
+		return true, nil
+	}
+	h.rejected.Add(1)
+	return false, nil
+}
+
+func (h *rejectIdleHook) OnPut(context.Context, *pool.Conn) (bool, bool, error) {
+	return true, false, nil
+}
+
+func (h *rejectIdleHook) OnRemove(context.Context, *pool.Conn, error) {}
+
+// TestDialRateLimitHookRejectedIdleDoesNotSpin: an idle connection that a hook
+// keeps rejecting stays acquirable. A throttled Get() must park and then dial,
+// not loop on the idle re-check until a token frees up.
+func TestDialRateLimitHookRejectedIdleDoesNotSpin(t *testing.T) {
+	var dials atomic.Int32
+	p := pool.NewConnPool(&pool.Options{
+		Dialer:             countingDialer(&dials),
+		PoolSize:           10,
+		MaxConcurrentDials: 10,
+		DialRateLimit:      1,
+		DialRateBurst:      1,
+		PoolTimeout:        200 * time.Millisecond,
+	})
+	defer p.Close()
+	ctx := context.Background()
+
+	c1, err := p.Get(ctx)
+	if err != nil {
+		t.Fatalf("first Get failed: %v", err)
+	}
+	p.Put(ctx, c1)
+
+	hook := &rejectIdleHook{}
+	p.AddPoolHook(hook)
+
+	c2, err := p.Get(ctx)
+	if err != nil {
+		t.Fatalf("throttled Get failed: %v", err)
+	}
+	defer p.Put(ctx, c2)
+	if c2 == c1 {
+		t.Fatal("throttled Get returned the rejected idle conn")
+	}
+	if got := hook.rejected.Load(); got > 50 {
+		t.Fatalf("idle conn rejected %d times: throttled Get spun on the idle re-check", got)
+	}
+}
+
+// TestDialRateLimitRefillRechecksAfterTokenWait: a refill worker that waited
+// for a dial token must not dial when the idle floor was met meanwhile.
+func TestDialRateLimitRefillRechecksAfterTokenWait(t *testing.T) {
+	var dials atomic.Int32
+	p := pool.NewConnPool(&pool.Options{
+		Dialer:             countingDialer(&dials),
+		PoolSize:           10,
+		MaxConcurrentDials: 10,
+		MinIdleConns:       2,
+		DialRateLimit:      1,
+		DialRateBurst:      1,
+		PoolTimeout:        200 * time.Millisecond,
+	})
+	defer p.Close()
+	ctx := context.Background()
+
+	// One refill worker takes the burst token; the other waits for a token.
+	waitFor(t, time.Second, func() bool { return p.IdleLen() == 1 })
+
+	// Meet the floor from the foreground: take the prewarmed conn, then a
+	// throttled Get escapes after PoolTimeout and dials; return both.
+	c1, err := p.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get 1 failed: %v", err)
+	}
+	c2, err := p.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get 2 failed: %v", err)
+	}
+	p.Put(ctx, c1)
+	p.Put(ctx, c2)
+	if got := p.IdleLen(); got != 2 {
+		t.Fatalf("IdleLen=%d after Put, want 2", got)
+	}
+
+	// Let the waiting refill workers get their tokens.
+	time.Sleep(2500 * time.Millisecond)
+	if got := p.IdleLen(); got != 2 {
+		t.Fatalf("IdleLen=%d, want 2 (MinIdleConns): refill dialed past the floor", got)
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("dials=%d, want 2", got)
+	}
+}
