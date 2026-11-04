@@ -958,3 +958,28 @@ func TestDialRateLimitRefundsOnDialFastFail(t *testing.T) {
 		t.Fatalf("DialTokens=%.2f, want 2: fast-failed Get kept its token", got)
 	}
 }
+
+// TestDialRateLimitHasFreeCapacityNeedsToken: with no idle conn and no dial
+// token, a Get would park, so HasFreeCapacity must report no capacity.
+func TestDialRateLimitHasFreeCapacityNeedsToken(t *testing.T) {
+	p := pool.NewConnPool(&pool.Options{
+		Dialer:             func(context.Context) (net.Conn, error) { return newDummyConn(), nil },
+		PoolSize:           10,
+		MaxConcurrentDials: 10,
+		DialRateLimit:      1,
+		DialRateBurst:      1,
+		PoolTimeout:        3 * time.Second,
+	})
+	defer p.Close()
+	if !p.HasFreeCapacity() {
+		t.Fatal("HasFreeCapacity=false with a dial token available")
+	}
+	cn, err := p.Get(context.Background()) // takes the only token
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Put(context.Background(), cn)
+	if p.HasFreeCapacity() {
+		t.Fatal("HasFreeCapacity=true with no idle conn and no dial token: a Get would park")
+	}
+}

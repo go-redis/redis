@@ -2628,6 +2628,11 @@ func (p *ConnPool) HasFreeCapacity() bool {
 	if p.dialErrorsNum.Load() >= uint32(p.cfg.PoolSize) {
 		return false
 	}
+	// Dial rate limit with no token: the Get would park in throttleDial (up to
+	// PoolTimeout) instead of dialing now.
+	if l := p.dialLimiter; l != nil && l.delayUntilNext() > 0 {
+		return false
+	}
 	return true
 }
 
