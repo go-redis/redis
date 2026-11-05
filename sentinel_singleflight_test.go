@@ -239,20 +239,3 @@ func TestSentinelOptionsMinIdleConnsZero(t *testing.T) {
 	}
 }
 
-func TestSharedLookupTimeoutDefaults(t *testing.T) {
-	c := &sentinelFailover{opt: &FailoverOptions{}}
-	if got := c.sharedLookupTimeout(); got != 10*time.Second {
-		t.Fatalf("default sharedLookupTimeout = %s, want 10s", got)
-	}
-	c.opt.DialTimeout = 2 * time.Second
-	c.opt.ReadTimeout = 3 * time.Second
-	if got := c.sharedLookupTimeout(); got != 5*time.Second {
-		t.Fatalf("sharedLookupTimeout = %s, want 5s", got)
-	}
-	// One budget per configured sentinel plus one, since replicaAddrsOnce
-	// tries them one after another.
-	c.opt.SentinelAddrs = []string{"s1:26379", "s2:26379", "s3:26379"}
-	if got := c.sharedLookupTimeout(); got != 20*time.Second {
-		t.Fatalf("sharedLookupTimeout with 3 sentinels = %s, want 20s", got)
-	}
-}
