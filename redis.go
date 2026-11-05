@@ -769,14 +769,19 @@ func (c *baseClient) _getConn(ctx context.Context) (*pool.Conn, error) {
 
 // initPooledConnLimited runs initPooledConn as one admitted operation against
 // Options.Limiter, for a caller that leases outside getConnLimited. A denial
-// removes the leased conn, the same disposition as a failed init.
-func (c *baseClient) initPooledConnLimited(ctx context.Context, p pool.Pooler, cn *pool.Conn) error {
+// removes the leased conn, the same disposition as a failed init. limited is
+// true only when Allow rejects, so callers can avoid falling back on a denial.
+func (c *baseClient) initPooledConnLimited(ctx context.Context, p pool.Pooler, cn *pool.Conn) (limited bool, err error) {
 	if cn.IsInited() {
-		return nil
+		return false, nil
 	}
-	return admitted(c.limiter(), func(err error) { p.Remove(ctx, cn, err) }, func() error {
+	err = admitted(c.limiter(), func(err error) {
+		limited = true
+		p.Remove(ctx, cn, err)
+	}, func() error {
 		return c.initPooledConn(ctx, p, cn)
 	})
+	return limited, err
 }
 
 // initPooledConn brings a conn freshly obtained from p to a usable state: it
