@@ -102,7 +102,6 @@ func TestClusterDefaultPoliciesRequireFanoutOptIn(t *testing.T) {
 		{"client", "setname", "name"},
 		{"flushdb"},
 		{"info"},
-		{"scan", 0},
 		{"mget", "{a}one", "{b}two"},
 	}
 	for _, args := range commands {
@@ -114,6 +113,12 @@ func TestClusterDefaultPoliciesRequireFanoutOptIn(t *testing.T) {
 		if err := c.pipelineRoutingError(cmd, &d); err != nil {
 			t.Fatalf("default pipeline %v: %v", args, err)
 		}
+	}
+	// SCAN is the exception: the default resolver gives it the server's special
+	// policy, so its iterator walks every master (executeScanCommand).
+	scan := c.commandRoutingDecision(ctx, NewScanCmd(ctx, nil, "scan", 0))
+	if scan.policy != scanPolicy || scan.policyErr != nil || !scan.readOnly {
+		t.Fatalf("default scan: policy=%v error=%v readonly=%v", scan.policy, scan.policyErr, scan.readOnly)
 	}
 	c.SetCommandInfoResolver(NewCommandMetadataResolver())
 	ping := c.commandRoutingDecision(ctx, NewCmd(ctx, "ping"))
@@ -3306,7 +3311,6 @@ func TestClusterConcreteCommandRouting(t *testing.T) {
 
 			wantCalls := map[string]int{"dbsize": 2, "script load": 3, "script flush": 3, "script exists": 2}
 			wantReplicaExistsCalls := 0
-			wantFlush := "OK"
 			if mode == "custom" {
 				for name := range wantCalls {
 					wantCalls[name] = 1
@@ -3314,7 +3318,6 @@ func TestClusterConcreteCommandRouting(t *testing.T) {
 			} else if mode == "disabled" {
 				wantCalls["script exists"] = 3
 				wantReplicaExistsCalls = 1
-				wantFlush = "" // Legacy fanout returns only an error.
 			}
 			if got, err := c.DBSize(ctx).Result(); err != nil || got != int64(wantCalls["dbsize"]) {
 				t.Fatalf("DBSize=%d err=%v", got, err)
@@ -3322,7 +3325,7 @@ func TestClusterConcreteCommandRouting(t *testing.T) {
 			if got, err := c.ScriptLoad(ctx, "return 1").Result(); err != nil || got != "sha" {
 				t.Fatalf("ScriptLoad=%q err=%v", got, err)
 			}
-			if got, err := c.ScriptFlush(ctx).Result(); err != nil || got != wantFlush {
+			if got, err := c.ScriptFlush(ctx).Result(); err != nil || got != "OK" {
 				t.Fatalf("ScriptFlush=%q err=%v", got, err)
 			}
 			if got, err := c.ScriptExists(ctx, "sha").Result(); err != nil || !reflect.DeepEqual(got, []bool{true}) {
