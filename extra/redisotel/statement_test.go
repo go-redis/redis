@@ -8,11 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
-
-	"github.com/redis/go-redis/v9"
 )
 
 func getDBStatement(spanData tracetest.SpanStub) string {
@@ -557,12 +556,11 @@ func TestTracingHook_StatementTruncation_CustomTypes(t *testing.T) {
 		assertEqual(t, expected, stmt)
 	})
 
-	t.Run("pointer arguments are dereferenced properly", func(t *testing.T) {
+	t.Run("redacting Stringer preserves mask with truncation enabled", func(t *testing.T) {
 		defer imsb.Reset()
 
-		strVal := "hello_pointer"
-		intVal := 42
-		cmd := redis.NewCmd(context.Background(), "SET", &strVal, &intVal)
+		type Secret string
+		cmd := redis.NewCmd(context.Background(), "SET", "mykey", testSecretType("hunter2"))
 		processHook := hook.ProcessHook(func(ctx context.Context, cmd redis.Cmder) error {
 			return nil
 		})
@@ -573,6 +571,16 @@ func TestTracingHook_StatementTruncation_CustomTypes(t *testing.T) {
 
 		assertEqual(t, 1, len(imsb.GetSpans()))
 		stmt := getDBStatement(imsb.GetSpans()[0])
-		assertEqual(t, "SET hello_pointer 42", stmt)
+		assertEqual(t, "SET mykey ***", stmt)
 	})
+}
+
+type testSecretType string
+
+func (s testSecretType) String() string {
+	return "***"
+}
+
+func (s testSecretType) MarshalBinary() ([]byte, error) {
+	return []byte(s), nil
 }

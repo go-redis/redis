@@ -152,9 +152,11 @@ func WithDBStatement(on bool) TracingOption {
 	})
 }
 
-// WithDBStatementMaxLen specifies the maximum length for statements and arguments in the tracing hook.
-// Arguments exceeding this limit are truncated with a summary marker `…(+N bytes)`.
-// If maxLen <= 0, statements and arguments are not truncated (full data opt-in).
+// WithDBStatementMaxLen sets the byte budget for the db.statement attribute
+// (default DefaultDBStatementMaxLen). The budget covers the whole statement:
+// one command, or all commands of a pipeline. Arguments that do not fit are cut
+// and get a `…(+N bytes)` marker; the marker and the command error text can go
+// past the budget. If maxLen <= 0, statements are not truncated.
 func WithDBStatementMaxLen(maxLen int) TracingOption {
 	return tracingOption(func(conf *config) {
 		conf.dbStmtMaxLen = maxLen
