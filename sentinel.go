@@ -1082,7 +1082,6 @@ func (c *sentinelFailover) RandomReplicaAddr(ctx context.Context) (string, error
 	return addresses[rand.Intn(len(addresses))], nil
 }
 
-
 func (c *sentinelFailover) MasterAddr(ctx context.Context) (string, error) {
 	v, err := c.masterAddrFlight.Do(ctx, "master", 0, func(shared context.Context) (interface{}, error) {
 		return c.masterAddrOnce(shared)
