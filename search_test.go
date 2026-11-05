@@ -3969,7 +3969,7 @@ var _ = Describe("FT.HYBRID Commands", func() {
 	// test image has none, so this checks that the token is placed where the
 	// server parses it (inside the counted method params).
 	It("should perform hybrid search with RERANK", Label("search", "fthybrid", "rerank"), func() {
-		SkipBeforeRedisVersion("8.10", "no support")
+		SkipBeforeRedisVersion("8.12", "RERANK in KNN/RANGE is not parsed before 8.12 (not in 8.10.3)")
 		vector := &redis.VectorFP32{Val: encodeFloat32Vector([]float32{1, 2, 2, 3})}
 
 		for _, tc := range []struct {

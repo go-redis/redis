@@ -512,7 +512,8 @@ type FTHybridVectorExpression struct {
 	// See https://redis.io/docs/latest/develop/ai/search-and-query/query/vector-search/
 	ShardKRatio float64
 	// Rerank toggles the exact re-scoring pass for the KNN and RANGE methods
-	// (Redis 8.8.7+). In Redis 8.12 it is only supported for disk-based
+	// (Redis 8.12+, or 8.8.7+ on the 8.8 line; Redis 8.10.3 rejects it as an
+	// unknown argument). In Redis 8.12 it is only supported for disk-based
 	// vector indexes; later versions may differ. The zero value leaves RERANK
 	// out. It is sent inside the method parameter list, so Method must be set.
 	Rerank       FTRerank
