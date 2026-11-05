@@ -30,18 +30,23 @@ func TestFTHybridWithArgs_Rerank(t *testing.T) {
 	}{
 		{
 			"knn true",
-			FTHybridVectorExpression{Method: "KNN", MethodParams: []interface{}{"K", 10}, Rerank: true},
+			FTHybridVectorExpression{Method: "KNN", MethodParams: []interface{}{"K", 10}, Rerank: FTRerankEnabled},
 			[]interface{}{"KNN", 4, "K", 10, "RERANK", "TRUE"},
 		},
 		{
 			"range explicit false",
-			FTHybridVectorExpression{Method: "RANGE", MethodParams: []interface{}{"RADIUS", 5}, HasRerank: true},
+			FTHybridVectorExpression{Method: "RANGE", MethodParams: []interface{}{"RADIUS", 5}, Rerank: FTRerankDisabled},
 			[]interface{}{"RANGE", 4, "RADIUS", 5, "RERANK", "FALSE"},
 		},
 		{
 			"rerank only",
-			FTHybridVectorExpression{Method: "KNN", Rerank: true},
+			FTHybridVectorExpression{Method: "KNN", Rerank: FTRerankEnabled},
 			[]interface{}{"KNN", 2, "RERANK", "TRUE"},
+		},
+		{
+			"default omits rerank",
+			FTHybridVectorExpression{Method: "KNN", MethodParams: []interface{}{"K", 10}},
+			[]interface{}{"KNN", 2, "K", 10},
 		},
 	}
 	for _, tc := range cases {
@@ -69,7 +74,7 @@ func TestFTHybridWithArgs_Rerank(t *testing.T) {
 	}
 
 	t.Run("requires method", func(t *testing.T) {
-		if _, err := build(FTHybridVectorExpression{Rerank: true}); err == nil {
+		if _, err := build(FTHybridVectorExpression{Rerank: FTRerankEnabled}); err == nil {
 			t.Fatal("expected error")
 		}
 	})

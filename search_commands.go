@@ -470,6 +470,26 @@ const (
 	RANGE FTHybridCombineMethod = "RANGE"
 )
 
+// FTRerank selects the RERANK setting of a vector query. The zero value leaves
+// the option out so the server default applies.
+//
+// In Redis 8.12, RERANK is only supported for disk-based vector indexes and
+// the server returns an error for other indexes. Later versions may differ.
+type FTRerank int
+
+const (
+	FTRerankDefault FTRerank = iota
+	FTRerankEnabled
+	FTRerankDisabled
+)
+
+func (r FTRerank) arg() string {
+	if r == FTRerankEnabled {
+		return "TRUE"
+	}
+	return "FALSE"
+}
+
 // FTHybridVectorExpression represents a vector expression in hybrid search
 type FTHybridVectorExpression struct {
 	VectorField string
@@ -491,12 +511,11 @@ type FTHybridVectorExpression struct {
 	// standalone Redis, and only applies to the KNN method. Requires Redis 8.8+.
 	// See https://redis.io/docs/latest/develop/ai/search-and-query/query/vector-search/
 	ShardKRatio float64
-	// Rerank toggles the exact re-scoring pass on disk-backed HNSW indexes
-	// (Redis 8.8.7+, KNN and RANGE methods). Rerank=true emits RERANK TRUE;
-	// set HasRerank=true with Rerank=false to emit RERANK FALSE. It is sent
-	// inside the method parameter list, so Method must be set.
-	Rerank       bool
-	HasRerank    bool
+	// Rerank toggles the exact re-scoring pass for the KNN and RANGE methods
+	// (Redis 8.8.7+). In Redis 8.12 it is only supported for disk-based
+	// vector indexes; later versions may differ. The zero value leaves RERANK
+	// out. It is sent inside the method parameter list, so Method must be set.
+	Rerank       FTRerank
 	Filter       string
 	YieldScoreAs string
 }
@@ -4022,7 +4041,7 @@ func (c cmdable) FTHybridWithArgs(ctx context.Context, index string, options *FT
 			args = append(args, "$"+paramName)
 			params[paramName] = vectorBlob
 
-			if (vectorExpr.Rerank || vectorExpr.HasRerank) && vectorExpr.Method == "" {
+			if vectorExpr.Rerank != FTRerankDefault && vectorExpr.Method == "" {
 				cmd := newFTHybridCmd(ctx, options, args...)
 				cmd.SetErr(fmt.Errorf("FT.HYBRID: RERANK requires a KNN or RANGE method"))
 				return cmd
@@ -4030,12 +4049,8 @@ func (c cmdable) FTHybridWithArgs(ctx context.Context, index string, options *FT
 			if vectorExpr.Method != "" {
 				args = append(args, vectorExpr.Method)
 				methodParams := vectorExpr.MethodParams
-				if vectorExpr.Rerank || vectorExpr.HasRerank {
-					rerank := "FALSE"
-					if vectorExpr.Rerank {
-						rerank = "TRUE"
-					}
-					methodParams = append(append([]interface{}{}, methodParams...), "RERANK", rerank)
+				if vectorExpr.Rerank != FTRerankDefault {
+					methodParams = append(append([]interface{}{}, methodParams...), "RERANK", vectorExpr.Rerank.arg())
 				}
 				if len(methodParams) > 0 {
 					// Method params are key-value pairs; the count is the number of tokens
