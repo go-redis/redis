@@ -127,6 +127,26 @@ func (hs *hooksMixin) initHooks(hooks hooks) {
 	hs.state.Store(state)
 }
 
+type memberCommandExecutedKey struct{}
+
+// trackMemberCommandExecution marks the terminal process hook for MultiDB.
+func (hs *hooksMixin) trackMemberCommandExecution() {
+	hs.hooksMu.Lock()
+	defer hs.hooksMu.Unlock()
+
+	old := hs.state.Load()
+	state := &hooksState{slice: old.slice, initial: old.initial}
+	process := state.initial.process
+	state.initial.process = func(ctx context.Context, cmd Cmder) error {
+		if executed, ok := ctx.Value(memberCommandExecutedKey{}).(*atomic.Bool); ok {
+			executed.Store(true)
+		}
+		return process(ctx, cmd)
+	}
+	state.rebuild()
+	hs.state.Store(state)
+}
+
 type hooks struct {
 	dial       DialHook
 	process    ProcessHook
