@@ -699,12 +699,17 @@ func admitted(limiter Limiter, denied func(error), fn func() error) error {
 
 // newPubSubConn dials, initializes, and tracks a PubSub connection as one
 // admitted operation against Options.Limiter.
-func (c *baseClient) newPubSubConn(ctx context.Context, addr string, channels []string) (*pool.Conn, error) {
+func (c *baseClient) newPubSubConn(ctx context.Context, addr string, channels []string, onInit ...func(*pool.Conn)) (*pool.Conn, error) {
 	var cn *pool.Conn
 	err := admitted(c.limiter(), nil, func() error {
 		var err error
 		cn, err = c.pubSubPool.NewConn(ctx, c.opt.Network, addr, channels)
 		if err == nil {
+			for _, fn := range onInit {
+				if fn != nil {
+					fn(cn)
+				}
+			}
 			err = c.initConn(ctx, cn)
 		}
 		if err == nil {
@@ -995,8 +1000,15 @@ func (c *baseClient) initStreamingCredentials() {
 
 func (c *baseClient) reAuthConnection() func(poolCn *pool.Conn, credentials auth.Credentials) error {
 	return func(poolCn *pool.Conn, credentials auth.Credentials) error {
-		var err error
 		username, password := credentials.BasicAuth()
+		if poolCn.IsPubSub() {
+			if fn := poolCn.GetPubSubReAuth(); fn != nil {
+				return fn(username, password)
+			}
+			return errors.New("redis: pubsub connection is not ready for re-authentication")
+		}
+
+		var err error
 
 		// Use background context - timeout is handled by ReadTimeout in WithReader/WithWriter
 		ctx := context.Background()
@@ -1020,6 +1032,12 @@ func (c *baseClient) reAuthConnection() func(poolCn *pool.Conn, credentials auth
 func (c *baseClient) onAuthenticationErr() func(poolCn *pool.Conn, err error) {
 	return func(poolCn *pool.Conn, err error) {
 		if err != nil {
+			if poolCn.IsPubSub() {
+				poolCn.GetStateMachine().Transition(pool.StateClosed)
+				_ = poolCn.Close()
+				internal.Logger.Printf(context.Background(), "redis: pubsub re-authentication failed: %v", err)
+				return
+			}
 			// A server-side rejection of the re-auth AUTH (WRONGPASS, NOPERM) is
 			// not a bad-conn error, so isBadConn alone would leave the connection
 			// pooled while it is still authenticated with the credentials the
@@ -1282,6 +1300,7 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 	if helloFallbackToRESP2 {
 		c.disableCSCServing(ctx, "HELLO 3 was rejected and the connection negotiated RESP2")
 	}
+	cn.SetResp3(c.opt.Protocol == 3 && helloOK)
 
 	// trackingEnabled reports whether THIS pool connection must issue
 	// CLIENT TRACKING ON during init. True when CSC (SharedTracking) is enabled:
@@ -3426,8 +3445,8 @@ func (c *baseClient) removeStreamingCredentialsState(cn *pool.Conn) {
 func (c *Client) pubSub() *PubSub {
 	pubsub := &PubSub{
 		opt: c.cloneOpt(),
-		newConn: func(ctx context.Context, addr string, channels []string) (*pool.Conn, error) {
-			return c.newPubSubConn(ctx, addr, channels)
+		newConn: func(ctx context.Context, addr string, channels []string, onInit ...func(*pool.Conn)) (*pool.Conn, error) {
+			return c.newPubSubConn(ctx, addr, channels, onInit...)
 		},
 		closeConn: func(cn *pool.Conn) error {
 			// Untrack connection from PubSubPool
