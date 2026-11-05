@@ -1230,14 +1230,6 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 			return fmt.Errorf("connection closed during streaming credentials setup: %w", pool.ErrClosed)
 		}
 
-		// Close may have run while subscription setup was waiting, before
-		// onClose was installed. Re-run teardown in that case; Conn.Close
-		// atomically claims callbacks, so unsubscribe still runs only once.
-		if cn.IsClosed() {
-			_ = cn.Close()
-			return fmt.Errorf("connection closed during streaming credentials setup: %w", pool.ErrClosed)
-		}
-
 		username, password = credentials.BasicAuth()
 	} else {
 		username, password, initErr = c.opt.resolveCredentials(ctx)
