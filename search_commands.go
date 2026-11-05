@@ -490,7 +490,13 @@ type FTHybridVectorExpression struct {
 	// the server default of 1.0 (no per-shard reduction). Has no effect on
 	// standalone Redis, and only applies to the KNN method. Requires Redis 8.8+.
 	// See https://redis.io/docs/latest/develop/ai/search-and-query/query/vector-search/
-	ShardKRatio  float64
+	ShardKRatio float64
+	// Rerank toggles the exact re-scoring pass on disk-backed HNSW indexes
+	// (Redis 8.8.7+, KNN and RANGE methods). Rerank=true emits RERANK TRUE;
+	// set HasRerank=true with Rerank=false to emit RERANK FALSE. It is sent
+	// inside the method parameter list, so Method must be set.
+	Rerank       bool
+	HasRerank    bool
 	Filter       string
 	YieldScoreAs string
 }
@@ -4016,12 +4022,25 @@ func (c cmdable) FTHybridWithArgs(ctx context.Context, index string, options *FT
 			args = append(args, "$"+paramName)
 			params[paramName] = vectorBlob
 
+			if (vectorExpr.Rerank || vectorExpr.HasRerank) && vectorExpr.Method == "" {
+				cmd := newFTHybridCmd(ctx, options, args...)
+				cmd.SetErr(fmt.Errorf("FT.HYBRID: RERANK requires a KNN or RANGE method"))
+				return cmd
+			}
 			if vectorExpr.Method != "" {
 				args = append(args, vectorExpr.Method)
-				if len(vectorExpr.MethodParams) > 0 {
-					// MethodParams should be key-value pairs, count them
-					args = append(args, len(vectorExpr.MethodParams))
-					args = append(args, vectorExpr.MethodParams...)
+				methodParams := vectorExpr.MethodParams
+				if vectorExpr.Rerank || vectorExpr.HasRerank {
+					rerank := "FALSE"
+					if vectorExpr.Rerank {
+						rerank = "TRUE"
+					}
+					methodParams = append(append([]interface{}{}, methodParams...), "RERANK", rerank)
+				}
+				if len(methodParams) > 0 {
+					// Method params are key-value pairs; the count is the number of tokens
+					args = append(args, len(methodParams))
+					args = append(args, methodParams...)
 				}
 			}
 
