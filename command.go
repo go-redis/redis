@@ -204,6 +204,9 @@ type (
 )
 
 type Cmder interface {
+	cacheState() *cscCommandState
+	cacheView() *commandMetadataView
+	setCacheView(*commandMetadataView)
 	// command name.
 	// e.g. "set k v ex 10" -> "set", "cluster info" -> "cluster".
 	Name() string
@@ -258,6 +261,15 @@ type Cmder interface {
 	// Commands that write directly to an io.Writer should return true since
 	// partial writes cannot be undone on retry.
 	NoRetry() bool
+	// setNoRetry sets the flag NoRetry reports. Part of the interface (not
+	// only of baseCmd) so a decorator that embeds a Cmder promotes it: the
+	// MultiDB transaction path marks every command of a transaction, and a
+	// decorated command must not slip through unmarked.
+	setNoRetry(bool)
+	// base returns the command's embedded baseCmd: the identity of the
+	// command that executes, stable across decorators, and usable as a map
+	// key where the Cmder value itself may not be comparable.
+	base() *baseCmd
 
 	// GetCmdType returns the command type for fast value extraction
 	GetCmdType() CmdType
@@ -478,19 +490,12 @@ type baseCmd struct {
 	ctx          context.Context
 	args         []interface{}
 	err          error
-	keyPos       int8
-	_stepCount   int8
 	rawVal       interface{}
 	_readTimeout *time.Duration
-	cmdType      CmdType
-	// slotCache memoizes the cluster slot once computed, so the cluster
-	// autopipeline shard router and the pipeline flush router don't each
-	// recompute it. 0 = not computed; it stores slot+1 so a real slot of 0 is
-	// distinguishable from unset. A plain field is safe by construction: it
-	// is written during admission or explicit pipeline resolution, before the
-	// command is dispatched to any worker. Workers only read it until the
-	// command completes. A shared routing template carries no slot of its own.
-	slotCache uint16
+
+	// noRetry marks the command as never-retryable (see NoRetry). It is set
+	// before the command is handed to an execution path, never concurrently.
+	noRetry bool
 
 	// ready, when non-nil, is the batch whose done channel closes once the
 	// command has executed. It is set only by the deferred (async)
@@ -508,6 +513,22 @@ type baseCmd struct {
 	// routing pins admission metadata until cluster dispatch completes. Keeping
 	// it on the command avoids retaining commands in a client-wide lookup table.
 	routing atomic.Pointer[clusterRoutingDecision]
+	// The pinned CSC view is independent of the consumed routing decision.
+	cscView *commandMetadataView
+
+	// slotCache memoizes the cluster slot once computed, so the cluster
+	// autopipeline shard router and the pipeline flush router don't each
+	// recompute it. 0 = not computed; it stores slot+1 so a real slot of 0 is
+	// distinguishable from unset. A plain field is safe by construction: it
+	// is written during admission or explicit pipeline resolution, before the
+	// command is dispatched to any worker. Workers only read it until the
+	// command completes. A shared routing template carries no slot of its own.
+	slotCache uint16
+
+	keyPos     int8
+	_stepCount int8
+	cmdType    CmdType
+	csc        cscCommandState
 }
 
 func (cmd *baseCmd) clusterRoutingDecision() *clusterRoutingDecision {
@@ -588,6 +609,10 @@ func (cmd *baseCmd) resultReady() bool {
 }
 
 var _ Cmder = (*Cmd)(nil)
+
+func (cmd *baseCmd) cacheState() *cscCommandState           { return &cmd.csc }
+func (cmd *baseCmd) cacheView() *commandMetadataView        { return cmd.cscView }
+func (cmd *baseCmd) setCacheView(view *commandMetadataView) { cmd.cscView = view }
 
 func (cmd *baseCmd) Name() string {
 	if len(cmd.args) == 0 {
@@ -705,10 +730,25 @@ func (cmd *baseCmd) isRawReply() bool { return false }
 // io.Writer (like RawWriteToCmd) should override this to return true since
 // partial writes cannot be undone on retry.
 func (cmd *baseCmd) NoRetry() bool {
+	if cmd.noRetry {
+		return true
+	}
 	// A READ advances server-side cursor state. Retrying after a lost reply
 	// would silently skip the results that were already consumed.
 	return len(cmd.args) > 1 && strings.EqualFold(cmd.stringArg(0), "ft.cursor") &&
 		strings.EqualFold(cmd.stringArg(1), "read")
+}
+
+// setNoRetry marks the command as never-retryable, e.g. the synthetic MULTI
+// of a MultiDB transaction whose batch must not be replayed by the member
+// client's retry loop.
+func (cmd *baseCmd) setNoRetry(v bool) {
+	cmd.noRetry = v
+}
+
+// base returns the command's identity (see Cmder.base).
+func (cmd *baseCmd) base() *baseCmd {
+	return cmd
 }
 
 func (cmd *baseCmd) GetCmdType() CmdType {
@@ -721,6 +761,12 @@ func (cmd *baseCmd) setArgs(args []interface{}) {
 }
 
 func (cmd *baseCmd) cloneBaseCmd() baseCmd {
+	state := cmd.csc
+	state.depth = 0
+	state.set(cscNoLookup, false)
+	if state.has(cscForceBypass) {
+		state.setMark(cacheBypassed)
+	}
 	var readTimeout *time.Duration
 	if cmd._readTimeout != nil {
 		timeout := *cmd._readTimeout
@@ -732,6 +778,8 @@ func (cmd *baseCmd) cloneBaseCmd() baseCmd {
 	copy(args, cmd.args)
 
 	return baseCmd{
+		csc:          state,
+		cscView:      cmd.cscView,
 		ctx:          cmd.ctx,
 		args:         args,
 		err:          cmd.err,
@@ -740,6 +788,7 @@ func (cmd *baseCmd) cloneBaseCmd() baseCmd {
 		rawVal:       cmd.rawVal,
 		_readTimeout: readTimeout,
 		cmdType:      cmd.cmdType,
+		noRetry:      cmd.noRetry,
 	}
 }
 
@@ -839,7 +888,12 @@ func (cmd *Cmd) Int() (int, error) {
 	}
 	switch val := cmd.val.(type) {
 	case int64:
-		return int(val), nil
+		if n := int(val); int64(n) == val {
+			return n, nil
+		}
+		// int is 32 bits on 386 and arm: give the range error Atoi gives
+		// for the same number in a bulk string, not a truncated value.
+		return strconv.Atoi(strconv.FormatInt(val, 10))
 	case string:
 		return strconv.Atoi(val)
 	case float64:

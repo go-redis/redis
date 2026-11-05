@@ -68,9 +68,24 @@ func (c *ClusterClient) ScriptLoad(ctx context.Context, script string) *StringCm
 func (c *ClusterClient) ScriptFlush(ctx context.Context) *StatusCmd {
 	cmd := NewStatusCmd(ctx, "script", "flush")
 	c.processClusterHelper(ctx, cmd, func(ctx context.Context, _ Cmder) error {
-		return c.ForEachShard(ctx, func(ctx context.Context, shard *Client) error {
-			return shard.ScriptFlush(ctx).Err()
+		var mu sync.Mutex
+		var status string
+		err := c.ForEachShard(ctx, func(ctx context.Context, shard *Client) error {
+			val, err := shard.ScriptFlush(ctx).Result()
+			if err != nil {
+				return err
+			}
+
+			mu.Lock()
+			status = val
+			mu.Unlock()
+
+			return nil
 		})
+		if err == nil {
+			cmd.val = status
+		}
+		return err
 	})
 	return cmd
 }
@@ -114,6 +129,7 @@ func (c *ClusterClient) ScriptExists(ctx context.Context, hashes ...string) *Boo
 // processClusterHelper resolves the helper policy only after process hooks
 // continue. Legacy helper fan-out and policy routing share the same hook call.
 func (c *ClusterClient) processClusterHelper(ctx context.Context, cmd Cmder, legacy ProcessHook) {
+	ctx = cscUnmarkedContext(ctx)
 	err := c.withProcessHook(ctx, cmd, func(ctx context.Context, cmd Cmder) error {
 		if c.usesLegacyClusterHelpers(ctx, cmd) {
 			return legacy(ctx, cmd)

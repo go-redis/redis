@@ -301,10 +301,28 @@ func (c *ClusterClient) executeMultiSlotCommand(
 	slot int,
 	decision *clusterRoutingDecision,
 ) error {
+	newPolicy := c.opt.cachePolicy().configured() || cmd.cacheState().mark() != cacheUnmarked || cmd.cacheState().has(cscForceBypass)
+	if newPolicy || c.captureCacheIntent {
+		// A fragment belongs to the parent invocation, even in plain mode.
+		// Preserve its pinned metadata when entering the node client.
+		cscEnter(cmd)
+		defer cscLeave(cmd)
+	}
+	callerCtx := ctx
 	var node *clusterNode
 	var moved, ask bool
+	var redirected bool
 	var lastErr error
 	for attempt := 0; attempt <= c.opt.MaxRedirects; attempt++ {
+		ctx = callerCtx
+		if redirected {
+			if newPolicy {
+				cmd.cacheState().set(cscNoLookup, true)
+				cmd.cacheState().set(cscAsk, ask)
+			} else {
+				ctx = cscBypass(ctx)
+			}
+		}
 		if attempt > 0 && !moved && !ask {
 			if err := internal.Sleep(ctx, c.retryBackoff(attempt)); err != nil {
 				return err
@@ -327,6 +345,7 @@ func (c *ClusterClient) executeMultiSlotCommand(
 			}
 		}
 
+		c.cscCheckNode(cmd, node.Client)
 		if ask {
 			ask = false
 			pipe := node.Client.Pipeline()
@@ -335,6 +354,17 @@ func (c *ClusterClient) executeMultiSlotCommand(
 			_, lastErr = pipe.Exec(ctx)
 		} else {
 			lastErr = node.Client.Process(ctx, cmd)
+		}
+		// Walk wrappers the same way process/Watch do so a hook-wrapped
+		// MOVED/ASK still carries the handoff host (#4233 Bugbot).
+		servingEp := servingEndpointFromErr(lastErr)
+		if e, ok := lastErr.(*errWithServingEndpoint); ok {
+			lastErr = e.err
+		} else if e, ok := lastErr.(*redirectFromNodeError); ok {
+			lastErr = e.err
+			if e.endpoint != "" {
+				servingEp = e.endpoint
+			}
 		}
 		if lastErr == nil {
 			return nil
@@ -356,9 +386,10 @@ func (c *ClusterClient) executeMultiSlotCommand(
 		var addr string
 		moved, ask, addr = isMovedError(lastErr)
 		if moved || ask {
+			redirected = true
 			c.state.LazyReload()
 			recordClusterRedirectMetric(ctx, ask)
-			redirected, err := c.nodes.GetOrCreate(redirectAddr(addr, node))
+			redirected, err := c.nodes.GetOrCreate(redirectAddr(addr, node, servingEp))
 			if err != nil {
 				return err
 			}
@@ -457,10 +488,11 @@ func (c *ClusterClient) executeCursorCommand(
 		}
 	}
 
+	c.cscCheckNode(cmd, node.Client)
 	err = node.Client.Process(ctx, cmd)
 	if err != nil {
 		if moved, ask, _ := isMovedError(err); moved || ask {
-			return &redirectFromNodeError{node: node, err: err}
+			return &redirectFromNodeError{node: node, endpoint: servingEndpointFromErr(err), err: err}
 		}
 	}
 	return err
@@ -561,6 +593,8 @@ func (c *ClusterClient) executeParallelTarget(
 	targetSlot int,
 	cmd Cmder,
 ) error {
+	cscEnter(cmd)
+	defer cscLeave(cmd)
 	var lastErr error
 	for attempt := 0; attempt <= c.opt.MaxRedirects; attempt++ {
 		if attempt > 0 {
@@ -568,6 +602,7 @@ func (c *ClusterClient) executeParallelTarget(
 				return err
 			}
 		}
+		c.cscCheckNode(cmd, node.Client)
 		lastErr = node.Client.Process(ctx, cmd)
 		if lastErr == nil {
 			return nil
