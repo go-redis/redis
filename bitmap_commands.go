@@ -19,7 +19,8 @@ type BitMapCmdable interface {
 	BitOpNot(ctx context.Context, destKey string, key string) *IntCmd
 	BitPos(ctx context.Context, key string, bit int64, pos ...int64) *IntCmd
 	BitPosSpan(ctx context.Context, key string, bit int8, start, end int64, span string) *IntCmd
-	BitRangeIntArray(ctx context.Context, key string, start, end int64, opts *BitRangeIntArrayOptions) *IntSliceCmd
+	BitRangeIntArray(ctx context.Context, key string, start, end int64) *IntSliceCmd
+	BitRangeIntArrayWithOptions(ctx context.Context, key string, start, end int64, opts *BitRangeIntArrayOptions) *IntSliceCmd
 	BitField(ctx context.Context, key string, values ...interface{}) *IntSliceCmd
 	BitFieldRO(ctx context.Context, key string, values ...interface{}) *IntSliceCmd
 }
@@ -177,12 +178,19 @@ type BitRangeIntArrayOptions struct {
 	Zeros bool
 }
 
-// BitRangeIntArray returns the offsets of the set bits of key in the range
-// [start, end], or of the clear bits with Zeros, in ascending order. The range
-// is read as in BITCOUNT. opts may be nil.
+// BitRangeIntArray returns the offsets of the set bits of key in the byte
+// range [start, end], in ascending order. The range is read as in BITCOUNT.
+// cmd: BITRANGEINTARRAY key start end
+// Introduced with Redis 8.12
+func (c cmdable) BitRangeIntArray(ctx context.Context, key string, start, end int64) *IntSliceCmd {
+	return c.BitRangeIntArrayWithOptions(ctx, key, start, end, nil)
+}
+
+// BitRangeIntArrayWithOptions is BitRangeIntArray with a unit, a limit and
+// the ZEROS flag. opts may be nil.
 // cmd: BITRANGEINTARRAY key start end [BYTE|BIT] [LIMIT count] [ZEROS]
 // Introduced with Redis 8.12
-func (c cmdable) BitRangeIntArray(ctx context.Context, key string, start, end int64, opts *BitRangeIntArrayOptions) *IntSliceCmd {
+func (c cmdable) BitRangeIntArrayWithOptions(ctx context.Context, key string, start, end int64, opts *BitRangeIntArrayOptions) *IntSliceCmd {
 	args := make([]any, 4, 8)
 	args[0] = "bitrangeintarray"
 	args[1] = key

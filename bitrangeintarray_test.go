@@ -24,7 +24,7 @@ var _ = Describe("BitRangeIntArray", Label("bitmap"), func() {
 		}
 	}
 	rng := func(key string, start, end int64, opts *redis.BitRangeIntArrayOptions) []int64 {
-		offs, err := client.BitRangeIntArray(ctx, key, start, end, opts).Result()
+		offs, err := client.BitRangeIntArrayWithOptions(ctx, key, start, end, opts).Result()
 		Expect(err).NotTo(HaveOccurred())
 		return offs
 	}
@@ -116,7 +116,7 @@ var _ = Describe("BitRangeIntArray", Label("bitmap"), func() {
 		})
 
 		It("should send LIMIT 0 and get an empty array", func() {
-			offs, err := client.BitRangeIntArray(ctx, "p", 0, -1,
+			offs, err := client.BitRangeIntArrayWithOptions(ctx, "p", 0, -1,
 				&redis.BitRangeIntArrayOptions{Limit: limit(0)}).Result()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(offs).NotTo(BeNil())
@@ -157,7 +157,7 @@ var _ = Describe("BitRangeIntArray", Label("bitmap"), func() {
 	})
 
 	It("should return an empty array for a missing key", func() {
-		offs, err := client.BitRangeIntArray(ctx, "missing", 0, -1, nil).Result()
+		offs, err := client.BitRangeIntArray(ctx, "missing", 0, -1).Result()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(offs).To(BeEmpty())
 	})
@@ -165,16 +165,16 @@ var _ = Describe("BitRangeIntArray", Label("bitmap"), func() {
 	It("should pass invalid arguments through to the server", func() {
 		setBits("b", 1)
 
-		err := client.BitRangeIntArray(ctx, "b", 0, -1, &redis.BitRangeIntArrayOptions{Unit: "nibble"}).Err()
+		err := client.BitRangeIntArrayWithOptions(ctx, "b", 0, -1, &redis.BitRangeIntArrayOptions{Unit: "nibble"}).Err()
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("syntax error"))
 
-		err = client.BitRangeIntArray(ctx, "b", 0, -1, &redis.BitRangeIntArrayOptions{Limit: limit(-1)}).Err()
+		err = client.BitRangeIntArrayWithOptions(ctx, "b", 0, -1, &redis.BitRangeIntArrayOptions{Limit: limit(-1)}).Err()
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("LIMIT can't be negative"))
 
 		Expect(client.RPush(ctx, "list", "x").Err()).NotTo(HaveOccurred())
-		err = client.BitRangeIntArray(ctx, "list", 0, -1, nil).Err()
+		err = client.BitRangeIntArray(ctx, "list", 0, -1).Err()
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("WRONGTYPE"))
 	})

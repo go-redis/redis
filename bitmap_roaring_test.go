@@ -133,9 +133,9 @@ var _ = Describe("Native bitmap", Label("bitmap", "NonRedisEnterprise"), func() 
 			{Limit: &limit},
 			{Unit: redis.BitCountIndexBit, Zeros: true},
 		} {
-			native, err := client.BitRangeIntArray(ctx, "native", 0, -1, opts).Result()
+			native, err := client.BitRangeIntArrayWithOptions(ctx, "native", 0, -1, opts).Result()
 			Expect(err).NotTo(HaveOccurred())
-			plain, err := client.BitRangeIntArray(ctx, "plain", 0, -1, opts).Result()
+			plain, err := client.BitRangeIntArrayWithOptions(ctx, "plain", 0, -1, opts).Result()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(native).To(Equal(plain), "opts %+v", opts)
 		}
@@ -156,7 +156,7 @@ var _ = Describe("Native bitmap", Label("bitmap", "NonRedisEnterprise"), func() 
 		Expect(client.Type(ctx, "big").Val()).To(Equal("bitmap"))
 
 		limit := int64(1)
-		offs, err := client.BitRangeIntArray(ctx, "big", 0, -1,
+		offs, err := client.BitRangeIntArrayWithOptions(ctx, "big", 0, -1,
 			&redis.BitRangeIntArrayOptions{Unit: redis.BitCountIndexBit, Limit: &limit}).Result()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(offs).To(Equal([]int64{off}))
