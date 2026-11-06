@@ -112,6 +112,56 @@ var _ = Describe("Native bitmap", Label("bitmap", "NonRedisEnterprise"), func() 
 		Expect(client.GetBit(ctx, "copy", 100).Val()).To(Equal(int64(1)))
 	})
 
+	It("should run BITRANGEINTARRAY like it does on a string bitmap", func() {
+		bits := []int64{0, 7, 8, 15, 56, 57, 63, 64, 73}
+		for _, off := range bits {
+			Expect(client.SetBit(ctx, "native", off, 1).Err()).NotTo(HaveOccurred())
+		}
+		Expect(client.Type(ctx, "native").Val()).To(Equal("bitmap"))
+
+		Expect(client.ConfigSet(ctx, "bitmap-default-roaring", "no").Err()).NotTo(HaveOccurred())
+		for _, off := range bits {
+			Expect(client.SetBit(ctx, "plain", off, 1).Err()).NotTo(HaveOccurred())
+		}
+		Expect(client.Type(ctx, "plain").Val()).To(Equal("string"))
+
+		limit := int64(3)
+		for _, opts := range []*redis.BitRangeIntArrayOptions{
+			nil,
+			{Unit: redis.BitCountIndexBit},
+			{Unit: redis.BitCountIndexBit, Limit: &limit},
+			{Limit: &limit},
+			{Unit: redis.BitCountIndexBit, Zeros: true},
+		} {
+			native, err := client.BitRangeIntArray(ctx, "native", 0, -1, opts).Result()
+			Expect(err).NotTo(HaveOccurred())
+			plain, err := client.BitRangeIntArray(ctx, "plain", 0, -1, opts).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(native).To(Equal(plain), "opts %+v", opts)
+		}
+	})
+
+	It("should return BITRANGEINTARRAY offsets above 32 bits", func() {
+		// Bit offsets are capped at proto-max-bulk-len * 8; raise it past 2^33.
+		prev, err := client.ConfigGet(ctx, "proto-max-bulk-len").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(client.ConfigSet(ctx, "proto-max-bulk-len", "2gb").Err()).NotTo(HaveOccurred())
+		DeferCleanup(func() {
+			Expect(client.ConfigSet(ctx, "proto-max-bulk-len", prev["proto-max-bulk-len"]).Err()).
+				NotTo(HaveOccurred())
+		})
+
+		const off = int64(1)<<33 + 5
+		Expect(client.SetBit(ctx, "big", off, 1).Err()).NotTo(HaveOccurred())
+		Expect(client.Type(ctx, "big").Val()).To(Equal("bitmap"))
+
+		limit := int64(1)
+		offs, err := client.BitRangeIntArray(ctx, "big", 0, -1,
+			&redis.BitRangeIntArrayOptions{Unit: redis.BitCountIndexBit, Limit: &limit}).Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(offs).To(Equal([]int64{off}))
+	})
+
 	It("should SCAN by the bitmap type", func() {
 		Expect(client.SetBit(ctx, "b", 100, 1).Err()).NotTo(HaveOccurred())
 		Expect(client.Set(ctx, "str", "x", 0).Err()).NotTo(HaveOccurred())
