@@ -15,12 +15,14 @@ type ContextDeadlineError struct {
 	cause    error
 }
 
-func (e *ContextDeadlineError) Error() string        { return e.cause.Error() }
+func (e *ContextDeadlineError) Error() string {
+	return e.cause.Error() + ": " + e.original.Error()
+}
+
 func (e *ContextDeadlineError) Unwrap() error        { return e.original }
 func (e *ContextDeadlineError) Is(target error) bool { return target == e.cause }
 
-func (e *ContextDeadlineError) Timeout() bool   { return e.timeout.Timeout() }
-func (e *ContextDeadlineError) Temporary() bool { return e.timeout.Temporary() }
+func (e *ContextDeadlineError) Timeout() bool { return e.timeout.Timeout() }
 
 type deadlineReader struct {
 	reader   io.Reader

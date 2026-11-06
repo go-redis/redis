@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -174,7 +175,7 @@ func TestConnContextDeadlinePreservesWrappedSocketError(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 	deadline, _ := ctx.Deadline()
-	socketErr := &net.OpError{Op: "read", Net: "tcp", Err: context.DeadlineExceeded}
+	socketErr := &net.OpError{Op: "read", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 6379}, Err: os.ErrDeadlineExceeded}
 	original := fmt.Errorf("custom transport: %w", socketErr)
 	err := contextDeadlineError(ctx, deadline, original)
 	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, original) {
@@ -183,5 +184,12 @@ func TestConnContextDeadlinePreservesWrappedSocketError(t *testing.T) {
 	var opErr *net.OpError
 	if !errors.As(err, &opErr) || opErr != socketErr {
 		t.Fatalf("lost socket error: %v", err)
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("lost network timeout: %v", err)
+	}
+	if want := context.DeadlineExceeded.Error() + ": " + original.Error(); err.Error() != want {
+		t.Fatalf("error text = %q, want %q", err, want)
 	}
 }
