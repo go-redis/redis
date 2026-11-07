@@ -415,7 +415,7 @@ func (opt *ClusterOptions) init() {
 func ParseClusterURL(redisURL string) (*ClusterOptions, error) {
 	o := &ClusterOptions{}
 
-	u, err := url.Parse(redisURL)
+	u, err := parseURL(redisURL)
 	if err != nil {
 		return nil, err
 	}
@@ -525,7 +525,7 @@ func setupClusterQueryParams(u *url.URL, o *ClusterOptions) (*ClusterOptions, er
 
 	// any parameters left?
 	if r := q.remaining(); len(r) > 0 {
-		return nil, fmt.Errorf("redis: unexpected option: %s", strings.Join(r, ", "))
+		return nil, fmt.Errorf("redis: unexpected option: %s", quoteURLPart(u.RawQuery, strings.Join(r, ", ")))
 	}
 
 	return o, nil

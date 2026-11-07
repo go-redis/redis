@@ -1011,7 +1011,7 @@ func NewDialer(opt *Options) func(context.Context, string, string) (net.Conn, er
 //		MaxRetries:  2,
 //	}
 func ParseURL(redisURL string) (*Options, error) {
-	u, err := url.Parse(redisURL)
+	u, err := parseURL(redisURL)
 	if err != nil {
 		return nil, err
 	}
@@ -1024,6 +1024,76 @@ func ParseURL(redisURL string) (*Options, error) {
 	default:
 		return nil, fmt.Errorf("redis: invalid URL scheme: %s", u.Scheme)
 	}
+}
+
+// parseURL is url.Parse with the password removed from the error. A
+// *url.Error prints the whole input, so a malformed URL would otherwise
+// return its credentials in the error, which callers typically log.
+func parseURL(redisURL string) (*url.URL, error) {
+	u, err := url.Parse(redisURL)
+	if err != nil {
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			var password string
+			uerr.URL, password = redactRawURL(redisURL)
+			// url.Parse ends the authority at the first '/', '?' or '#', so
+			// with one of them unescaped in the password it parses part of
+			// the password as host or port and quotes it in uerr.Err. An
+			// invalid escape in the password is quoted as well.
+			var escErr url.EscapeError
+			switch {
+			case strings.ContainsAny(password, "/?#"):
+				uerr.Err = errors.New("password contains unescaped '/', '?' or '#'")
+			case errors.As(uerr.Err, &escErr) && strings.Contains(password, string(escErr)):
+				uerr.Err = errors.New("password contains an invalid URL escape")
+			}
+		}
+		return nil, err
+	}
+	return u, nil
+}
+
+// redactRawURL returns a URL that failed to parse with the password replaced
+// by "xxxxx", like url.URL.Redacted, and the query and fragment dropped, since
+// ParseFailoverURL reads a password from the query. It also returns the
+// password it found. The userinfo ends at the last '@', so a password
+// containing unescaped '@' or '/' is still covered.
+func redactRawURL(s string) (string, string) {
+	start := 0
+	if i := strings.Index(s, "://"); i >= 0 && !strings.ContainsAny(s[:i], "?#") {
+		start = i + len("://")
+	}
+	end := len(s)
+	if i := strings.IndexAny(s[start:], "?#"); i >= 0 {
+		end = start + i
+	}
+	at := strings.LastIndexByte(s, '@')
+	if at < start {
+		return s[:end], ""
+	}
+	user, password, ok := strings.Cut(s[start:at], ":")
+	switch {
+	case at > end:
+		// The '@' is in the password or in a query value, and the two
+		// can't be told apart, so quote only the scheme.
+		return s[:start], password
+	case !ok:
+		return s[:end], ""
+	default:
+		return s[:start] + user + ":xxxxx" + s[at:end], password
+	}
+}
+
+// quoteURLPart returns the last of parts for an error message. When any part
+// has an '@', url.Parse likely split the password at an unescaped '/', '?' or
+// '#', so the text may hold the password and is not returned.
+func quoteURLPart(parts ...string) string {
+	for _, p := range parts {
+		if strings.Contains(p, "@") {
+			return "(not shown: it contains '@'; escape '/', '?' and '#' in the password)"
+		}
+	}
+	return parts[len(parts)-1]
 }
 
 func setupTCPConn(u *url.URL) (*Options, error) {
@@ -1043,10 +1113,10 @@ func setupTCPConn(u *url.URL) (*Options, error) {
 	case 1:
 		var err error
 		if o.DB, err = strconv.Atoi(f[0]); err != nil {
-			return nil, fmt.Errorf("redis: invalid database number: %q", f[0])
+			return nil, fmt.Errorf("redis: invalid database number: %s", quoteURLPart(strconv.Quote(f[0])))
 		}
 	default:
-		return nil, fmt.Errorf("redis: invalid URL path: %s", u.Path)
+		return nil, fmt.Errorf("redis: invalid URL path: %s", quoteURLPart(u.Path))
 	}
 
 	if u.Scheme == "rediss" {
@@ -1284,7 +1354,7 @@ func setupConnParams(u *url.URL, o *Options) (*Options, error) {
 
 	// any parameters left?
 	if r := q.remaining(); len(r) > 0 {
-		return nil, fmt.Errorf("redis: unexpected option: %s", strings.Join(r, ", "))
+		return nil, fmt.Errorf("redis: unexpected option: %s", quoteURLPart(u.RawQuery, strings.Join(r, ", ")))
 	}
 
 	return o, nil

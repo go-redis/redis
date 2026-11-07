@@ -488,7 +488,7 @@ func (opt *FailoverOptions) clusterOptions() *ClusterOptions {
 //		ReadTimeout: 6 * time.Second,
 //	}
 func ParseFailoverURL(redisURL string) (*FailoverOptions, error) {
-	u, err := url.Parse(redisURL)
+	u, err := parseURL(redisURL)
 	if err != nil {
 		return nil, err
 	}
@@ -521,10 +521,10 @@ func setupFailoverConn(u *url.URL) (*FailoverOptions, error) {
 	case 1:
 		var err error
 		if o.DB, err = strconv.Atoi(f[0]); err != nil {
-			return nil, fmt.Errorf("redis: invalid database number: %q", f[0])
+			return nil, fmt.Errorf("redis: invalid database number: %s", quoteURLPart(strconv.Quote(f[0])))
 		}
 	default:
-		return nil, fmt.Errorf("redis: invalid URL path: %s", u.Path)
+		return nil, fmt.Errorf("redis: invalid URL path: %s", quoteURLPart(u.Path))
 	}
 
 	return setupFailoverConnParams(u, o)
@@ -619,7 +619,7 @@ func setupFailoverConnParams(u *url.URL, o *FailoverOptions) (*FailoverOptions, 
 
 	// any parameters left?
 	if r := q.remaining(); len(r) > 0 {
-		return nil, fmt.Errorf("redis: unexpected option: %s", strings.Join(r, ", "))
+		return nil, fmt.Errorf("redis: unexpected option: %s", quoteURLPart(u.RawQuery, strings.Join(r, ", ")))
 	}
 
 	return o, nil
